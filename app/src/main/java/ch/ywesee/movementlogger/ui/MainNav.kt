@@ -61,6 +61,7 @@ fun MainNav() {
         ) {
             composable(Dest.Sync.route) { FileSyncScreen() }
             composable(Dest.Replay.route) { ReplayScreen() }
+
         }
     }
 }
