@@ -1,0 +1,3 @@
+Time [mS], AccX [mg], AccY [mg], AccZ [mg], GyroX [mdps], GyroY [mdps], GyroZ [mdps],MagX [mgauss],MagY [mgauss],MagZ [mgauss],P [mB],T ['C]
+50, 1024, 0, -512, 0, 0, 0, 0, 0, 0, 1013.25, 25.00
+51, 1025, 1, -510, 100, -50, 25, 0, 0, 0, 1013.25, 25.00
