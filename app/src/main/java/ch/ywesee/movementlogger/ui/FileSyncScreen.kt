@@ -228,58 +228,115 @@ private fun FilesPanel(
     if (state.listing && state.files.isEmpty()) {
         CenteredSpinner(label = "listing files…"); return
     }
+    // Match the desktop GUI: sensor-data files (per-session recordings) on top,
+    // everything else under a "Debug" section the user usually ignores.
+    val sensor = state.files.filter { isSensorData(it.name) }
+    val debug = state.files.filterNot { isSensorData(it.name) }
     LazyColumn {
-        items(state.files, key = { it.name }) { f ->
-            val progress = state.downloads[f.name]
-            val savedPath = state.savedPaths[f.name]
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-            ) {
-                Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(f.name, fontWeight = FontWeight.SemiBold)
-                            Text(
-                                humanBytes(f.size),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            if (savedPath != null) {
-                                Text(
-                                    "saved → $savedPath",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                        }
-                        OutlinedButton(
-                            onClick = { onDownload(f) },
-                            enabled = progress == null,
-                        ) { Text(if (progress == null) "Download" else "…") }
-                        Spacer(Modifier.width(4.dp))
-                        OutlinedButton(onClick = { onDelete(f) }) { Text("Delete") }
-                    }
-                    if (progress != null) {
-                        Spacer(Modifier.height(8.dp))
-                        LinearProgressIndicator(
-                            progress = { progress.fraction },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+        if (sensor.isNotEmpty()) {
+            item(key = "header-sensor") { GroupHeader("Sensor", sensor.size) }
+            items(sensor, key = { "s-${it.name}" }) { f -> FileRow(f, state, onDownload, onDelete) }
+        }
+        if (debug.isNotEmpty()) {
+            item(key = "header-debug") { GroupHeader("Debug", debug.size) }
+            items(debug, key = { "d-${it.name}" }) { f -> FileRow(f, state, onDownload, onDelete) }
+        }
+    }
+}
+
+@Composable
+private fun GroupHeader(title: String, count: Int) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            title,
+            fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            "($count)",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun FileRow(
+    f: RemoteFile,
+    state: FileSyncUiState,
+    onDownload: (RemoteFile) -> Unit,
+    onDelete: (RemoteFile) -> Unit,
+) {
+    val progress = state.downloads[f.name]
+    val savedPath = state.savedPaths[f.name]
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(f.name, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        humanBytes(f.size),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (savedPath != null) {
                         Text(
-                            "${humanBytes(progress.bytesDone)} / ${humanBytes(progress.total)} " +
-                                "(${(progress.fraction * 100).toInt()}%)",
+                            "saved → $savedPath",
                             style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                 }
+                OutlinedButton(
+                    onClick = { onDownload(f) },
+                    enabled = progress == null,
+                ) { Text(if (progress == null) "Download" else "…") }
+                Spacer(Modifier.width(4.dp))
+                OutlinedButton(onClick = { onDelete(f) }) { Text("Delete") }
+            }
+            if (progress != null) {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(
+                    progress = { progress.fraction },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "${humanBytes(progress.bytesDone)} / ${humanBytes(progress.total)} " +
+                        "(${(progress.fraction * 100).toInt()}%)",
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
         }
     }
+}
+
+/**
+ * Per-session sensor-data files the firmware writes: Sens*.csv, Gps*.csv,
+ * Bat*.csv, Mic*.wav. Everything else (notably DebugX.csv) lands in the
+ * Debug group. Matches `is_sensor_data_name` in stbox-viz-gui/src/main.rs.
+ *
+ * macOS AppleDouble sidecars (`._<name>`) match the inner pattern by accident
+ * — guard the prefix explicitly.
+ */
+private fun isSensorData(name: String): Boolean {
+    val n = name.lowercase()
+    if (n.startsWith("._")) return false
+    return (n.startsWith("sens") && n.endsWith(".csv")) ||
+        (n.startsWith("gps")  && n.endsWith(".csv")) ||
+        (n.startsWith("bat")  && n.endsWith(".csv")) ||
+        (n.startsWith("mic")  && n.endsWith(".wav"))
 }
 
 @Composable
