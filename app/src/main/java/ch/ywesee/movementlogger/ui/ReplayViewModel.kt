@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import ch.ywesee.movementlogger.data.CsvParsers
+import ch.ywesee.movementlogger.data.GpsMath
 import ch.ywesee.movementlogger.data.GpsRow
 import ch.ywesee.movementlogger.data.GpsTime
 import ch.ywesee.movementlogger.data.SensorRow
@@ -27,6 +28,10 @@ data class ReplayUiState(
     val sensorRows: List<SensorRow> = emptyList(),
     val gpsRows: List<GpsRow> = emptyList(),
     val gpsAnchorUtcMillis: Long? = null,
+    /** Smoothed position-derived speed per GPS row, km/h. */
+    val speedSmoothedKmh: DoubleArray = DoubleArray(0),
+    /** Absolute UTC ms per GPS row (parsed from `utc` against today's date). -1 if unparseable. */
+    val gpsAbsTimesMs: LongArray = LongArray(0),
     val loading: Boolean = false,
     val error: String? = null,
 )
@@ -69,18 +74,27 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
             _state.update { it.copy(loading = true, error = null) }
             try {
                 val rows = withContext(Dispatchers.IO) { CsvParsers.parseGpsFile(file) }
-                // Anchor the GPS time axis: combine the first fix's `hhmmss.ss`
-                // with today's UTC date. The user can override the date later
-                // (the desktop's --date flag). First valid fix wins.
-                val anchor = rows.firstNotNullOfOrNull { row ->
+                // Precompute the speed series + per-row absolute UTC. Done on
+                // IO since smoothing a 1800-row session is fine but isn't
+                // something to block the main thread on.
+                val (smoothed, absTimes, anchor) = withContext(Dispatchers.IO) {
+                    val raw = GpsMath.positionDerivedSpeedKmh(rows)
+                    val cleaned = GpsMath.rejectAccOutliers(rows, raw)
+                    val smooth = GpsMath.smoothSpeedKmh(cleaned)
                     val (y, mo, d) = GpsTime.todayUtc()
-                    GpsTime.toUtcMillis(row.utc, y, mo, d)
+                    val times = LongArray(rows.size) { i ->
+                        GpsTime.toUtcMillis(rows[i].utc, y, mo, d) ?: -1L
+                    }
+                    val firstAnchor = times.firstOrNull { it >= 0L }
+                    Triple(smooth, times, firstAnchor)
                 }
                 _state.update {
                     it.copy(
                         gpsFile = file,
                         gpsRows = rows,
                         gpsAnchorUtcMillis = anchor,
+                        speedSmoothedKmh = smoothed,
+                        gpsAbsTimesMs = absTimes,
                         loading = false,
                     )
                 }

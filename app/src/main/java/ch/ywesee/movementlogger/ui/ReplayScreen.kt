@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -18,7 +19,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -36,9 +39,14 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -52,6 +60,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import ch.ywesee.movementlogger.data.formatLocalTime
 import java.io.File
+import kotlinx.coroutines.delay
 
 /**
  * Replay screen — pick a video and one or two CSV files saved by the
@@ -79,6 +88,15 @@ fun ReplayScreen(vm: ReplayViewModel = viewModel()) {
         player.prepare()
     }
 
+    // Poll the playhead at ~30 fps. Cheap; produceState restarts when `player`
+    // changes (won't, in this screen).
+    val playheadMs by produceState(initialValue = 0L, player) {
+        while (true) {
+            value = player.currentPosition
+            delay(33L)
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -90,7 +108,11 @@ fun ReplayScreen(vm: ReplayViewModel = viewModel()) {
         },
     ) { padding ->
         Column(
-            modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
         ) {
             VideoSurface(player = player, hasVideo = state.videoUri != null)
             Spacer(Modifier.height(12.dp))
@@ -137,8 +159,114 @@ fun ReplayScreen(vm: ReplayViewModel = viewModel()) {
 
             Spacer(Modifier.height(12.dp))
             AlignmentSummary(state)
+
+            if (state.speedSmoothedKmh.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                SpeedPanel(
+                    smoothed = state.speedSmoothedKmh,
+                    gpsAbsTimesMs = state.gpsAbsTimesMs,
+                    videoCreationMs = state.videoMeta?.creationTimeMillis,
+                    playheadMs = playheadMs,
+                )
+            }
         }
     }
+}
+
+@Composable
+private fun SpeedPanel(
+    smoothed: DoubleArray,
+    gpsAbsTimesMs: LongArray,
+    videoCreationMs: Long?,
+    playheadMs: Long,
+) {
+    val n = smoothed.size
+    val maxV = (smoothed.maxOrNull() ?: 0.0).coerceAtLeast(5.0)
+
+    // Map video playhead → GPS row index by absolute UTC. When the video has
+    // no creation_time, the cursor is hidden — the user can still see the
+    // overall speed shape without alignment.
+    val cursorIdx: Int = if (videoCreationMs != null && gpsAbsTimesMs.isNotEmpty()) {
+        nearestIndexByTime(gpsAbsTimesMs, videoCreationMs + playheadMs)
+    } else -1
+    val currentSpeed = if (cursorIdx in 0 until n) smoothed[cursorIdx] else 0.0
+
+    val lineColor = MaterialTheme.colorScheme.primary
+    Column {
+        Text("Speed (km/h)", fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(140.dp)
+                .background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(8.dp))
+                .padding(8.dp),
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                if (n < 2) return@Canvas
+                val w = size.width
+                val h = size.height
+                val path = Path()
+                for (i in 0 until n) {
+                    val x = i.toFloat() / (n - 1) * w
+                    val y = h - (smoothed[i] / maxV * h).toFloat()
+                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                drawPath(path, color = lineColor, style = Stroke(width = 2.dp.toPx()))
+                if (cursorIdx in 0 until n) {
+                    val cx = cursorIdx.toFloat() / (n - 1) * w
+                    drawLine(
+                        color = Color(0xFFD32F2F),
+                        start = Offset(cx, 0f),
+                        end = Offset(cx, h),
+                        strokeWidth = 1.5.dp.toPx(),
+                    )
+                }
+            }
+            // Top-left current/max labels.
+            Column(
+                modifier = Modifier.align(Alignment.TopStart),
+            ) {
+                Text(
+                    "now %.1f".format(currentSpeed),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    "max %.1f".format(maxV),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (videoCreationMs == null) {
+            Text(
+                "Video has no creation_time — cursor hidden. Future slice: manual offset slider.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** Nearest-index search by absolute time. `arr` ascending, may contain -1 sentinels at edges. */
+private fun nearestIndexByTime(arr: LongArray, target: Long): Int {
+    val n = arr.size
+    if (n == 0) return -1
+    // Skip leading sentinels (-1 from un-parseable utc strings).
+    var lo = 0
+    while (lo < n && arr[lo] < 0) lo++
+    if (lo >= n) return -1
+    var hi = n - 1
+    if (target <= arr[lo]) return lo
+    if (target >= arr[hi]) return hi
+    while (lo < hi) {
+        val mid = (lo + hi) ushr 1
+        if (arr[mid] < target) lo = mid + 1 else hi = mid
+    }
+    return lo
 }
 
 @Composable
