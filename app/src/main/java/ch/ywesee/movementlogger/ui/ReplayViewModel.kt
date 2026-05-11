@@ -11,7 +11,9 @@ import ch.ywesee.movementlogger.data.FusionHeight
 import ch.ywesee.movementlogger.data.GpsMath
 import ch.ywesee.movementlogger.data.GpsRow
 import ch.ywesee.movementlogger.data.GpsTime
+import ch.ywesee.movementlogger.data.ReplayTrim
 import ch.ywesee.movementlogger.data.SensorRow
+import ch.ywesee.movementlogger.data.VideoExporter
 import ch.ywesee.movementlogger.data.VideoMetadata
 import ch.ywesee.movementlogger.data.VideoMetadataReader
 import kotlinx.coroutines.Dispatchers
@@ -48,7 +50,15 @@ data class ReplayUiState(
     val loading: Boolean = false,
     val computing: Boolean = false,
     val error: String? = null,
+    val exportState: ExportState = ExportState.Idle,
 )
+
+sealed class ExportState {
+    data object Idle : ExportState()
+    data class Running(val progress: Float) : ExportState()
+    data class Done(val uri: Uri) : ExportState()
+    data class Failed(val message: String) : ExportState()
+}
 
 class ReplayViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -60,6 +70,26 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
         val dir = getApplication<Application>().getExternalFilesDir(null) ?: return emptyList()
         return dir.listFiles()?.filter { it.isFile }?.sortedBy { it.name } ?: emptyList()
     }
+
+    /**
+     * Video files (.mov / .mp4 / .m4v) sitting in the app-private external
+     * dir. Lets users (and the test harness) skip the system Photo Picker
+     * entirely — just adb-push a video next to the CSVs.
+     */
+    fun listLocalVideos(): List<File> {
+        val dir = getApplication<Application>().getExternalFilesDir(null) ?: return emptyList()
+        return dir.listFiles()
+            ?.filter { it.isFile && isVideoFile(it.name) }
+            ?.sortedBy { it.name } ?: emptyList()
+    }
+
+    private fun isVideoFile(name: String): Boolean {
+        val n = name.lowercase()
+        return n.endsWith(".mov") || n.endsWith(".mp4") || n.endsWith(".m4v")
+    }
+
+    /** Same as `pickVideo(Uri)` but for a file already on local storage. */
+    fun pickLocalVideo(file: File) = pickVideo(Uri.fromFile(file))
 
     fun pickVideo(uri: Uri) {
         viewModelScope.launch {
@@ -211,5 +241,76 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearError() {
         _state.update { it.copy(error = null) }
+    }
+
+    fun clearExportState() {
+        _state.update { it.copy(exportState = ExportState.Idle) }
+    }
+
+    /**
+     * Render a combined rider + sensor-panels video clipped to the video's
+     * time window and save it to MediaStore (Photos app). Requires a video
+     * with a parseable `creation_time` and both CSVs loaded with fusion
+     * complete.
+     */
+    fun exportCombinedVideo() {
+        val s = _state.value
+        val uri = s.videoUri
+        val creationMs = s.videoMeta?.creationTimeMillis
+        if (uri == null || creationMs == null) {
+            _state.update {
+                it.copy(exportState = ExportState.Failed("Video needs creation_time metadata"))
+            }
+            return
+        }
+        if (s.sensorRows.isEmpty() || s.gpsRows.isEmpty() || s.pitchDeg.isEmpty()) {
+            _state.update {
+                it.copy(exportState = ExportState.Failed("Load Sens + GPS CSVs first"))
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            _state.update { it.copy(exportState = ExportState.Running(0f)) }
+            try {
+                val ctx = getApplication<Application>().applicationContext
+                val source = withContext(Dispatchers.IO) { VideoExporter.probeSource(ctx, uri) }
+                val windowStart = creationMs
+                val windowEnd = creationMs + source.durationMs
+                val trimmed = withContext(Dispatchers.Default) {
+                    ReplayTrim.trimToWindow(
+                        gpsRows = s.gpsRows,
+                        gpsAbsTimesMs = s.gpsAbsTimesMs,
+                        speedSmoothedKmh = s.speedSmoothedKmh,
+                        sensorAbsTimesMs = s.sensorAbsTimesMs,
+                        pitchDeg = s.pitchDeg,
+                        baroHeightM = s.baroHeightM,
+                        fusedHeightM = s.fusedHeightM,
+                        startMs = windowStart,
+                        endMs = windowEnd,
+                    )
+                }
+                if (trimmed.gpsRows.isEmpty() || trimmed.pitchDeg.isEmpty()) {
+                    throw IllegalStateException(
+                        "No sensor or GPS rows overlap the video window — check date alignment.",
+                    )
+                }
+                val displayName = "MovementLogger_${System.currentTimeMillis()}.mp4"
+                val savedUri = VideoExporter.export(
+                    context = ctx,
+                    sourceUri = uri,
+                    sourceSize = source,
+                    trimmed = trimmed,
+                    windowStartMs = windowStart,
+                    windowEndMs = windowEnd,
+                    displayName = displayName,
+                ) { p ->
+                    _state.update { it.copy(exportState = ExportState.Running(p)) }
+                }
+                _state.update { it.copy(exportState = ExportState.Done(savedUri)) }
+            } catch (e: Exception) {
+                _state.update { it.copy(exportState = ExportState.Failed(e.message ?: "export failed")) }
+            }
+        }
     }
 }

@@ -53,6 +53,12 @@ Pick any video from your phone plus a `Sens*.csv` / `Gps*.csv` pair that the Syn
 
 The downloaded CSVs from the Sync tab are picked up directly, so the typical loop is: take the box out, run a session, plug into BLE on the way home, download files, open the video in Replay.
 
+#### Export combined video
+
+Once the video and both CSVs are picked, **Export combined** renders a single MP4 with the rider on top and the four data panels stacked below — exactly what the live Replay shows, baked into a video the phone's Photos app understands. The export is automatically trimmed to the video's time window, so panels only show sensor + GPS data that overlaps the ride, not the whole session. HDR clips (HEVC HLG, iPhone-style) are tone-mapped to SDR before encoding so the panel overlays composite correctly. When the encode finishes, an **Open video** button on the banner launches the system video viewer on the freshly saved file under `Movies/MovementLogger/`.
+
+The Alignment card shows the row counts that fall inside the video window, so you can see at a glance how much of the session will be in the export (`trim → gps: 365 / 26914` etc.) before kicking it off.
+
 ## Build from source
 
 Requirements: JDK 17+, Android SDK with build-tools 34.0.0 and platforms 35.

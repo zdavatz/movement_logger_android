@@ -9,7 +9,7 @@ Android port of the Movement Logger desktop app at `~/software/fp-sns-stbox1/Uti
 - **Sync** — connects to the PumpTsueri SensorTile.box over BLE, downloads its CSV recordings, saves them to app-private external storage.
 - **Replay** — picks a saved sensor / GPS CSV pair and a video, plays them time-synced with overlaid panels (speed, pitch / Nasenwinkel, height above water, GPS track).
 
-Pure Kotlin + Jetpack Compose, no NDK. Phase-2 numerics (Madgwick fusion, baro height, butterworth, etc.) are ported from `stbox-viz/*.rs` to Kotlin under `data/`; the desktop's plotly-HTML / GIF / board-3D output side is replaced by direct Compose Canvas rendering. ffmpeg-overlay GIF export remains desktop-only.
+Pure Kotlin + Jetpack Compose, no NDK. Phase-2 numerics (Madgwick fusion, baro height, butterworth, etc.) are ported from `stbox-viz/*.rs` to Kotlin under `data/`; the desktop's plotly-HTML / GIF / board-3D output side is replaced by direct Compose Canvas rendering. The desktop's ffmpeg-overlay GIF export is replaced on Android by an in-app **Export combined** that uses Media3 Transformer to bake the same v-stack (rider on top, four sensor panels below) into a single MP4 saved to `Movies/MovementLogger/`.
 
 ## Build & run
 
@@ -43,7 +43,10 @@ app/src/main/java/ch/ywesee/movementlogger/
 │   ├── EulerAngles.kt         quat → roll/pitch/yaw + gimbal-lock regions
 │   ├── Madgwick.kt            6DOF IMU AHRS + nose-angle series
 │   ├── Baro.kt                GPS-anchored TC'd-pressure height
-│   └── FusionHeight.kt        α-β baro + body-frame acc complementary
+│   ├── FusionHeight.kt        α-β baro + body-frame acc complementary
+│   ├── ReplayTrim.kt          slice parallel arrays to a UTC-ms window
+│   ├── ExportPanelRenderer.kt android.graphics.Canvas port of the four panels
+│   └── VideoExporter.kt       Media3 Transformer combined-video pipeline
 └── ui/
     ├── MainNav.kt             bottom-nav scaffold (Sync / Replay)
     ├── FileSyncScreen.kt      Sync tab UI
@@ -79,6 +82,28 @@ Panels (all Compose Canvas, all bound to a 33 ms playhead poll):
 - **GPS track** — lat/lon with `cos(meanLat)` longitude correction; moving red dot at the playhead.
 
 Each panel takes its own absolute-time array (`gpsAbsTimesMs` or `sensorAbsTimesMs`) and binary-searches the cursor index from `videoMeta.creationTimeMillis + playheadMs`. When the video has no `creation_time`, cursors hide (manual offset slider is a future polish slice).
+
+The **Local video** section in the Replay picker lists any `.mov`/`.mp4`/`.m4v` files in the app-private external dir (`Android/data/ch.ywesee.movementlogger/files/`). Tapping Load picks the file directly via `Uri.fromFile()`, bypassing the system Photo Picker — handy for adb-pushed test clips that the picker can't find (Photo Picker sorts by `datetaken`, which embeds the video's `creation_time`, so old footage is buried).
+
+### Combined video export (`Export combined`)
+
+`ReplayViewModel.exportCombinedVideo()` orchestrates the pipeline:
+
+1. `VideoExporter.probeSource` — width/height/rotation/duration via `MediaMetadataRetriever`. Rotation is applied so dimensions are post-rotated.
+2. `ReplayTrim.trimToWindow(creationMs, creationMs + durationMs)` — slices the GPS + sensor parallel arrays to the video's UTC time window. Out-of-window rows are dropped entirely; the Alignment card shows `trim → gps: X / Y` so you can see the in-window count before kicking off the encode. Trip-protection: if the trimmed window is empty (e.g. wrong date), the export errors out instead of producing a blank.
+3. `ExportPanelRenderer` — `android.graphics.Canvas` mirror of the Compose Canvas panels. Precomputes stable axes (maxSpeed/absMaxPitch/heightRange/gpsBounds) at construction so frame-to-frame Y axes stay still while the red cursor sweeps.
+4. `VideoExporter.export` — Media3 Transformer composition with three video effects layered on top of the source:
+   1. `Presentation.createForWidthAndHeight(outW, srcH + panelsH, LAYOUT_SCALE_TO_FIT)` letterboxes the source into the taller output canvas.
+   2. A `MatrixTransformation` translates the video up by `panelsH/outH` in NDC so the rider sits at the top of the frame instead of vertically centred.
+   3. `OverlayEffect(BitmapOverlay)` draws the four-panel stack at the bottom. `setBackgroundFrameAnchor(0f, -1f) + setOverlayFrameAnchor(0f, -1f)` bottom-aligns the overlay; do **not** also call `setScale` — Media3's `OverlayMatrixProvider.aspectRatioMatrix` already maps overlay→background size, so a manual scale double-shrinks the panels.
+5. The encoded MP4 lands in app cache, then `saveToMoviesCollection` copies it into `MediaStore.Video` under `Movies/MovementLogger/` via the `IS_PENDING` flag for atomic visibility.
+
+The Done banner exposes an **Open video** button that fires `Intent.ACTION_VIEW` (chooser) on the saved `content://media/...` URI — Photos/Gallery/etc. handle playback. `Intent.FLAG_GRANT_READ_URI_PERMISSION` is set so the picked viewer can read the MediaStore entry.
+
+#### Export gotchas
+
+- **HDR sources trip `OverlayShaderProgram` checkArgument.** HEVC HLG / Ultra-HDR clips (iPhone, Pixel main camera) route through Media3's HDR overlay codepath, which asserts `bitmap.hasGainmap()` on the overlay — our SDR panel bitmap fails. Fix: set `Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL` on the composition. Without it, the Ayano_Pump session crashes with `java.lang.IllegalArgumentException at OverlayShaderProgram.drawFrame:131` on Pixel 8a.
+- **Rotation:** the encoded stream keeps the source's rotation flag (1080×3840 raw bytes for a portrait source) but plays back rotated (3840×1080 displayed → 1080×3840 visible). Don't try to compensate in pixel space; trust the rotation metadata.
 
 ## BLE protocol gotchas (carried over from the Rust client)
 

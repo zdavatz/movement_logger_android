@@ -1,5 +1,6 @@
 package ch.ywesee.movementlogger.ui
 
+import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -28,6 +29,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -117,13 +119,22 @@ fun ReplayScreen(vm: ReplayViewModel = viewModel()) {
             VideoSurface(player = player, hasVideo = state.videoUri != null)
             Spacer(Modifier.height(12.dp))
 
-            Row {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Button(onClick = {
                     videoLauncher.launch(
                         PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
                     )
                 }) { Text(if (state.videoUri == null) "Pick video" else "Replace video") }
+
+                if (canExport(state)) {
+                    Spacer(Modifier.width(12.dp))
+                    OutlinedButton(
+                        onClick = { vm.exportCombinedVideo() },
+                        enabled = state.exportState !is ExportState.Running,
+                    ) { Text("Export combined") }
+                }
             }
+            ExportBanner(state = state.exportState, onDismiss = vm::clearExportState)
 
             Spacer(Modifier.height(12.dp))
             HorizontalDivider()
@@ -562,10 +573,11 @@ private fun VideoSurface(player: ExoPlayer, hasVideo: Boolean) {
 @Composable
 private fun RecordingPicker(vm: ReplayViewModel, state: ReplayUiState) {
     val recordings = remember(state.sensorFile, state.gpsFile) { vm.listLocalRecordings() }
+    val localVideos = remember(state.videoUri) { vm.listLocalVideos() }
     val sensorCandidates = recordings.filter { isSensCsv(it.name) }
     val gpsCandidates = recordings.filter { isGpsCsv(it.name) }
 
-    if (recordings.isEmpty()) {
+    if (recordings.isEmpty() && localVideos.isEmpty()) {
         Text(
             "No CSVs in this app's storage yet. Use the Sync tab to download some first.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -589,6 +601,18 @@ private fun RecordingPicker(vm: ReplayViewModel, state: ReplayUiState) {
         empty = "no Gps*.csv downloaded",
         onPick = vm::pickGpsCsv,
     )
+    if (localVideos.isNotEmpty()) {
+        Spacer(Modifier.height(8.dp))
+        Text("Local video", fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        val selectedVideo = state.videoUri?.path?.let { File(it) }
+        FileChooserList(
+            files = localVideos,
+            selected = selectedVideo,
+            empty = "no .mov/.mp4 in app storage",
+            onPick = vm::pickLocalVideo,
+        )
+    }
 }
 
 @Composable
@@ -661,7 +685,38 @@ private fun AlignmentSummary(state: ReplayUiState) {
             maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(sensorLine, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
         Text(gpsRowsLine, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+
+        // Export trim preview — counts how many rows actually fall inside
+        // the video's time window, so it's obvious that the export will
+        // only render data overlapping the ride.
+        val durMs = state.videoMeta?.durationMillis
+        val createMs = state.videoMeta?.creationTimeMillis
+        if (durMs != null && durMs > 0L && createMs != null && state.gpsAbsTimesMs.isNotEmpty()) {
+            val winStart = createMs
+            val winEnd = createMs + durMs
+            val gpsInWin = countInWindow(state.gpsAbsTimesMs, winStart, winEnd)
+            val sensorInWin = countInWindow(state.sensorAbsTimesMs, winStart, winEnd)
+            Text(
+                "video window:   ${formatLocalTime(winStart)} → ${formatLocalTime(winEnd)}",
+                fontFamily = FontFamily.Monospace, fontSize = 12.sp, maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                "trim → gps:     $gpsInWin / ${state.gpsRows.size}",
+                fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+            )
+            Text(
+                "trim → sensor:  $sensorInWin / ${state.sensorRows.size}",
+                fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+            )
+        }
     }
+}
+
+private fun countInWindow(times: LongArray, lo: Long, hi: Long): Int {
+    var n = 0
+    for (t in times) if (t in lo..hi) n++
+    return n
 }
 
 private fun isSensCsv(name: String): Boolean {
@@ -680,4 +735,81 @@ private fun humanBytesShort(b: Long): String = when {
     b < 1024 -> "$b B"
     b < 1024L * 1024 -> "%.1f KB".format(b / 1024.0)
     else -> "%.2f MB".format(b / (1024.0 * 1024.0))
+}
+
+private fun openVideo(context: android.content.Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "video/mp4")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(Intent.createChooser(intent, "Open video"))
+}
+
+private fun canExport(state: ReplayUiState): Boolean =
+    state.videoUri != null &&
+        state.videoMeta?.creationTimeMillis != null &&
+        state.gpsRows.isNotEmpty() &&
+        state.pitchDeg.isNotEmpty()
+
+@Composable
+private fun ExportBanner(state: ExportState, onDismiss: () -> Unit) {
+    when (state) {
+        is ExportState.Idle -> {}
+        is ExportState.Running -> {
+            Spacer(Modifier.height(12.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(
+                        "Encoding combined video… %d%%".format((state.progress * 100).toInt()),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(
+                        progress = { state.progress.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+        }
+        is ExportState.Done -> {
+            val context = LocalContext.current
+            Spacer(Modifier.height(12.dp))
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Saved to Photos · Movies/MovementLogger",
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(onClick = { openVideo(context, state.uri) }) { Text("Open video") }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = onDismiss) { Text("OK") }
+                }
+            }
+        }
+        is ExportState.Failed -> {
+            Spacer(Modifier.height(12.dp))
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Export failed: ${state.message}", modifier = Modifier.weight(1f))
+                    OutlinedButton(onClick = onDismiss) { Text("Dismiss") }
+                }
+            }
+        }
+    }
 }
