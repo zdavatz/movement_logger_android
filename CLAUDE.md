@@ -69,7 +69,7 @@ app/src/main/java/ch/ywesee/movementlogger/
 5. `FusionHeight.fusedHeightM` — α-β complementary baro + body→world-rotated acc
 6. Per-sensor-row absolute UTC by tick-offset from the GPS anchor
 
-Video alignment: `MediaMetadataRetriever`'s `METADATA_KEY_DATE` against four common ISO-8601 / RFC-3339 spellings → UTC ms. GPS anchor = first parseable `hhmmss.ss` against today's UTC date (the desktop's `--date YYYY-MM-DD` override hasn't landed yet; revisit when needed).
+Video alignment: `MediaMetadataRetriever`'s `METADATA_KEY_DATE` against four common ISO-8601 / RFC-3339 spellings → UTC ms. GPS anchor = first parseable `hhmmss.ss` against the video's session date (extracted via `GpsTime.utcYmdFromMillis` from the video's `creation_time`), falling back to today's UTC date when no video is picked yet. Picking the video after the GPS triggers `ReplayViewModel.reanchorGpsTimes()` so the sensor + GPS abs-time series stay consistent with the playhead.
 
 Panels (all Compose Canvas, all bound to a 33 ms playhead poll):
 

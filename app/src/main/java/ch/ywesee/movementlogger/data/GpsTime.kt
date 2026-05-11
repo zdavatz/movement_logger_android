@@ -49,4 +49,15 @@ object GpsTime {
             cal.get(Calendar.DAY_OF_MONTH),
         )
     }
+
+    /** UTC date (y, m1-12, d) extracted from an absolute UTC millis value. */
+    fun utcYmdFromMillis(millis: Long): Triple<Int, Int, Int> {
+        val cal = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
+        cal.timeInMillis = millis
+        return Triple(
+            cal.get(Calendar.YEAR),
+            cal.get(Calendar.MONTH) + 1,
+            cal.get(Calendar.DAY_OF_MONTH),
+        )
+    }
 }

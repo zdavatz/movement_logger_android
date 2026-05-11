@@ -68,6 +68,38 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
                 VideoMetadataReader.read(getApplication(), uri)
             }
             _state.update { it.copy(videoUri = uri, videoMeta = meta, loading = false) }
+            // Re-anchor any already-loaded GPS rows to the video's session date.
+            // hhmmss.ss strings have no date, so the GPS abs-time series we
+            // computed earlier was anchored to "today" — which is only correct
+            // if the user records and replays the same day.
+            if (_state.value.gpsRows.isNotEmpty()) reanchorGpsTimes()
+        }
+    }
+
+    /** Year/month/day to use when interpreting `hhmmss.ss` UTC strings. */
+    private fun sessionDate(): Triple<Int, Int, Int> {
+        val creation = _state.value.videoMeta?.creationTimeMillis
+        return if (creation != null) GpsTime.utcYmdFromMillis(creation) else GpsTime.todayUtc()
+    }
+
+    private fun reanchorGpsTimes() {
+        viewModelScope.launch(Dispatchers.Default) {
+            val s = _state.value
+            val (y, mo, d) = sessionDate()
+            val rows = s.gpsRows
+            val times = LongArray(rows.size) { i -> GpsTime.toUtcMillis(rows[i].utc, y, mo, d) ?: -1L }
+            val anchor = times.firstOrNull { it >= 0L }
+            _state.update { it.copy(gpsAbsTimesMs = times, gpsAnchorUtcMillis = anchor) }
+            // Sensor abs times are derived from the GPS anchor + tick offset,
+            // so they need a refresh too.
+            if (s.sensorRows.isNotEmpty() && anchor != null) {
+                val firstGpsTicks = s.gpsRows.first().ticks
+                val sensorTimes = LongArray(s.sensorRows.size) { i ->
+                    val deltaTicks = s.sensorRows[i].ticks - firstGpsTicks
+                    anchor + (deltaTicks * 10.0).toLong()
+                }
+                _state.update { it.copy(sensorAbsTimesMs = sensorTimes) }
+            }
         }
     }
 
@@ -92,11 +124,11 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
                 // Precompute the speed series + per-row absolute UTC. Done on
                 // IO since smoothing a 1800-row session is fine but isn't
                 // something to block the main thread on.
+                val (y, mo, d) = sessionDate()
                 val (smoothed, absTimes, anchor) = withContext(Dispatchers.IO) {
                     val raw = GpsMath.positionDerivedSpeedKmh(rows)
                     val cleaned = GpsMath.rejectAccOutliers(rows, raw)
                     val smooth = GpsMath.smoothSpeedKmh(cleaned)
-                    val (y, mo, d) = GpsTime.todayUtc()
                     val times = LongArray(rows.size) { i ->
                         GpsTime.toUtcMillis(rows[i].utc, y, mo, d) ?: -1L
                     }
