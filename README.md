@@ -41,7 +41,7 @@ Scans for the `PumpTsueri` box over BLE, connects via GATT, and drives the FileS
 
 Pick any video from your phone plus a `Sens*.csv` / `Gps*.csv` pair that the Sync tab downloaded, and the app:
 
-1. Pulls the video's `creation_time` from its metadata to anchor wall-clock alignment.
+1. Pulls the video's `creation_time` from its metadata to anchor wall-clock alignment. The GPS CSV's `hhmmss.ss` timestamps carry no date, so the video's UTC date is also used as the session date — replaying a clip from last week stays correctly aligned.
 2. Parses the CSVs.
 3. Runs the full numerics pipeline (Madgwick 6DOF fusion, GPS-anchored baro height, complementary baro + IMU fused height, drift-corrected nose angle, GPS-derived speed with outlier rejection + rolling median).
 4. Renders four data panels stacked below the video player:
