@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -35,6 +36,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -51,9 +53,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -103,6 +107,11 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
             color = MaterialTheme.colorScheme.background,
         ) {
             Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                state.sessionRunning?.let {
+                    SessionBanner(it, onCleared = vm::clearSession)
+                    Spacer(Modifier.height(12.dp))
+                }
+
                 ConnectionBar(
                     state = state,
                     permsGranted = permsGranted,
@@ -114,6 +123,8 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                     onDisconnect = vm::disconnect,
                     onList = vm::listFiles,
                     onStopLog = vm::stopLog,
+                    onSetDuration = vm::setSessionDuration,
+                    onStartSession = vm::startSession,
                 )
 
                 Spacer(Modifier.height(12.dp))
@@ -143,36 +154,138 @@ private fun ConnectionBar(
     onDisconnect: () -> Unit,
     onList: () -> Unit,
     onStopLog: () -> Unit,
+    onSetDuration: (Int) -> Unit,
+    onStartSession: () -> Unit,
 ) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        when (state.connection) {
-            Connection.Disconnected -> {
-                if (!permsGranted) {
-                    Button(onClick = onRequestPerms) { Text("Grant BLE permissions") }
-                } else {
-                    Button(onClick = onScan, enabled = !state.scanning) {
-                        Text(if (state.scanning) "Scanning…" else "Scan for PumpTsueri")
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            when (state.connection) {
+                Connection.Disconnected -> {
+                    if (!permsGranted) {
+                        Button(onClick = onRequestPerms) { Text("Grant BLE permissions") }
+                    } else {
+                        Button(onClick = onScan, enabled = !state.scanning) {
+                            Text(if (state.scanning) "Scanning…" else "Scan for PumpTsueri")
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(onClick = onEnableBt) { Text("Bluetooth…") }
+                    }
+                }
+                Connection.Connecting -> {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("connecting…")
+                }
+                Connection.Connected -> {
+                    Button(onClick = onList, enabled = !state.listing) {
+                        Text(if (state.listing) "Listing…" else "List files")
                     }
                     Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = onEnableBt) { Text("Bluetooth…") }
+                    OutlinedButton(onClick = onStopLog) { Text("STOP_LOG") }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
                 }
-            }
-            Connection.Connecting -> {
-                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                Spacer(Modifier.width(8.dp))
-                Text("connecting…")
-            }
-            Connection.Connected -> {
-                Button(onClick = onList, enabled = !state.listing) {
-                    Text(if (state.listing) "Listing…" else "List files")
-                }
-                Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = onStopLog) { Text("STOP_LOG") }
-                Spacer(Modifier.width(8.dp))
-                OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
             }
         }
+        if (state.connection == Connection.Connected) {
+            Spacer(Modifier.height(8.dp))
+            SessionStarter(
+                durationSeconds = state.sessionDurationSeconds,
+                onDurationChange = onSetDuration,
+                onStart = onStartSession,
+            )
+        }
     }
+}
+
+@Composable
+private fun SessionStarter(
+    durationSeconds: Int,
+    onDurationChange: (Int) -> Unit,
+    onStart: () -> Unit,
+) {
+    // Local text state so partial edits ("18", "180", "1800") aren't clamped
+    // back as the user types. Reseeds when the model value changes.
+    var text by remember(durationSeconds) { androidx.compose.runtime.mutableStateOf(durationSeconds.toString()) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OutlinedTextField(
+            value = text,
+            onValueChange = { raw ->
+                text = raw.filter { it.isDigit() }.take(5)
+                text.toIntOrNull()?.let(onDurationChange)
+            },
+            label = { Text("Duration") },
+            suffix = { Text("s · ${humanDuration(durationSeconds)}") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.width(200.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Button(
+            onClick = onStart,
+            enabled = durationSeconds in 1..86_400,
+        ) { Text("Start session") }
+    }
+}
+
+@Composable
+private fun SessionBanner(running: SessionRunning, onCleared: () -> Unit) {
+    var nowMs by androidx.compose.runtime.remember { androidx.compose.runtime.mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(running) {
+        while (true) {
+            nowMs = System.currentTimeMillis()
+            if (running.remainingMillis(nowMs) <= 0L) break
+            delay(1000)
+        }
+        onCleared()
+    }
+    val remainingMs = running.remainingMillis(nowMs)
+    val remainingSecs = (remainingMs / 1000).toInt()
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+        ),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+            Text(
+                "LOG session running",
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            Text(
+                "${formatRemaining(remainingSecs)} remaining of ${humanDuration(running.durationSeconds)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Box is in LOG mode and invisible to Scan. Short-press the button on the box to abort early.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+        }
+    }
+}
+
+private fun humanDuration(secs: Int): String {
+    val h = secs / 3600
+    val m = (secs / 60) % 60
+    val s = secs % 60
+    return when {
+        h > 0 && m > 0 -> "${h}h ${m}m"
+        h > 0 -> "${h}h"
+        m > 0 && s > 0 -> "${m}m ${s}s"
+        m > 0 -> "${m}m"
+        else -> "${s}s"
+    }
+}
+
+private fun formatRemaining(secs: Int): String {
+    val h = secs / 3600
+    val m = (secs / 60) % 60
+    val s = secs % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
 }
 
 @Composable

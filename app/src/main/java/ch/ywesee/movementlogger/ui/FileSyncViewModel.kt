@@ -26,6 +26,20 @@ data class DownloadProgress(val bytesDone: Long, val total: Long) {
 
 enum class Connection { Disconnected, Connecting, Connected }
 
+/**
+ * In-flight LOG session on the box. Recorded optimistically when the user
+ * taps Start session: the firmware reboots ~50 ms later so the BLE link
+ * dies, and the box is invisible to Scan until `durationSeconds` elapses.
+ * Used to render the countdown banner.
+ */
+data class SessionRunning(
+    val startedAtMillis: Long,
+    val durationSeconds: Int,
+) {
+    fun remainingMillis(nowMillis: Long): Long =
+        (startedAtMillis + durationSeconds * 1000L - nowMillis).coerceAtLeast(0L)
+}
+
 data class FileSyncUiState(
     val connection: Connection = Connection.Disconnected,
     val scanning: Boolean = false,
@@ -35,6 +49,8 @@ data class FileSyncUiState(
     val savedPaths: Map<String, String> = emptyMap(),
     val listing: Boolean = false,
     val log: List<String> = emptyList(),
+    val sessionDurationSeconds: Int = 1800,  // 30-min default, matches desktop
+    val sessionRunning: SessionRunning? = null,
 )
 
 class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
@@ -97,6 +113,40 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
     fun stopLog() {
         log("STOP_LOG")
         ble.send(BleCmd.StopLog)
+    }
+
+    fun setSessionDuration(seconds: Int) {
+        val clamped = seconds.coerceIn(1, 86_400)  // 1 s .. 24 h, same range as desktop
+        _state.update { it.copy(sessionDurationSeconds = clamped) }
+    }
+
+    fun startSession() {
+        val dur = _state.value.sessionDurationSeconds
+        log("START_LOG $dur s — box rebooting to LOG mode")
+        ble.send(BleCmd.StartLog(dur))
+        // Firmware NVIC_SystemReset's ~50 ms after START_LOG, so the BLE
+        // link dies abruptly without LL_TERMINATE_IND. Send an explicit
+        // Disconnect right after to tear down host state proactively;
+        // either way the worker ends up Idle.
+        ble.send(BleCmd.Disconnect)
+        _state.update {
+            it.copy(
+                sessionRunning = SessionRunning(
+                    startedAtMillis = System.currentTimeMillis(),
+                    durationSeconds = dur,
+                ),
+                files = emptyList(),
+                downloads = emptyMap(),
+                listing = false,
+            )
+        }
+    }
+
+    fun clearSession() {
+        if (_state.value.sessionRunning != null) {
+            log("LOG session deadline reached — box should be advertising again")
+            _state.update { it.copy(sessionRunning = null) }
+        }
     }
 
     // ---------------- Event handling ---------------------------------------
