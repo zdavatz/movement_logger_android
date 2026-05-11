@@ -139,13 +139,27 @@ object GpsMath {
         }
     }
 
-    /** Centred rolling-median with a `window`-sized buffer. */
-    internal fun rollingMedian(x: DoubleArray, window: Int): DoubleArray {
+    /**
+     * Centred rolling-median. Dispatches between a copy-and-sort impl for
+     * tiny windows and a TreeMap-multiset incremental impl for big windows
+     * (e.g. the 60 s × 100 Hz = 6000-sample baseline used by the fusion's
+     * nose-angle drift correction).
+     *
+     * Both impls pick `sorted[len/2]` so they agree on even-length windows.
+     */
+    fun rollingMedian(x: DoubleArray, window: Int): DoubleArray {
+        val w = maxOf(window, 1)
+        return if (x.size < 64 || w < 32) rollingMedianSimple(x, w) else rollingMedianFast(x, w)
+    }
+
+    internal fun rollingMedianSimple(x: DoubleArray, window: Int): DoubleArray {
         val n = x.size
         val w = maxOf(window, 1)
         val half = w / 2
         val out = DoubleArray(n)
-        val buf = DoubleArray(w)
+        // Centred window at index i covers [i-half, i+half+1), so for even w
+        // the range is `w + 1` wide — buffer one slot beyond `w` to handle it.
+        val buf = DoubleArray(w + 1)
         for (i in 0 until n) {
             val lo = maxOf(i - half, 0)
             val hi = minOf(i + half + 1, n)
@@ -153,6 +167,80 @@ object GpsMath {
             for (k in 0 until len) buf[k] = x[lo + k]
             Arrays.sort(buf, 0, len)
             out[i] = buf[len / 2]
+        }
+        return out
+    }
+
+    /**
+     * O(n · log w) rolling median via two TreeMap multisets. `lower` and
+     * `upper` together hold the current window; we balance so lower has
+     * ⌈total/2⌉ elements (odd total → median = lower.lastKey, even total
+     * → median = upper.firstKey, matching `sorted[len/2]`).
+     */
+    internal fun rollingMedianFast(x: DoubleArray, window: Int): DoubleArray {
+        val n = x.size
+        if (n == 0) return DoubleArray(0)
+        val w = maxOf(window, 1)
+        val half = w / 2
+        val out = DoubleArray(n)
+
+        val lower = java.util.TreeMap<Double, Int>()
+        val upper = java.util.TreeMap<Double, Int>()
+        var lowerSize = 0
+        var upperSize = 0
+
+        fun addLower(v: Double) {
+            lower.merge(v, 1) { a, b -> a + b }
+            lowerSize++
+        }
+        fun addUpper(v: Double) {
+            upper.merge(v, 1) { a, b -> a + b }
+            upperSize++
+        }
+        fun removeLower(v: Double) {
+            val c = lower[v]!!
+            if (c == 1) lower.remove(v) else lower[v] = c - 1
+            lowerSize--
+        }
+        fun removeUpper(v: Double) {
+            val c = upper[v]!!
+            if (c == 1) upper.remove(v) else upper[v] = c - 1
+            upperSize--
+        }
+        fun balance() {
+            while (lowerSize > upperSize + 1) {
+                val v = lower.lastKey()
+                removeLower(v); addUpper(v)
+            }
+            while (upperSize > lowerSize) {
+                val v = upper.firstKey()
+                removeUpper(v); addLower(v)
+            }
+        }
+        fun insert(v: Double) {
+            if (lowerSize == 0 || v <= lower.lastKey()) addLower(v) else addUpper(v)
+            balance()
+        }
+        fun remove(v: Double) {
+            if (lower.containsKey(v)) removeLower(v) else removeUpper(v)
+            balance()
+        }
+        fun median(): Double {
+            val total = lowerSize + upperSize
+            return if (total % 2 == 1) lower.lastKey() else upper.firstKey()
+        }
+
+        // Centred window at i=0 covers x[0 .. min(half+1, n)).
+        val initialHi = minOf(half + 1, n)
+        for (k in 0 until initialHi) insert(x[k])
+        out[0] = median()
+
+        for (i in 1 until n) {
+            val newR = i + half
+            if (newR < n) insert(x[newR])
+            val oldL = i - half - 1
+            if (oldL >= 0) remove(x[oldL])
+            out[i] = median()
         }
         return out
     }

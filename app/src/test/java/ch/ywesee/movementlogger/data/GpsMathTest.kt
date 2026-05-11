@@ -96,4 +96,32 @@ class GpsMathTest {
         // = [1,2,3,4,100]; the median is buf[len/2] = buf[2] = 3.
         assertEquals(3.0, out[2], 0.0)
     }
+
+    @Test
+    fun fastAndSimpleMedianAgree() {
+        // Random-ish data, large enough to exercise the fast path.
+        val n = 1024
+        val seed = 7L
+        val rng = java.util.Random(seed)
+        val a = DoubleArray(n) { rng.nextDouble() * 100.0 - 50.0 }
+        val w = 51  // odd, > 32 → fast path
+        val fast = GpsMath.rollingMedianFast(a, w)
+        val slow = GpsMath.rollingMedianSimple(a, w)
+        for (i in 0 until n) {
+            assertEquals("idx $i", slow[i], fast[i], 1e-12)
+        }
+    }
+
+    @Test
+    fun fastMedianHandlesEvenWindow() {
+        val n = 512
+        val rng = java.util.Random(11L)
+        val a = DoubleArray(n) { rng.nextDouble() * 10.0 }
+        val w = 64  // even, > 32
+        val fast = GpsMath.rollingMedianFast(a, w)
+        val slow = GpsMath.rollingMedianSimple(a, w)
+        for (i in 0 until n) {
+            assertEquals("idx $i", slow[i], fast[i], 1e-12)
+        }
+    }
 }

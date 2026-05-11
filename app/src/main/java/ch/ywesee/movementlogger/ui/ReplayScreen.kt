@@ -169,6 +169,42 @@ fun ReplayScreen(vm: ReplayViewModel = viewModel()) {
                     playheadMs = playheadMs,
                 )
             }
+            if (state.computing) {
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.width(20.dp).height(20.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("running fusion + baro + nose-angle…")
+                }
+            }
+            if (state.pitchDeg.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                PitchPanel(
+                    pitchDeg = state.pitchDeg,
+                    sensorAbsTimesMs = state.sensorAbsTimesMs,
+                    videoCreationMs = state.videoMeta?.creationTimeMillis,
+                    playheadMs = playheadMs,
+                )
+            }
+            if (state.fusedHeightM.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                HeightPanel(
+                    baroM = state.baroHeightM,
+                    fusedM = state.fusedHeightM,
+                    sensorAbsTimesMs = state.sensorAbsTimesMs,
+                    videoCreationMs = state.videoMeta?.creationTimeMillis,
+                    playheadMs = playheadMs,
+                )
+            }
+            if (state.gpsRows.size > 1) {
+                Spacer(Modifier.height(12.dp))
+                GpsTrackPanel(
+                    gpsRows = state.gpsRows,
+                    gpsAbsTimesMs = state.gpsAbsTimesMs,
+                    videoCreationMs = state.videoMeta?.creationTimeMillis,
+                    playheadMs = playheadMs,
+                )
+            }
         }
     }
 }
@@ -247,6 +283,232 @@ private fun SpeedPanel(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+    }
+}
+
+@Composable
+private fun PitchPanel(
+    pitchDeg: DoubleArray,
+    sensorAbsTimesMs: LongArray,
+    videoCreationMs: Long?,
+    playheadMs: Long,
+) {
+    val n = pitchDeg.size
+    if (n < 2) return
+    var minV = Double.POSITIVE_INFINITY
+    var maxV = Double.NEGATIVE_INFINITY
+    for (v in pitchDeg) { if (v < minV) minV = v; if (v > maxV) maxV = v }
+    // Keep zero visible — pad symmetrically around 0.
+    val absMax = maxOf(kotlin.math.abs(minV), kotlin.math.abs(maxV), 5.0)
+    val cursorIdx = if (videoCreationMs != null && sensorAbsTimesMs.isNotEmpty()) {
+        nearestIndexByTime(sensorAbsTimesMs, videoCreationMs + playheadMs)
+    } else -1
+    val currentPitch = if (cursorIdx in 0 until n) pitchDeg[cursorIdx] else 0.0
+
+    val lineColor = MaterialTheme.colorScheme.secondary
+    val zeroColor = MaterialTheme.colorScheme.outline
+    Column {
+        Text("Pitch / Nasenwinkel (°)", fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(140.dp)
+                .background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(8.dp))
+                .padding(8.dp),
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val w = size.width
+                val h = size.height
+                val zeroY = h / 2f
+                drawLine(zeroColor, Offset(0f, zeroY), Offset(w, zeroY), strokeWidth = 1f)
+                val path = Path()
+                for (i in 0 until n) {
+                    val x = i.toFloat() / (n - 1) * w
+                    val y = zeroY - (pitchDeg[i] / absMax * (h / 2)).toFloat()
+                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                drawPath(path, color = lineColor, style = Stroke(width = 2.dp.toPx()))
+                if (cursorIdx in 0 until n) {
+                    val cx = cursorIdx.toFloat() / (n - 1) * w
+                    drawLine(
+                        color = Color(0xFFD32F2F),
+                        start = Offset(cx, 0f),
+                        end = Offset(cx, h),
+                        strokeWidth = 1.5.dp.toPx(),
+                    )
+                }
+            }
+            Column(modifier = Modifier.align(Alignment.TopStart)) {
+                Text(
+                    "now %+.1f°".format(currentPitch),
+                    fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                )
+                Text(
+                    "±%.0f°".format(absMax),
+                    fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HeightPanel(
+    baroM: DoubleArray,
+    fusedM: DoubleArray,
+    sensorAbsTimesMs: LongArray,
+    videoCreationMs: Long?,
+    playheadMs: Long,
+) {
+    val n = fusedM.size
+    if (n < 2) return
+    var minV = Double.POSITIVE_INFINITY
+    var maxV = Double.NEGATIVE_INFINITY
+    for (v in baroM) { if (v < minV) minV = v; if (v > maxV) maxV = v }
+    for (v in fusedM) { if (v < minV) minV = v; if (v > maxV) maxV = v }
+    if (maxV - minV < 0.2) { minV -= 0.1; maxV += 0.1 }
+    val span = maxV - minV
+
+    val cursorIdx = if (videoCreationMs != null && sensorAbsTimesMs.isNotEmpty()) {
+        nearestIndexByTime(sensorAbsTimesMs, videoCreationMs + playheadMs)
+    } else -1
+    val curBaro = if (cursorIdx in baroM.indices) baroM[cursorIdx] else 0.0
+    val curFused = if (cursorIdx in fusedM.indices) fusedM[cursorIdx] else 0.0
+
+    val baroColor = MaterialTheme.colorScheme.outline
+    val fusedColor = MaterialTheme.colorScheme.primary
+    Column {
+        Text("Height above water (m)", fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(160.dp)
+                .background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(8.dp))
+                .padding(8.dp),
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val w = size.width
+                val h = size.height
+
+                fun draw(arr: DoubleArray, color: Color, stroke: Float) {
+                    if (arr.size < 2) return
+                    val path = Path()
+                    for (i in 0 until arr.size) {
+                        val x = i.toFloat() / (arr.size - 1) * w
+                        val y = h - ((arr[i] - minV) / span * h).toFloat()
+                        if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    }
+                    drawPath(path, color = color, style = Stroke(width = stroke))
+                }
+                draw(baroM, baroColor, 1.dp.toPx())
+                draw(fusedM, fusedColor, 2.dp.toPx())
+
+                if (cursorIdx in 0 until n) {
+                    val cx = cursorIdx.toFloat() / (n - 1) * w
+                    drawLine(
+                        color = Color(0xFFD32F2F),
+                        start = Offset(cx, 0f),
+                        end = Offset(cx, h),
+                        strokeWidth = 1.5.dp.toPx(),
+                    )
+                }
+            }
+            Column(modifier = Modifier.align(Alignment.TopStart)) {
+                Text(
+                    "fused %+.2f m".format(curFused),
+                    fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    "baro  %+.2f m".format(curBaro),
+                    fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "range %+.2f .. %+.2f".format(minV, maxV),
+                    fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun GpsTrackPanel(
+    gpsRows: List<ch.ywesee.movementlogger.data.GpsRow>,
+    gpsAbsTimesMs: LongArray,
+    videoCreationMs: Long?,
+    playheadMs: Long,
+) {
+    if (gpsRows.size < 2) return
+    var minLat = Double.POSITIVE_INFINITY
+    var maxLat = Double.NEGATIVE_INFINITY
+    var minLon = Double.POSITIVE_INFINITY
+    var maxLon = Double.NEGATIVE_INFINITY
+    for (r in gpsRows) {
+        if (r.lat < minLat) minLat = r.lat
+        if (r.lat > maxLat) maxLat = r.lat
+        if (r.lon < minLon) minLon = r.lon
+        if (r.lon > maxLon) maxLon = r.lon
+    }
+    // Aspect-correct longitude span by cos(meanLat) so 1° lon ≠ 1° lat.
+    val meanLat = (minLat + maxLat) / 2.0
+    val lonScale = kotlin.math.cos(Math.toRadians(meanLat))
+    val latSpan = (maxLat - minLat).coerceAtLeast(1e-9)
+    val lonSpan = ((maxLon - minLon) * lonScale).coerceAtLeast(1e-9)
+
+    val cursorIdx = if (videoCreationMs != null && gpsAbsTimesMs.isNotEmpty()) {
+        nearestIndexByTime(gpsAbsTimesMs, videoCreationMs + playheadMs)
+    } else -1
+
+    val trackColor = MaterialTheme.colorScheme.tertiary
+    Column {
+        Text("GPS track", fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(8.dp))
+                .padding(8.dp),
+        ) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val w = size.width
+                val h = size.height
+                // Fit-to-canvas with uniform scale: pick the tighter of the two axes
+                val scale = minOf(w / lonSpan, h / latSpan).toFloat()
+                val cx = w / 2f
+                val cy = h / 2f
+                val lonMid = (minLon + maxLon) / 2.0
+                val latMid = (minLat + maxLat) / 2.0
+                fun project(lat: Double, lon: Double): Offset {
+                    val dx = ((lon - lonMid) * lonScale * scale).toFloat()
+                    val dy = ((lat - latMid) * scale).toFloat()
+                    // North up: subtract dy since canvas y grows down.
+                    return Offset(cx + dx, cy - dy)
+                }
+
+                val path = Path()
+                for (i in gpsRows.indices) {
+                    val p = project(gpsRows[i].lat, gpsRows[i].lon)
+                    if (i == 0) path.moveTo(p.x, p.y) else path.lineTo(p.x, p.y)
+                }
+                drawPath(path, color = trackColor, style = Stroke(width = 2.dp.toPx()))
+
+                if (cursorIdx in gpsRows.indices) {
+                    val p = project(gpsRows[cursorIdx].lat, gpsRows[cursorIdx].lon)
+                    drawCircle(
+                        color = Color(0xFFD32F2F),
+                        radius = 6.dp.toPx(),
+                        center = p,
+                    )
+                }
+            }
         }
     }
 }
