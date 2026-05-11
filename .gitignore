@@ -11,3 +11,6 @@ captures/
 *.aab
 *.keystore
 *.jks
+*.store
+signing.properties
+keystore/
