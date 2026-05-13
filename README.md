@@ -75,13 +75,24 @@ For signed release builds, drop a `signing.properties` at the repo root with `ST
 
 ## Releasing
 
-Pushing a `vX.Y.Z` git tag fires `.github/workflows/release.yml`, which derives `versionName` + `versionCode` from the tag, builds a signed AAB + APK, uploads to the Play Store **internal** track via Gradle Play Publisher (bundle + listing + screenshots + release notes), and creates a GitHub release with both binaries attached:
+Pushing a `vX.Y.Z` git tag fires `.github/workflows/release.yml`, which derives `versionName` + `versionCode` from the tag, builds a signed AAB + APK, uploads to the Play Store **internal** track (bundle + listing + screenshots + 512×512 icon + Ayano promo video URL + release notes via `scripts/publish_to_play.py`), and creates a GitHub release with both binaries attached:
 
 ```sh
-git tag v0.0.6 && git push origin v0.0.6
+git tag v0.0.13 && git push origin v0.0.13
 ```
 
-See [CLAUDE.md](CLAUDE.md) for the full release-pipeline docs (required GitHub secrets, listing source-of-truth under `app/src/main/play/`, why we call `publishReleaseBundle publishReleaseListing` instead of `publishReleaseApps`).
+Manual production push (when you're ready to promote — Play Console forms must be complete first):
+
+```sh
+./gradlew bundleRelease -PappVersionName=0.0.13 -PappVersionCode=13
+python3 scripts/publish_to_play.py \
+  --aab app/build/outputs/bundle/release/app-release.aab \
+  --version-name 0.0.13 \
+  --track production \
+  --release-status draft   # required while the app is still in Play "draft" state
+```
+
+See [CLAUDE.md](CLAUDE.md) for the full release-pipeline docs (required GitHub secrets, listing source-of-truth under `app/src/main/play/`, why we run a direct-API Python script instead of Gradle Play Publisher).
 
 ## Architecture
 

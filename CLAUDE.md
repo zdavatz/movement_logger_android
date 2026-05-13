@@ -125,7 +125,7 @@ The Done banner exposes an **Open video** button that fires `Intent.ACTION_VIEW`
 
 ## Release pipeline
 
-Releases are driven from a single source: push a `vX.Y.Z` git tag and the GitHub Actions workflow at `.github/workflows/release.yml` builds the signed AAB + APK, uploads to the Play Store **internal** track via Gradle Play Publisher, and creates a GitHub release with the binaries attached. No local commit-and-bump dance needed.
+Releases are driven from a single source: push a `vX.Y.Z` git tag and the GitHub Actions workflow at `.github/workflows/release.yml` builds the signed AAB + APK, runs `scripts/publish_to_play.py` to upload everything (bundle, listing texts, screenshots, 512×512 icon, video URL, contact email, release notes) to the Play Store **internal** track via the Android Publisher v3 API directly, and creates a GitHub release with the binaries attached. No local commit-and-bump dance needed.
 
 ```sh
 git tag v0.0.6
@@ -152,36 +152,60 @@ Add via Settings → Secrets and variables → Actions:
 | `KEY_PASSWORD`                 | the `KEY_PASSWORD` value                                                                       |
 | `PLAY_SERVICE_ACCOUNT_JSON`    | full JSON contents of the Play Console service-account key (paste the file verbatim)            |
 
-Service-account JSON comes from Play Console → Setup → API access → Create new service account → grant "Release manager" → download key. The Android Publisher API must be enabled on the linked GCP project (one-time, prompted in the same flow).
+Service-account JSON comes from Google Cloud Console (Service Accounts → Create → download JSON key) plus a one-time grant in Play Console → Nutzer und Berechtigungen → invite the SA email and give Admin / all-permissions on Movement Logger. The Android Publisher API must be enabled in the GCP project (one-time, click-through prompt the first time you use it).
 
 ### Local development
 
-`signing.properties` + `keystore/movement_logger_upload.keystore` at the repo root work the same as before for local signed builds (`./gradlew bundleRelease assembleRelease`). The Play Publisher plugin's tasks only run when explicitly invoked, so day-to-day builds are unaffected. Drop `play-service-account.json` at the repo root if you want to test `publishReleaseApps` locally — it's gitignored.
+`signing.properties` + `keystore/movement_logger_upload.keystore` at the repo root work the same as before for local signed builds (`./gradlew bundleRelease assembleRelease`). The Play Publisher plugin's tasks are disabled via `play { enabled.set(false) }`, so day-to-day builds are unaffected by the missing service-account JSON. Drop `play-service-account.json` at the repo root if you want to run `scripts/publish_to_play.py` locally — it's gitignored.
+
+### Promoting to production
+
+The workflow defaults to the **internal** track with status `completed`. To push to production:
+
+```sh
+./gradlew bundleRelease -PappVersionName=0.0.X -PappVersionCode=X --rerun-tasks
+python3 scripts/publish_to_play.py \
+  --aab app/build/outputs/bundle/release/app-release.aab \
+  --version-name 0.0.X \
+  --track production \
+  --release-status draft
+```
+
+`--release-status draft` is required while the app itself is still in Play Console "draft" state (i.e. no production release has ever been approved). The release lands as a draft in Play Console; complete the data-safety / content-rating / target-audience / app-category / privacy-policy forms in the web UI, then click **Send for review** to actually publish.
 
 ### Play listing source of truth
 
-`app/src/main/play/` holds the listing metadata that the workflow uploads on each release:
+`app/src/main/play/` holds the listing metadata that `scripts/publish_to_play.py` uploads on each release:
 
-- `default-language.txt` — `en-US`
-- `listings/en-US/title.txt`, `short-description.txt`, `full-description.txt`
-- `listings/en-US/graphics/phone-screenshots/*.png` — synced from `/screenshots/`
-- `release-notes/en-US/default.txt` — what's new in the latest version
+- `default-language.txt` — `de-DE` (matches Play Console's default locale, which was set when the app was created with a German UI)
+- `listings/de-DE/title.txt`, `short-description.txt`, `full-description.txt`
+- `listings/de-DE/video-url.txt` — YouTube watch URL (one per locale; Play rejects direct uploads)
+- `listings/de-DE/graphics/phone-screenshots/*.png` — synced from `/screenshots/`; min 2, max 8, 16:9 or 9:16 (or close to it, each side max 2.3× the other)
+- `listings/de-DE/graphics/icon/icon.png` — 512×512 RGB (no alpha; Play rejects alpha channels on icons)
+- `release-notes/de-DE/default.txt` — "what's new" string for the upcoming release
 
-Edit these files in the same commit that bumps the version, and they ride along on the next tag push. The `resolutionStrategy = AUTO` setting on the `play { }` block means the plugin won't clobber a higher version already on Play.
+Edit these files in the same commit that bumps the version, and they ride along on the next tag push.
 
-### Why the workflow runs two specific tasks instead of `publishReleaseApps`
+### Why we replaced Gradle Play Publisher with a direct-API script
 
-Gradle Play Publisher's umbrella task `publishReleaseApps` chains in `publishReleaseProducts` + `publishReleaseSubscriptions`, both of which hit the legacy `/applications/.../inappproducts` v3 endpoint. Google has flagged that endpoint with `PERMISSION_DENIED: "Please migrate to the new publishing API."` for apps that have never had in-app products configured (which is us — no IAPs in Movement Logger). Same goes for the `bootstrapListing` task. Workaround: run `publishReleaseBundle publishReleaseListing` explicitly — those skip the IAP path and Gradle batches the two writes into a single `commitEdit` at the end.
+Three independent reasons:
+
+1. **Deprecated IAP endpoint.** GPP's umbrella `publishReleaseApps` chains in `publishReleaseProducts` + `publishReleaseSubscriptions`, which hit the legacy `/applications/.../inappproducts` v3 endpoint. Google flagged it with `PERMISSION_DENIED: "Please migrate to the new publishing API."` for apps that have never had in-app products configured. Same for the `bootstrapListing` task — both query IAPs even when none exist.
+2. **No `changesNotSentForReview` in 3.x.** GPP 3.13's `play { }` extension lacks `changesNotSentForReview` (landed in 4.0, which requires Gradle 9). We initially needed it to bypass the review gate; turned out Google now rejects `changesNotSentForReview=true` with `INVALID_ARGUMENT: "Changes are sent for review automatically"` for this app, so we don't need it after all — but discovering that took several failed runs.
+3. **Aggressive Gradle UP-TO-DATE caching.** GPP's `publishReleaseListing` decides what's been uploaded based on local file mtimes, not on actual Play state. If you re-run the workflow after a partial failure, GPP says "UP-TO-DATE" and skips the uploads even though Play has nothing. Forcing `--rerun-tasks` works but defeats incremental builds elsewhere.
+
+`scripts/publish_to_play.py` sidesteps all three: one open edit, explicit uploads of bundle + listing + screenshots + icon + release-notes + details, one commit. ~250 LOC, no plugin dependency. GPP stays applied (`play { enabled.set(false) }`) only so `processReleaseVersionCodes` continues to wire into the bundle task graph cleanly; all its real publish tasks are off.
 
 ### First-release caveats
 
-The Play Developer API can publish updates but can't create the app entry itself. Before the first tag push, the user must have:
+Before the first production push from this pipeline, the developer must have:
 
-1. Created the app on https://play.google.com/console (one-time).
-2. Filled in the **data-safety form**, **content rating**, **target audience**, and **app category** in the web console (API can't touch these).
-3. Uploaded a 512×512 icon and 1024×500 feature graphic (we could automate via GPP but skip for now — easier to do once in the web UI).
+1. **Created the app entry** on https://play.google.com/console (one-time). The API can publish updates but not create the app itself.
+2. **Created a dedicated upload keystore** (`keystore/movement_logger_upload.keystore`) — Play Console's App Signing rejects keys reused across apps, so the ywesee shared `release.keystore` (still used by generika/sdif/parados) cannot be used here.
+3. **Granted the service-account Admin (or Release manager)** on Movement Logger via Play Console → Nutzer und Berechtigungen.
+4. **Completed the Play-Console-only forms** before production reviews accept anything: Datenschutzerklärung URL, Datenschutz/Data safety, Altersfreigabe/Content rating questionnaire, Zielgruppe/Target audience, App-Kategorie. The API can stage a draft release without these but cannot send it for review.
 
-The API upload succeeds on first push; the release sits in **draft** until those web-only fields are complete.
+Internal track uploads work as soon as 1+2+3 are done; production reviews need 4 on top.
 
 ## Memory and references
 
