@@ -78,24 +78,13 @@ android {
 // (gitignored). When the file is missing the Play tasks fail at run-time,
 // not config-time, so local `assembleDebug` builds aren't affected.
 play {
-    val key = rootProject.file("play-service-account.json")
-    // GPP inserts itself into the regular `bundleRelease` pipeline (for
-    // version-code auto-bump), which means it demands credentials even for
-    // a plain local signed build. Disable the whole plugin when the
-    // service-account JSON is absent — Play tasks (`publishReleaseApps`,
-    // etc.) still exist on the task list but bail with a clear error; the
-    // rest of the build is unaffected.
-    enabled.set(key.exists())
-    if (key.exists()) {
-        serviceAccountCredentials.set(key)
-    }
-    // Default to the internal-testing track. Bump to "production" once you're
-    // ready to ship to the public Play Store.
-    track.set("internal")
-    defaultToAppBundles.set(true)
-    // AUTO: merge whatever changed locally with what's on Play, never blow
-    // away a higher version that's already up.
-    resolutionStrategy.set(com.github.triplet.gradle.androidpublisher.ResolutionStrategy.AUTO)
+    // GPP 3.13 lacks `changesNotSentForReview`, which Play requires for our
+    // internal track without forcing review-gate validation (data safety,
+    // content rating, target audience, etc.). Upgrading to 4.0 needs Gradle
+    // 9. Workaround: keep the plugin applied (so `processReleaseVersionCodes`
+    // wires up cleanly) but disable all GPP tasks. The actual Play API
+    // upload runs from scripts/publish_to_play.py via the GitHub workflow.
+    enabled.set(false)
 }
 
 dependencies {

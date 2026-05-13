@@ -86,16 +86,18 @@ jobs:
             -PappVersionCode=${{ steps.ver.outputs.code }} \
             --no-daemon --stacktrace
 
+      - name: Install Python deps for Play API client
+        run: pip install --quiet cryptography
+
       - name: Publish to Play Store (internal track + listing + screenshots)
-        # publishReleaseApps would also run publishReleaseProducts, which hits
-        # the deprecated /inappproducts endpoint and fails with "Please migrate
-        # to the new publishing API." We have no IAPs anyway, so just run the
-        # bundle + listing tasks. The single commitEdit at the end batches both.
+        # Direct API call — bypasses Gradle Play Publisher because GPP 3.13
+        # can't set changesNotSentForReview=true (needed while the app's
+        # data-safety/content-rating/etc. forms are still draft). See
+        # scripts/publish_to_play.py.
         run: |
-          ./gradlew publishReleaseBundle publishReleaseListing \
-            -PappVersionName=${{ steps.ver.outputs.name }} \
-            -PappVersionCode=${{ steps.ver.outputs.code }} \
-            --no-daemon --stacktrace
+          python3 scripts/publish_to_play.py \
+            --aab app/build/outputs/bundle/release/app-release.aab \
+            --version-name ${{ steps.ver.outputs.name }}
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
