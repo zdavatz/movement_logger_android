@@ -142,7 +142,7 @@ Add via Settings → Secrets and variables → Actions:
 
 | Secret name                    | Value                                                                                          |
 | ------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `RELEASE_KEYSTORE_BASE64`      | `base64 -w0 keystore/release.keystore` output (single line, no newlines)                       |
+| `RELEASE_KEYSTORE_BASE64`      | `base64 -w0 keystore/movement_logger_upload.keystore` output (single line, no newlines)                       |
 | `STORE_PASSWORD`               | the `STORE_PASSWORD` value from local `signing.properties`                                      |
 | `KEY_ALIAS`                    | the `KEY_ALIAS` value                                                                          |
 | `KEY_PASSWORD`                 | the `KEY_PASSWORD` value                                                                       |
@@ -152,7 +152,7 @@ Service-account JSON comes from Play Console → Setup → API access → Create
 
 ### Local development
 
-`signing.properties` + `keystore/release.keystore` at the repo root work the same as before for local signed builds (`./gradlew bundleRelease assembleRelease`). The Play Publisher plugin's tasks only run when explicitly invoked, so day-to-day builds are unaffected. Drop `play-service-account.json` at the repo root if you want to test `publishReleaseApps` locally — it's gitignored.
+`signing.properties` + `keystore/movement_logger_upload.keystore` at the repo root work the same as before for local signed builds (`./gradlew bundleRelease assembleRelease`). The Play Publisher plugin's tasks only run when explicitly invoked, so day-to-day builds are unaffected. Drop `play-service-account.json` at the repo root if you want to test `publishReleaseApps` locally — it's gitignored.
 
 ### Play listing source of truth
 
@@ -164,6 +164,10 @@ Service-account JSON comes from Play Console → Setup → API access → Create
 - `release-notes/en-US/default.txt` — what's new in the latest version
 
 Edit these files in the same commit that bumps the version, and they ride along on the next tag push. The `resolutionStrategy = AUTO` setting on the `play { }` block means the plugin won't clobber a higher version already on Play.
+
+### Why the workflow runs two specific tasks instead of `publishReleaseApps`
+
+Gradle Play Publisher's umbrella task `publishReleaseApps` chains in `publishReleaseProducts` + `publishReleaseSubscriptions`, both of which hit the legacy `/applications/.../inappproducts` v3 endpoint. Google has flagged that endpoint with `PERMISSION_DENIED: "Please migrate to the new publishing API."` for apps that have never had in-app products configured (which is us — no IAPs in Movement Logger). Same goes for the `bootstrapListing` task. Workaround: run `publishReleaseBundle publishReleaseListing` explicitly — those skip the IAP path and Gradle batches the two writes into a single `commitEdit` at the end.
 
 ### First-release caveats
 

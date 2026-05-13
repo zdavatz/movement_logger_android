@@ -87,8 +87,12 @@ jobs:
             --no-daemon --stacktrace
 
       - name: Publish to Play Store (internal track + listing + screenshots)
+        # publishReleaseApps would also run publishReleaseProducts, which hits
+        # the deprecated /inappproducts endpoint and fails with "Please migrate
+        # to the new publishing API." We have no IAPs anyway, so just run the
+        # bundle + listing tasks. The single commitEdit at the end batches both.
         run: |
-          ./gradlew publishReleaseApps \
+          ./gradlew publishReleaseBundle publishReleaseListing \
             -PappVersionName=${{ steps.ver.outputs.name }} \
             -PappVersionCode=${{ steps.ver.outputs.code }} \
             --no-daemon --stacktrace
