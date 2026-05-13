@@ -33,7 +33,9 @@ app/src/main/java/ch/ywesee/movementlogger/
 ├── MainActivity.kt          → MainNav
 ├── ble/
 │   ├── FileSyncProtocol.kt    UUIDs, opcodes, status bytes
-│   └── BleClient.kt           single-worker GATT state machine
+│   ├── BleClient.kt           single-worker GATT state machine
+│   ├── FileSyncCore.kt        process-singleton: BleClient + UiState owner
+│   └── BleSyncService.kt      foreground service (connectedDevice) keeping BLE alive in background
 ├── data/
 │   ├── CsvParsers.kt          Sens / Gps / Bat CSV → typed rows
 │   ├── GpsTime.kt             hhmmss.ss → absolute UTC ms
@@ -50,7 +52,7 @@ app/src/main/java/ch/ywesee/movementlogger/
 └── ui/
     ├── MainNav.kt             bottom-nav scaffold (Sync / Replay)
     ├── FileSyncScreen.kt      Sync tab UI
-    ├── FileSyncViewModel.kt   Sync state machine
+    ├── FileSyncViewModel.kt   thin façade over FileSyncCore (Activity-scoped)
     ├── ReplayScreen.kt        Replay tab UI + Compose Canvas panels
     └── ReplayViewModel.kt     CSV + fusion pipeline orchestration
 ```
@@ -58,7 +60,9 @@ app/src/main/java/ch/ywesee/movementlogger/
 ### Sync tab — BLE FileSync
 
 - `ble/BleClient.kt` is the canonical Kotlin port of the desktop client's `stbox-viz-gui/src/ble.rs`. All Android BLE callbacks marshal raw events into one `Channel<RawEvent>`; one coroutine `select`s between that and the command channel, holding `CurrentOp` (Idle / Listing / Reading / Deleting). Watchdog ticks every 200 ms are posted as `RawEvent.Tick` through the same channel so op-state mutation stays single-threaded without locks. Read the Rust comments before changing behaviour here.
-- Compose UI binds to `StateFlow<FileSyncUiState>`. Runtime BLE permissions via `rememberLauncherForActivityResult`; Android 12+ uses `BLUETOOTH_SCAN` (with `neverForLocation`) + `BLUETOOTH_CONNECT`, pre-12 falls back to legacy `BLUETOOTH` / `BLUETOOTH_ADMIN` / `ACCESS_FINE_LOCATION` (manifest caps the legacy ones at `maxSdkVersion=30`).
+- `ble/FileSyncCore.kt` is a process-wide singleton that owns `BleClient` + `StateFlow<FileSyncUiState>`. Moved out of the ViewModel so the BLE worker and in-flight READ buffers survive Activity recreation. `FileSyncViewModel` is now a thin façade that observes the core and forwards commands.
+- `ble/BleSyncService.kt` is a foreground service (`foregroundServiceType=connectedDevice`) the ViewModel `start()`s on scan/connect. It registers itself as a `FileSyncCore.Listener`, refreshes a sticky notification on every state change ("Downloading Sens001.csv 42 %" etc.), and self-stops 5 s after the core reports `isBusy()=false`. Mirrors the iOS approach (`UIBackgroundModes=bluetooth-central` + `beginBackgroundTask`).
+- Compose UI binds to `StateFlow<FileSyncUiState>`. Runtime BLE permissions via `rememberLauncherForActivityResult`; Android 12+ uses `BLUETOOTH_SCAN` (with `neverForLocation`) + `BLUETOOTH_CONNECT`, pre-12 falls back to legacy `BLUETOOTH` / `BLUETOOTH_ADMIN` / `ACCESS_FINE_LOCATION` (manifest caps the legacy ones at `maxSdkVersion=30`). `POST_NOTIFICATIONS` is requested on API 33+ but kept *separate* from the BLE-perm gate so denial only loses the foreground notification, not the BLE UI itself.
 - Downloaded files land in `Android/data/ch.ywesee.movementlogger/files/` under the original filename from LIST.
 
 ### Replay tab — data on top of video

@@ -32,7 +32,7 @@ Scans for the `PumpTsueri` box over BLE, connects via GATT, and drives the FileS
 
 - **Scan / Connect** — runtime BLE permission prompts on first launch.
 - **List files** — splits results into a **Sensor** group (Sens\*.csv, Gps\*.csv, Bat\*.csv, Mic\*.wav) and a **Debug** group, matching the desktop GUI.
-- **Download** — saves each file to `Android/data/ch.ywesee.movementlogger/files/` under its original name. Visible in the system Files app.
+- **Download** — saves each file to `Android/data/ch.ywesee.movementlogger/files/` under its original name. Visible in the system Files app. Long downloads keep running when you switch apps or lock the phone — a foreground notification shows the active file + percentage so the OS doesn't kill the worker mid-READ.
 - **Delete** — removes a file from the SD card.
 - **Start session** — sends START_LOG with a user-set duration (default 30 min). The box reboots into LOG mode and is invisible to Scan until the duration elapses. An on-screen countdown banner ticks while the session runs; the physical button on the box aborts early.
 - **STOP_LOG** — gracefully closes any active logging session so subsequent LIST/READ stop returning BUSY. Does **not** reboot the box.
@@ -72,6 +72,16 @@ Requirements: JDK 17+, Android SDK with build-tools 34.0.0 and platforms 35.
 Outputs land in `app/build/outputs/`.
 
 For signed release builds, drop a `signing.properties` at the repo root with `STORE_FILE`, `STORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD` (all gitignored), then `./gradlew bundleRelease assembleRelease`.
+
+## Releasing
+
+Pushing a `vX.Y.Z` git tag fires `.github/workflows/release.yml`, which derives `versionName` + `versionCode` from the tag, builds a signed AAB + APK, uploads to the Play Store **internal** track via Gradle Play Publisher (bundle + listing + screenshots + release notes), and creates a GitHub release with both binaries attached:
+
+```sh
+git tag v0.0.6 && git push origin v0.0.6
+```
+
+See [CLAUDE.md](CLAUDE.md) for the full release-pipeline docs (required GitHub secrets, listing source-of-truth under `app/src/main/play/`, why we call `publishReleaseBundle publishReleaseListing` instead of `publishReleaseApps`).
 
 ## Architecture
 
