@@ -69,27 +69,49 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
     val context = LocalContext.current
 
     val requiredPerms = remember {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        // Hard requirements: BLE scan/connect. The app can't function without them.
+        val ble = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
         } else {
             arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }
+        // Soft requirement: POST_NOTIFICATIONS gates the foreground-service
+        // notification BleSyncService shows while syncing in the background.
+        // Denial doesn't block BLE — the user just won't see the persistent
+        // banner — so we ask for it but don't gate the UI on it.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ble + Manifest.permission.POST_NOTIFICATIONS
+        } else ble
+    }
+    val blePerms = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            setOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            setOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
     }
     var permsGranted by remember {
-        mutableStateOf(requiredPerms.all {
+        mutableStateOf(blePerms.all {
             ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
         })
     }
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { grants -> permsGranted = grants.values.all { it } }
+    ) { grants ->
+        // Only the BLE perms gate the UI; notification perm is best-effort.
+        permsGranted = blePerms.all { grants[it] == true || // user granted now
+            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
+    }
 
     val enableBtLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { /* user came back from settings — let next Scan retry */ }
 
     LaunchedEffect(Unit) {
-        if (!permsGranted) permLauncher.launch(requiredPerms)
+        val missing = requiredPerms.filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) permLauncher.launch(missing.toTypedArray())
     }
 
     Scaffold(

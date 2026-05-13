@@ -14,3 +14,4 @@ captures/
 *.store
 signing.properties
 keystore/
+play-service-account.json

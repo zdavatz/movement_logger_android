@@ -1,0 +1,26 @@
+Movement Logger is the Android companion for the PumpTsueri SensorTile.box,
+a wearable that records IMU, GPS, and barometric data while you ride.
+
+Two screens, one workflow:
+
+Sync — discovers the box over Bluetooth Low Energy, lists every recording
+on its SD card, downloads them to your phone, and starts new logging
+sessions with a configurable duration. The sync keeps running in the
+background, so you can switch apps without interrupting a long download.
+
+Replay — pick a downloaded sensor CSV pair and a video of the same ride,
+and the app plays them back time-synced. Four data panels stack below the
+video:
+
+  • Speed (km/h) — GPS-derived, smoothed and outlier-clipped
+  • Pitch / Nasenwinkel (°) — Madgwick 6DOF AHRS with drift correction
+  • Height above water (m) — barometric height with GPS-anchored
+    reference, complementary-fused with body-frame acceleration
+  • GPS track — lat/lon path with longitude aspect correction
+
+Each panel shows a moving cursor that follows the video playhead. Export
+the whole composition as a single MP4 — rider on top, panels below —
+straight to the phone's Photos library.
+
+Open source. Built for foilboarders, paragliders, and anyone else who
+wants to see exactly what their body and the world did during a session.

@@ -1,0 +1,3 @@
+Background sync: BLE sync now keeps running when you switch apps. A
+foreground-service notification shows the active download and percentage
+so long READs no longer stall when the phone is locked or backgrounded.

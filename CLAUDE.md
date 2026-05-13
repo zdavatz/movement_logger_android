@@ -121,12 +121,59 @@ The Done banner exposes an **Open video** button that fires `Intent.ACTION_VIEW`
 
 ## Release pipeline
 
-- Keystore copied from generika_android (same ywesee GmbH cert) into `keystore/release.keystore` (gitignored). Credentials in `signing.properties` at repo root (also gitignored).
-- `app/build.gradle.kts` loads `signing.properties` at configuration time; falls back to unsigned release when absent (e.g. on CI without secrets).
-- Bump `versionCode` and `versionName` in `app/build.gradle.kts` for each release.
-- `./gradlew bundleRelease assembleRelease` → AAB + APK.
-- Commit + tag `vX.Y.Z` + `git push && git push origin vX.Y.Z`.
-- `gh release create vX.Y.Z app/build/outputs/apk/release/app-release.apk app/build/outputs/bundle/release/app-release.aab --title … --notes …` for the GitHub release with sideload binaries attached.
+Releases are driven from a single source: push a `vX.Y.Z` git tag and the GitHub Actions workflow at `.github/workflows/release.yml` builds the signed AAB + APK, uploads to the Play Store **internal** track via Gradle Play Publisher, and creates a GitHub release with the binaries attached. No local commit-and-bump dance needed.
+
+```sh
+git tag v0.0.6
+git push origin v0.0.6
+# Watch the workflow run; binaries land on GitHub + Play within ~5 min.
+```
+
+The workflow derives both `versionName` and `versionCode` from the tag:
+
+- `versionName` = the tag minus the `v` prefix (`v0.0.6` → `"0.0.6"`).
+- `versionCode` = `major * 10000 + minor * 100 + patch` (`0.0.6` → `6`, `0.1.0` → `100`, `1.0.0` → `10000`). Monotonic for any sane semver bump.
+
+The `appVersionName` / `appVersionCode` Gradle properties in `app/build.gradle.kts` honor these, with sensible fallback defaults so local `assembleRelease` builds still work without CLI args.
+
+### Required GitHub secrets
+
+Add via Settings → Secrets and variables → Actions:
+
+| Secret name                    | Value                                                                                          |
+| ------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `RELEASE_KEYSTORE_BASE64`      | `base64 -w0 keystore/release.keystore` output (single line, no newlines)                       |
+| `STORE_PASSWORD`               | the `STORE_PASSWORD` value from local `signing.properties`                                      |
+| `KEY_ALIAS`                    | the `KEY_ALIAS` value                                                                          |
+| `KEY_PASSWORD`                 | the `KEY_PASSWORD` value                                                                       |
+| `PLAY_SERVICE_ACCOUNT_JSON`    | full JSON contents of the Play Console service-account key (paste the file verbatim)            |
+
+Service-account JSON comes from Play Console → Setup → API access → Create new service account → grant "Release manager" → download key. The Android Publisher API must be enabled on the linked GCP project (one-time, prompted in the same flow).
+
+### Local development
+
+`signing.properties` + `keystore/release.keystore` at the repo root work the same as before for local signed builds (`./gradlew bundleRelease assembleRelease`). The Play Publisher plugin's tasks only run when explicitly invoked, so day-to-day builds are unaffected. Drop `play-service-account.json` at the repo root if you want to test `publishReleaseApps` locally — it's gitignored.
+
+### Play listing source of truth
+
+`app/src/main/play/` holds the listing metadata that the workflow uploads on each release:
+
+- `default-language.txt` — `en-US`
+- `listings/en-US/title.txt`, `short-description.txt`, `full-description.txt`
+- `listings/en-US/graphics/phone-screenshots/*.png` — synced from `/screenshots/`
+- `release-notes/en-US/default.txt` — what's new in the latest version
+
+Edit these files in the same commit that bumps the version, and they ride along on the next tag push. The `resolutionStrategy = AUTO` setting on the `play { }` block means the plugin won't clobber a higher version already on Play.
+
+### First-release caveats
+
+The Play Developer API can publish updates but can't create the app entry itself. Before the first tag push, the user must have:
+
+1. Created the app on https://play.google.com/console (one-time).
+2. Filled in the **data-safety form**, **content rating**, **target audience**, and **app category** in the web console (API can't touch these).
+3. Uploaded a 512×512 icon and 1024×500 feature graphic (we could automate via GPP but skip for now — easier to do once in the web UI).
+
+The API upload succeeds on first push; the release sits in **draft** until those web-only fields are complete.
 
 ## Memory and references
 
