@@ -95,6 +95,7 @@ def api_call(token: str, method: str, path: str, package: str,
         print(f"\n{method} {url}", file=sys.stderr)
         print(f"  HTTP {e.code} {e.reason}", file=sys.stderr)
         print(f"  Body: {err_body[:1200]}", file=sys.stderr)
+        e.body = err_body  # so callers can inspect without re-reading
         raise
 
 
@@ -131,25 +132,50 @@ def publish(args: argparse.Namespace) -> None:
 
         # 3. Assign to track with release notes.
         release_notes_text = read_text(release_notes_path) if os.path.exists(release_notes_path) else ""
-        api_call(token, "PUT", f"/edits/{edit}/tracks/{args.track}", args.package, body={
-            "track": args.track,
-            "releases": [{
-                "name": args.version_name,
-                "versionCodes": [str(version_code)],
-                "status": args.release_status,
-                "releaseNotes": [{"language": default_lang, "text": release_notes_text}]
-                                  if release_notes_text else [],
-            }],
-        })
+        release_payload = {
+            "name": args.version_name,
+            "versionCodes": [str(version_code)],
+            "status": args.release_status,
+            "releaseNotes": [{"language": default_lang, "text": release_notes_text}]
+                              if release_notes_text else [],
+        }
+        effective_status = args.release_status
+        try:
+            api_call(token, "PUT", f"/edits/{edit}/tracks/{args.track}",
+                     args.package, body={"track": args.track, "releases": [release_payload]})
+        except urllib.error.HTTPError as e:
+            # While the app itself is still in Play Console "draft" state (no
+            # production release has ever been approved), Play only accepts
+            # production releases with status=draft. Fall back automatically
+            # so the workflow doesn't get stuck on the first-ever production
+            # push.
+            if (e.code == 400
+                    and args.track == "production"
+                    and args.release_status != "draft"
+                    and "draft app" in getattr(e, "body", "")):
+                print("App is still in Play 'draft' state — retrying with "
+                      "release-status=draft. Click 'Send for review' in "
+                      "Play Console to promote.")
+                release_payload["status"] = "draft"
+                effective_status = "draft"
+                api_call(token, "PUT", f"/edits/{edit}/tracks/{args.track}",
+                         args.package, body={"track": args.track, "releases": [release_payload]})
+            else:
+                raise
         print(f"Assigned to {args.track} track as '{args.version_name}' "
-              f"(status={args.release_status})")
+              f"(status={effective_status})")
 
-        # 4. App-level details (contact email + default language).
-        api_call(token, "PUT", f"/edits/{edit}/details", args.package, body={
+        # 4. App-level details (contact email + website + default language).
+        details_body = {
             "contactEmail": args.contact_email,
             "defaultLanguage": default_lang,
-        })
-        print(f"Set details: contact={args.contact_email}, defaultLanguage={default_lang}")
+        }
+        if args.contact_website:
+            details_body["contactWebsite"] = args.contact_website
+        api_call(token, "PUT", f"/edits/{edit}/details", args.package, body=details_body)
+        print(f"Set details: contact={args.contact_email}, "
+              f"website={args.contact_website or '<unset>'}, "
+              f"defaultLanguage={default_lang}")
 
         # 5. Listing texts + video URL.
         title_path = os.path.join(listing_dir, "title.txt")
@@ -212,12 +238,39 @@ def publish(args: argparse.Namespace) -> None:
         # review. So plain commit it is; relies on the app having all
         # Play-Console-side forms (data safety, content rating, target
         # audience, etc.) filled in.
-        api_call(
-            token, "POST", f"/edits/{edit}:commit",
-            args.package, body=b"", content_type="application/json",
-        )
+        #
+        # Play API quirk: `PUT /tracks/production` accepts status=completed
+        # even while the app itself is in "draft" state on Play (no
+        # production release ever approved). But `:commit` then rejects it
+        # with `INVALID_ARGUMENT: "Only releases with status draft may be
+        # created on draft app."`. Fall back to status=draft and retry.
+        try:
+            api_call(
+                token, "POST", f"/edits/{edit}:commit",
+                args.package, body=b"", content_type="application/json",
+            )
+        except urllib.error.HTTPError as e:
+            if (e.code == 400
+                    and args.track == "production"
+                    and effective_status != "draft"
+                    and "draft app" in getattr(e, "body", "")):
+                print("Commit rejected because app is still in Play 'draft' "
+                      "state — retrying with release status=draft. The "
+                      "release will land in Play Console as a draft; click "
+                      "'Send for review' in the web UI to promote.")
+                release_payload["status"] = "draft"
+                effective_status = "draft"
+                api_call(token, "PUT", f"/edits/{edit}/tracks/{args.track}",
+                         args.package, body={"track": args.track,
+                                              "releases": [release_payload]})
+                api_call(
+                    token, "POST", f"/edits/{edit}:commit",
+                    args.package, body=b"", content_type="application/json",
+                )
+            else:
+                raise
         print(f"\nCommit OK. Release {args.version_name} (versionCode {version_code}) "
-              f"is on the {args.track} track.")
+              f"is on the {args.track} track (status={effective_status}).")
     except Exception:
         # Best-effort cleanup so a partial edit doesn't linger.
         try:
@@ -236,6 +289,8 @@ def main() -> None:
     p.add_argument("--package", default="ch.ywesee.movementlogger")
     p.add_argument("--track", default="internal")
     p.add_argument("--contact-email", default="zdavatz@ywesee.com")
+    p.add_argument("--contact-website", default="https://ywesee.com/MovementLogger/MovementLogger",
+                   help="Public-facing website URL on the Play listing.")
     p.add_argument("--play-dir", default="app/src/main/play")
     p.add_argument(
         "--release-status",

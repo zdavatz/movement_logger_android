@@ -89,15 +89,20 @@ jobs:
       - name: Install Python deps for Play API client
         run: pip install --quiet cryptography
 
-      - name: Publish to Play Store (internal track + listing + screenshots)
-        # Direct API call — bypasses Gradle Play Publisher because GPP 3.13
-        # can't set changesNotSentForReview=true (needed while the app's
-        # data-safety/content-rating/etc. forms are still draft). See
-        # scripts/publish_to_play.py.
+      - name: Publish to Play Store (production track + listing + screenshots)
+        # Direct API call — bypasses Gradle Play Publisher; see
+        # scripts/publish_to_play.py. Targets the production track with
+        # status=completed (100% rollout once Google approves). Falls back
+        # to status=draft automatically while the app itself is still in
+        # Play Console's "draft" state — i.e. before the first production
+        # release is approved. After that one-time gate, every tag push
+        # rolls out to production immediately on review approval.
         run: |
           python3 scripts/publish_to_play.py \
             --aab app/build/outputs/bundle/release/app-release.aab \
-            --version-name ${{ steps.ver.outputs.name }}
+            --version-name ${{ steps.ver.outputs.name }} \
+            --track production \
+            --release-status completed
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
