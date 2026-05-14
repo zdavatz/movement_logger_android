@@ -339,6 +339,7 @@ class BleClient(private val context: Context) {
             is RawEvent.Notification -> onNotification(raw.charUuid, raw.value)
             RawEvent.Tick -> tickWatchdog()
             is RawEvent.DescriptorWritten -> onDescriptorWritten(raw.charUuid, raw.status)
+            is RawEvent.MtuChanged -> onMtuChanged(raw.mtu, raw.status)
         }
     }
 
@@ -350,6 +351,7 @@ class BleClient(private val context: Context) {
      * doesn't expose it and the user should still get FileSync.
      */
     private fun onDescriptorWritten(charUuid: UUID, status: Int) {
+        Log.i(tag, "CCCD ack for $charUuid status=$status")
         when (charUuid) {
             FileSyncProtocol.FILEDATA_UUID -> {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -361,6 +363,7 @@ class BleClient(private val context: Context) {
                 // characteristic exists on this firmware.
                 val s = streamChar
                 if (s != null) {
+                    Log.i(tag, "FileData CCCD done — chaining SensorStream subscribe")
                     if (!subscribeAndWriteCccd(s)) {
                         // Soft-fail: log and proceed with Connected.
                         emit(BleEvent.Status("SensorStream subscribe failed — Live tab will be empty"))
@@ -368,6 +371,7 @@ class BleClient(private val context: Context) {
                         emit(BleEvent.Connected)
                     }
                 } else {
+                    Log.i(tag, "no SensorStream char — emitting Connected without it")
                     op = CurrentOp.Idle
                     emit(BleEvent.Connected)
                 }
@@ -412,6 +416,14 @@ class BleClient(private val context: Context) {
         // SensorStream is optional — only PumpLogger firmware exposes it.
         // Legacy SDDataLogFileX (PumpTsueri name) is FileSync-only.
         streamChar = findCharacteristic(g, FileSyncProtocol.STREAM_UUID)
+        // Diagnostic dump — every characteristic on the box, with properties.
+        // Helps explain "SensorStream not subscribing" reports from the field.
+        for (svc in g.services) {
+            for (ch in svc.characteristics) {
+                Log.i(tag, "char=${ch.uuid} props=0x${"%02X".format(ch.properties)} svc=${svc.uuid}")
+            }
+        }
+        Log.i(tag, "FileCmd=${cmdChar != null}, FileData=${dataChar != null}, SensorStream=${streamChar != null}")
         if (cmdChar == null || dataChar == null) {
             emitErr("Box firmware doesn't expose FileSync chars — flash a newer build")
             disconnectInner(emitEvent = true); return
@@ -421,12 +433,46 @@ class BleClient(private val context: Context) {
                 "SensorStream characteristic not advertised — legacy firmware, Live tab will be empty"
             ))
         }
-        if (!subscribeAndWriteCccd(dataChar!!)) {
+        // Request a larger MTU *before* subscribing. SensorStream notifies
+        // are 46 bytes; the default ATT MTU 23 truncates them to 20 bytes
+        // and the firmware doesn't fall back to the 3-chunk protocol the
+        // desktop client expects (verified on PumpLogger PR #18 against a
+        // Pixel 8a — every notify came in 20 B with no sequence prefix).
+        // CCCD writes are kicked off from onMtuChanged once the negotiated
+        // MTU is known. requestMtu→onMtuChanged is the only way to upgrade
+        // on Android; the OS won't auto-negotiate.
+        val mtuKicked = try {
+            g.requestMtu(MTU_REQUEST)
+        } catch (e: SecurityException) {
+            emitErr("requestMtu permission denied: ${e.message}"); false
+        }
+        if (!mtuKicked) {
+            // Couldn't even queue the request — fall back to subscribing at
+            // default MTU. Live tab will be empty but FileSync still works.
+            Log.w(tag, "requestMtu($MTU_REQUEST) returned false — subscribing at default MTU")
+            if (!subscribeAndWriteCccd(dataChar!!)) {
+                disconnectInner(emitEvent = true); return
+            }
+        }
+        // BleEvent.Connected is emitted once both subscriptions are settled,
+        // either from onDescriptorWritten(SensorStream) or the no-SensorStream
+        // branch in onDescriptorWritten(FileData).
+    }
+
+    /** MTU upgrade callback — proceed with CCCD subscription chain. */
+    private suspend fun onMtuChanged(mtu: Int, status: Int) {
+        Log.i(tag, "onMtuChanged mtu=$mtu status=$status")
+        // We continue regardless of `status` — even if Android reports
+        // failure, *some* MTU is in effect. If it's still 23 we'll get
+        // truncated 20-byte notifies (Live tab stays empty), but FileSync
+        // is unaffected and disconnecting would be worse UX.
+        val d = dataChar ?: run {
+            emitErr("internal: dataChar missing after MTU change")
             disconnectInner(emitEvent = true); return
         }
-        // SensorStream CCCD is written from onDescriptorWritten() after the
-        // FileData CCCD ack — Android serialises GATT ops one-at-a-time.
-        // BleEvent.Connected is emitted once both subscriptions are settled.
+        if (!subscribeAndWriteCccd(d)) {
+            disconnectInner(emitEvent = true)
+        }
     }
 
     /**
@@ -676,6 +722,9 @@ class BleClient(private val context: Context) {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             rawChannel.trySend(RawEvent.ServicesDiscovered(status))
         }
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            rawChannel.trySend(RawEvent.MtuChanged(mtu, status))
+        }
         override fun onDescriptorWrite(
             g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int,
         ) {
@@ -739,6 +788,7 @@ class BleClient(private val context: Context) {
         data class Notification(val charUuid: UUID, val value: ByteArray) : RawEvent()
         /** `charUuid` is the parent characteristic — descriptors all share the standard CCCD UUID. */
         data class DescriptorWritten(val charUuid: UUID, val status: Int) : RawEvent()
+        data class MtuChanged(val mtu: Int, val status: Int) : RawEvent()
         data object Tick : RawEvent()
     }
 
@@ -751,5 +801,13 @@ class BleClient(private val context: Context) {
         private const val LIST_INACTIVITY_DONE_MS = 500L
         private const val PROGRESS_CHUNK_BYTES = 4L * 1024
         private const val MAX_BUFFER_HINT = 16 * 1024 * 1024
+        /**
+         * ATT MTU we ask for on connect. Max in the spec is 517; 247 is the
+         * BLE 4.2 Data-Length-Extension sweet spot and what most modern
+         * peripherals advertise. Box is happy to negotiate down if it
+         * can't go that high, so requesting more than the box supports
+         * just means we get whatever it advertises.
+         */
+        private const val MTU_REQUEST = 247
     }
 }

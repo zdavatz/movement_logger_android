@@ -1,1 +1,1 @@
-Live tab: zeigt die 0,5-Hz-SensorStream-Snapshots des STBoxFs-Boards live an (Beschleunigung, Gyro, Magnet, Druck, GPS) mit zwei Sparklines. Tab-Reihenfolge ist jetzt Live → Sync → Replay, passend zur Desktop-App.
+Live tab zeigt jetzt die 0,5-Hz-SensorStream-Snapshots des STBoxFs-Boards live an (Beschleunigung, Gyro, Magnet, Druck, GPS) mit zwei Sparklines. ATT-MTU wird beim Verbinden auf 247 Bytes erhöht, damit die 46-Byte-Pakete in einem einzigen Notify ankommen.

@@ -28,7 +28,7 @@ Three screens via the bottom navigation bar.
 
 ### Live
 
-When connected to a PumpLogger-firmware box (advertises as `STBoxFs`), shows the 0.5 Hz SensorStream snapshot live: accel / gyro / mag / baro / GPS readouts plus two sparklines (acceleration magnitude, barometric pressure). Subscription is automatic on Connect — no extra button. Legacy PumpTsueri firmware doesn't expose the SensorStream characteristic, so the tab stays empty with a one-shot log line in the Sync log explaining why.
+When connected to a PumpLogger-firmware box (advertises as `STBoxFs`), shows the 0.5 Hz SensorStream snapshot live: accel / gyro / mag / baro / GPS readouts plus two sparklines (acceleration magnitude, barometric pressure). Subscription is automatic on Connect — no extra button. On connect, the app requests an ATT MTU of 247 so each 46-byte snapshot lands in a single notify (the firmware doesn't chunk on small MTUs, so the upgrade is required to see data). Legacy PumpTsueri firmware doesn't expose the SensorStream characteristic, so the tab stays empty with a one-shot log line in the Sync log explaining why.
 
 ### Sync
 
