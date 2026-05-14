@@ -24,11 +24,15 @@ Requires Android 8.0 (API 26) or newer. Targets API 35.
 
 ## What it does
 
-Two screens via the bottom navigation bar.
+Three screens via the bottom navigation bar.
+
+### Live
+
+When connected to a PumpLogger-firmware box (advertises as `STBoxFs`), shows the 0.5 Hz SensorStream snapshot live: accel / gyro / mag / baro / GPS readouts plus two sparklines (acceleration magnitude, barometric pressure). Subscription is automatic on Connect — no extra button. Legacy PumpTsueri firmware doesn't expose the SensorStream characteristic, so the tab stays empty with a one-shot log line in the Sync log explaining why.
 
 ### Sync
 
-Scans for the `PumpTsueri` box over BLE, connects via GATT, and drives the FileSync protocol:
+Scans for the box over BLE (advertise name `PumpTsueri` *or* `STBoxFs`), connects via GATT, and drives the FileSync protocol:
 
 - **Scan / Connect** — runtime BLE permission prompts on first launch.
 - **List files** — splits results into a **Sensor** group (Sens\*.csv, Gps\*.csv, Bat\*.csv, Mic\*.wav) and a **Debug** group, matching the desktop GUI.

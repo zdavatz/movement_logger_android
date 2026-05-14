@@ -8,10 +8,22 @@ import java.util.UUID
  * and the desktop Rust client (`stbox-viz-gui/src/ble.rs`).
  */
 object FileSyncProtocol {
-    const val BOX_NAME: String = "PumpTsueri"
+    /**
+     * Accepted advertise names. `PumpTsueri` is the legacy SDDataLogFileX
+     * firmware; `STBoxFs` is the bare-metal PumpLogger firmware (Peter's
+     * PR #18) which adds the SensorStream characteristic. Match either so
+     * one APK handles both during the firmware transition.
+     */
+    val BOX_NAMES: Array<String> = arrayOf("PumpTsueri", "STBoxFs")
 
     val FILECMD_UUID: UUID = UUID.fromString("00000080-0010-11e1-ac36-0002a5d5c51b")
     val FILEDATA_UUID: UUID = UUID.fromString("00000040-0010-11e1-ac36-0002a5d5c51b")
+    /**
+     * SensorStream — 0.5 Hz packed 46-byte all-sensor snapshot. Optional;
+     * only PumpLogger firmware exposes it. Subscribing is enough to start
+     * the stream; the box has no STREAM_START opcode.
+     */
+    val STREAM_UUID: UUID = UUID.fromString("00000100-0010-11e1-ac36-0002a5d5c51b")
     val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     // Opcodes (first byte of FileCmd write).
@@ -68,4 +80,10 @@ sealed class BleEvent {
     }
     data class DeleteDone(val name: String) : BleEvent()
     data class Error(val msg: String) : BleEvent()
+    /**
+     * One decoded SensorStream snapshot (0.5 Hz). Only emitted while
+     * connected to PumpLogger firmware that exposes the SensorStream
+     * characteristic; legacy PumpTsueri builds never produce this event.
+     */
+    data class Sample(val sample: LiveSample) : BleEvent()
 }

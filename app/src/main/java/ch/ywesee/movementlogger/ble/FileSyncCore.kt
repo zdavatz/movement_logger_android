@@ -6,6 +6,8 @@ import ch.ywesee.movementlogger.ui.Connection
 import ch.ywesee.movementlogger.ui.DiscoveredDevice
 import ch.ywesee.movementlogger.ui.DownloadProgress
 import ch.ywesee.movementlogger.ui.FileSyncUiState
+import ch.ywesee.movementlogger.ui.LivePoint
+import ch.ywesee.movementlogger.ui.LiveState
 import ch.ywesee.movementlogger.ui.RemoteFile
 import ch.ywesee.movementlogger.ui.SessionRunning
 import kotlinx.coroutines.CoroutineScope
@@ -160,14 +162,19 @@ object FileSyncCore {
                 log("connected")
             }
             BleEvent.Disconnected -> {
+                // Drop the live-stream buffers too — the box may resume
+                // with a fresh timestamp axis on reconnect, and a stale
+                // sparkline would falsely suggest the stream is still alive.
                 _state.update {
                     it.copy(
                         connection = Connection.Disconnected,
                         files = emptyList(),
                         listing = false,
                         downloads = emptyMap(),
+                        live = LiveState(),
                     )
                 }
+                liveT0Ms = null
                 log("disconnected")
             }
             is BleEvent.ListEntry -> _state.update { s ->
@@ -196,8 +203,33 @@ object FileSyncCore {
                 _state.update { s -> s.copy(files = s.files.filterNot { it.name == e.name }) }
                 log("deleted ${e.name}")
             }
+            is BleEvent.Sample -> onSample(e.sample)
         }
         listener?.onStateChanged(_state.value)
+    }
+
+    /** First-sample box-timestamp; sparkline X axis is `(s.timestampMs - liveT0Ms) / 1000`. */
+    private var liveT0Ms: Long? = null
+
+    private fun onSample(s: ch.ywesee.movementlogger.ble.LiveSample) {
+        val t0 = liveT0Ms ?: run { liveT0Ms = s.timestampMs; s.timestampMs }
+        val dt = (s.timestampMs - t0) / 1000.0
+        val accG = s.accMagnitudeG()
+        val presHpa = s.pressurePa / 100.0
+        _state.update { st ->
+            val acc = (st.live.accHistory + LivePoint(dt, accG)).takeLast(LIVE_HISTORY_LEN)
+            val pres = (st.live.pressureHistory + LivePoint(dt, presHpa)).takeLast(LIVE_HISTORY_LEN)
+            st.copy(
+                live = st.live.copy(
+                    latestSample = s,
+                    latestSampleAtMs = System.currentTimeMillis(),
+                    sampleCount = st.live.sampleCount + 1,
+                    accHistory = acc,
+                    pressureHistory = pres,
+                    streamCapable = true,
+                )
+            )
+        }
     }
 
     private fun saveFile(name: String, bytes: ByteArray): String {
@@ -225,4 +257,6 @@ object FileSyncCore {
     }
 
     private const val MAX_LOG_LINES = 200
+    /** Bounded rolling buffer for the Live tab sparklines. 120 × 2 s = 4 min. */
+    private const val LIVE_HISTORY_LEN = 120
 }

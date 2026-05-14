@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Android port of the Movement Logger desktop app at `~/software/fp-sns-stbox1/Utilities/rust`. Two screens:
+Android port of the Movement Logger desktop app at `~/software/movement_logger_desktop`. Three screens:
 
-- **Sync** — connects to the PumpTsueri SensorTile.box over BLE, downloads its CSV recordings, saves them to app-private external storage.
+- **Live** — when connected to a PumpLogger-firmware box, renders the 0.5 Hz SensorStream snapshot (accel / gyro / mag / baro / GPS) as a typed readout plus two acc-magnitude + pressure sparklines. Empty for legacy PumpTsueri firmware (no SensorStream characteristic).
+- **Sync** — connects to the PumpTsueri/STBoxFs SensorTile.box over BLE, downloads its CSV recordings, saves them to app-private external storage.
 - **Replay** — picks a saved sensor / GPS CSV pair and a video, plays them time-synced with overlaid panels (speed, pitch / Nasenwinkel, height above water, GPS track).
 
 Pure Kotlin + Jetpack Compose, no NDK. Phase-2 numerics (Madgwick fusion, baro height, butterworth, etc.) are ported from `stbox-viz/*.rs` to Kotlin under `data/`; the desktop's plotly-HTML / GIF / board-3D output side is replaced by direct Compose Canvas rendering. The desktop's ffmpeg-overlay GIF export is replaced on Android by an in-app **Export combined** that uses Media3 Transformer to bake the same v-stack (rider on top, four sensor panels below) into a single MP4 saved to `Movies/MovementLogger/`.
@@ -32,9 +33,10 @@ Targets: `minSdk 26 / compileSdk 35 / targetSdk 35`, `buildToolsVersion 34.0.0`.
 app/src/main/java/ch/ywesee/movementlogger/
 ├── MainActivity.kt          → MainNav
 ├── ble/
-│   ├── FileSyncProtocol.kt    UUIDs, opcodes, status bytes
-│   ├── BleClient.kt           single-worker GATT state machine
-│   ├── FileSyncCore.kt        process-singleton: BleClient + UiState owner
+│   ├── FileSyncProtocol.kt    UUIDs (FileCmd/FileData/SensorStream), opcodes, status bytes
+│   ├── LiveSample.kt          46-byte SensorStream wire layout + decoder
+│   ├── BleClient.kt           single-worker GATT state machine; dual CCCD (FileData + SensorStream)
+│   ├── FileSyncCore.kt        process-singleton: BleClient + UiState owner (FileSync + Live)
 │   └── BleSyncService.kt      foreground service (connectedDevice) keeping BLE alive in background
 ├── data/
 │   ├── CsvParsers.kt          Sens / Gps / Bat CSV → typed rows
@@ -50,12 +52,23 @@ app/src/main/java/ch/ywesee/movementlogger/
 │   ├── ExportPanelRenderer.kt android.graphics.Canvas port of the four panels
 │   └── VideoExporter.kt       Media3 Transformer combined-video pipeline
 └── ui/
-    ├── MainNav.kt             bottom-nav scaffold (Sync / Replay)
+    ├── MainNav.kt             bottom-nav scaffold (Live / Sync / Replay)
+    ├── LiveScreen.kt          Live tab UI: readout grid + two Compose Canvas sparklines
     ├── FileSyncScreen.kt      Sync tab UI
     ├── FileSyncViewModel.kt   thin façade over FileSyncCore (Activity-scoped)
     ├── ReplayScreen.kt        Replay tab UI + Compose Canvas panels
     └── ReplayViewModel.kt     CSV + fusion pipeline orchestration
 ```
+
+### Live tab — SensorStream readouts
+
+`ble/LiveSample.kt` mirrors the desktop `LiveSample` in `stbox-viz-gui/src/ble.rs`: a 46-byte little-endian packed snapshot decoded into typed fields (acc mg, gyro centi-dps, mag mG, pressure Pa, GPS lat/lon ×1e7, fix-q + sat count + flags). Two transport modes — single 46-byte notify when the negotiated MTU is large enough, or a 3-chunk sequence (0x00 / 0x01 / 0x02 prefix bytes) on the default-MTU fallback path. Out-of-order chunks reset the asm buffer; malformed frames drop silently and auto-resync on the next 0x00 start.
+
+`BleClient` now subscribes to **two** characteristics on connect (FileData *and* SensorStream). Android serialises GATT ops one-at-a-time, so the second CCCD write is chained from the first's `onDescriptorWrite` callback — both descriptors share the standard CCCD UUID, so `RawEvent.DescriptorWritten` carries the parent characteristic UUID to route the ack. SensorStream subscription is soft-fail: legacy PumpTsueri firmware doesn't expose it, the user still gets FileSync, and the Live tab stays empty with a log line saying why.
+
+`FileSyncCore.onSample` updates a `LiveState` inside `FileSyncUiState`: most-recent decoded sample, `latestSampleAtMs` for the freshness label, sample count, plus two 120-point rolling buffers (acc magnitude in g, pressure in hPa). Cleared on disconnect so a stale sparkline doesn't masquerade as a live stream.
+
+The Compose UI gates the readouts on `Connection.Connected` — when disconnected it shows a "Go to Sync" button. A 250 ms tick recomposes the freshness strip so the "X ms ago" label keeps moving between the 2-second sample arrivals.
 
 ### Sync tab — BLE FileSync
 

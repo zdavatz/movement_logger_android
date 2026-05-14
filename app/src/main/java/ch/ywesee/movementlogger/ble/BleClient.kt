@@ -63,9 +63,17 @@ class BleClient(private val context: Context) {
     private var gatt: BluetoothGatt? = null
     private var cmdChar: BluetoothGattCharacteristic? = null
     private var dataChar: BluetoothGattCharacteristic? = null
+    private var streamChar: BluetoothGattCharacteristic? = null
     private var op: CurrentOp = CurrentOp.Idle
     private var scanning: Boolean = false
     private var scanStopJob: Job? = null
+
+    /** 3-chunk reassembly state for the SensorStream MTU-fallback path.
+     *  When the negotiated MTU is too small for a 46-byte single notify,
+     *  the firmware splits the snapshot across three sequential notifies
+     *  with first-byte sequence indices 0x00 / 0x01 / 0x02. */
+    private val streamAsm = ArrayList<Byte>(LiveSample.WIRE_SIZE)
+    private var streamAsmNext: Int = 0
 
     init {
         workerJob = scope.launch { workerLoop() }
@@ -227,6 +235,9 @@ class BleClient(private val context: Context) {
         gatt = null
         cmdChar = null
         dataChar = null
+        streamChar = null
+        streamAsm.clear()
+        streamAsmNext = 0
         if (emitEvent) emit(BleEvent.Disconnected)
     }
 
@@ -325,16 +336,50 @@ class BleClient(private val context: Context) {
             )
             is RawEvent.ConnectionStateChange -> onConnectionState(raw.status, raw.newState)
             is RawEvent.ServicesDiscovered -> onServicesDiscovered(raw.status)
-            is RawEvent.Notification -> onNotification(raw.value)
+            is RawEvent.Notification -> onNotification(raw.charUuid, raw.value)
             RawEvent.Tick -> tickWatchdog()
-            is RawEvent.DescriptorWritten -> {
-                if (raw.status == BluetoothGatt.GATT_SUCCESS) {
+            is RawEvent.DescriptorWritten -> onDescriptorWritten(raw.charUuid, raw.status)
+        }
+    }
+
+    /**
+     * Two CCCDs to write in sequence (Android only allows one in-flight GATT
+     * op at a time): FileData first, then SensorStream (if present). When the
+     * FileData CCCD is acked we either chain into SensorStream or emit
+     * Connected. SensorStream failures are soft — legacy PumpTsueri firmware
+     * doesn't expose it and the user should still get FileSync.
+     */
+    private fun onDescriptorWritten(charUuid: UUID, status: Int) {
+        when (charUuid) {
+            FileSyncProtocol.FILEDATA_UUID -> {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    emitErr("FileData CCCD write failed: $status")
+                    scope.launch { disconnectInner(emitEvent = true) }
+                    return
+                }
+                // FileData ready. Chain to SensorStream subscribe if the
+                // characteristic exists on this firmware.
+                val s = streamChar
+                if (s != null) {
+                    if (!subscribeAndWriteCccd(s)) {
+                        // Soft-fail: log and proceed with Connected.
+                        emit(BleEvent.Status("SensorStream subscribe failed — Live tab will be empty"))
+                        op = CurrentOp.Idle
+                        emit(BleEvent.Connected)
+                    }
+                } else {
                     op = CurrentOp.Idle
                     emit(BleEvent.Connected)
-                } else {
-                    emitErr("CCCD write failed: ${raw.status}")
-                    disconnectInner(emitEvent = true)
                 }
+            }
+            FileSyncProtocol.STREAM_UUID -> {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    emit(BleEvent.Status("SensorStream CCCD write failed ($status) — Live tab will be empty"))
+                } else {
+                    emit(BleEvent.Status("SensorStream subscribed (live data at 0.5 Hz)"))
+                }
+                op = CurrentOp.Idle
+                emit(BleEvent.Connected)
             }
         }
     }
@@ -364,27 +409,51 @@ class BleClient(private val context: Context) {
         val g = gatt ?: return
         cmdChar = findCharacteristic(g, FileSyncProtocol.FILECMD_UUID)
         dataChar = findCharacteristic(g, FileSyncProtocol.FILEDATA_UUID)
+        // SensorStream is optional — only PumpLogger firmware exposes it.
+        // Legacy SDDataLogFileX (PumpTsueri name) is FileSync-only.
+        streamChar = findCharacteristic(g, FileSyncProtocol.STREAM_UUID)
         if (cmdChar == null || dataChar == null) {
-            emitErr("PumpTsueri firmware doesn't expose FileSync chars — flash a newer build")
+            emitErr("Box firmware doesn't expose FileSync chars — flash a newer build")
             disconnectInner(emitEvent = true); return
         }
-        val ch = dataChar!!
+        if (streamChar == null) {
+            emit(BleEvent.Status(
+                "SensorStream characteristic not advertised — legacy firmware, Live tab will be empty"
+            ))
+        }
+        if (!subscribeAndWriteCccd(dataChar!!)) {
+            disconnectInner(emitEvent = true); return
+        }
+        // SensorStream CCCD is written from onDescriptorWritten() after the
+        // FileData CCCD ack — Android serialises GATT ops one-at-a-time.
+        // BleEvent.Connected is emitted once both subscriptions are settled.
+    }
+
+    /**
+     * Enable notifications for `ch` and write its CCCD. Returns true if the
+     * write was kicked off; the caller must wait for `onDescriptorWritten`
+     * for the final result. Returns false on synchronous failure (missing
+     * CCCD, permission denied) — caller decides whether to disconnect.
+     */
+    private fun subscribeAndWriteCccd(ch: BluetoothGattCharacteristic): Boolean {
+        val g = gatt ?: return false
         val ok = try {
             g.setCharacteristicNotification(ch, true)
         } catch (e: SecurityException) {
             emitErr("subscribe permission denied: ${e.message}"); false
         }
         if (!ok) {
-            emitErr("setCharacteristicNotification failed")
-            disconnectInner(emitEvent = true); return
+            emitErr("setCharacteristicNotification failed for ${ch.uuid}")
+            return false
         }
         val cccd = ch.getDescriptor(FileSyncProtocol.CCCD_UUID) ?: run {
-            emitErr("CCCD descriptor missing on FileData")
-            disconnectInner(emitEvent = true); return
+            emitErr("CCCD descriptor missing on ${ch.uuid}")
+            return false
         }
-        try {
+        return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ==
+                    BluetoothGatt.GATT_SUCCESS
             } else {
                 @Suppress("DEPRECATION")
                 cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
@@ -393,9 +462,8 @@ class BleClient(private val context: Context) {
             }
         } catch (e: SecurityException) {
             emitErr("CCCD write permission denied: ${e.message}")
-            disconnectInner(emitEvent = true)
+            false
         }
-        // BleEvent.Connected is emitted from onDescriptorWrite.
     }
 
     private fun findCharacteristic(g: BluetoothGatt, uuid: UUID): BluetoothGattCharacteristic? {
@@ -405,12 +473,75 @@ class BleClient(private val context: Context) {
         return null
     }
 
-    private fun onNotification(value: ByteArray) {
+    private fun onNotification(charUuid: UUID, value: ByteArray) {
+        if (charUuid == FileSyncProtocol.STREAM_UUID) {
+            handleStreamNotify(value)
+            return
+        }
+        // FileData path — drive the in-flight op's state machine.
         when (val current = op) {
             CurrentOp.Idle -> Unit  // stray notify between ops — harmless
             is CurrentOp.Listing -> handleListNotify(current, value)
             is CurrentOp.Reading -> handleReadNotify(current, value)
             is CurrentOp.Deleting -> handleDeleteNotify(current, value)
+        }
+    }
+
+    /**
+     * SensorStream notification handler. Two transport modes per
+     * DESIGN.md §3:
+     *
+     *   - **Single-notify** (negotiated MTU ≥ 50): one 46-byte payload
+     *     per snapshot, parsed in one shot.
+     *   - **3-chunk fallback** (default MTU ≈ 23): three sequential
+     *     ~20-byte notifies, first byte is the sequence index
+     *     (0x00 / 0x01 / 0x02). Out-of-order chunks reset the asm
+     *     buffer and wait for the next 0x00.
+     *
+     * Malformed packets drop silently — the stream auto-resyncs on the
+     * next 0x00 start, and at 0.5 Hz a lost frame is barely a blip.
+     */
+    private fun handleStreamNotify(bytes: ByteArray) {
+        if (bytes.size == LiveSample.WIRE_SIZE) {
+            // Single-notify path. Reset any in-flight chunked frame so a
+            // mid-frame MTU upgrade doesn't leave the asm in a bad state.
+            streamAsm.clear()
+            streamAsmNext = 0
+            LiveSample.parse(bytes)?.let { emit(BleEvent.Sample(it)) }
+            return
+        }
+        if (bytes.isEmpty()) return
+        val seq = bytes[0].toInt() and 0xFF
+        val body = bytes.copyOfRange(1, bytes.size)
+        when (seq) {
+            0x00 -> {
+                streamAsm.clear()
+                for (b in body) streamAsm.add(b)
+                streamAsmNext = 1
+            }
+            0x01 -> {
+                if (streamAsmNext != 1) {
+                    streamAsm.clear(); streamAsmNext = 0
+                    return
+                }
+                for (b in body) streamAsm.add(b)
+                streamAsmNext = 2
+            }
+            0x02 -> {
+                if (streamAsmNext != 2) {
+                    streamAsm.clear(); streamAsmNext = 0
+                    return
+                }
+                for (b in body) streamAsm.add(b)
+                if (streamAsm.size == LiveSample.WIRE_SIZE) {
+                    val assembled = ByteArray(LiveSample.WIRE_SIZE) { streamAsm[it] }
+                    LiveSample.parse(assembled)?.let { emit(BleEvent.Sample(it)) }
+                }
+                streamAsm.clear(); streamAsmNext = 0
+            }
+            else -> {
+                streamAsm.clear(); streamAsmNext = 0
+            }
         }
     }
 
@@ -527,7 +658,7 @@ class BleClient(private val context: Context) {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val name = result.scanRecord?.deviceName ?: result.device.name ?: return
-            if (name != FileSyncProtocol.BOX_NAME) return
+            if (FileSyncProtocol.BOX_NAMES.none { it == name }) return
             rawChannel.trySend(
                 RawEvent.Discovered(result.device.address, name, result.rssi)
             )
@@ -549,7 +680,12 @@ class BleClient(private val context: Context) {
             g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int,
         ) {
             if (descriptor.uuid == FileSyncProtocol.CCCD_UUID) {
-                rawChannel.trySend(RawEvent.DescriptorWritten(status))
+                // Two characteristics share the standard CCCD UUID — pass
+                // the parent characteristic UUID so the worker can route
+                // the write ack to the right state-machine slot.
+                rawChannel.trySend(
+                    RawEvent.DescriptorWritten(descriptor.characteristic.uuid, status)
+                )
             }
         }
         // Android 13+ delivers the value here directly; older versions fall through
@@ -557,17 +693,19 @@ class BleClient(private val context: Context) {
         override fun onCharacteristicChanged(
             g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray,
         ) {
-            if (characteristic.uuid != FileSyncProtocol.FILEDATA_UUID) return
-            rawChannel.trySend(RawEvent.Notification(value.copyOf()))
+            rawChannel.trySend(
+                RawEvent.Notification(characteristic.uuid, value.copyOf())
+            )
         }
         @Deprecated("Pre-Tiramisu callback path", level = DeprecationLevel.HIDDEN)
         override fun onCharacteristicChanged(
             g: BluetoothGatt, characteristic: BluetoothGattCharacteristic,
         ) {
-            if (characteristic.uuid != FileSyncProtocol.FILEDATA_UUID) return
             @Suppress("DEPRECATION")
             val v = characteristic.value ?: return
-            rawChannel.trySend(RawEvent.Notification(v.copyOf()))
+            rawChannel.trySend(
+                RawEvent.Notification(characteristic.uuid, v.copyOf())
+            )
         }
     }
 
@@ -597,8 +735,10 @@ class BleClient(private val context: Context) {
         data class Discovered(val address: String, val name: String, val rssi: Int) : RawEvent()
         data class ConnectionStateChange(val status: Int, val newState: Int) : RawEvent()
         data class ServicesDiscovered(val status: Int) : RawEvent()
-        data class Notification(val value: ByteArray) : RawEvent()
-        data class DescriptorWritten(val status: Int) : RawEvent()
+        /** `charUuid` distinguishes FileData (FileSync) from SensorStream (Live tab). */
+        data class Notification(val charUuid: UUID, val value: ByteArray) : RawEvent()
+        /** `charUuid` is the parent characteristic — descriptors all share the standard CCCD UUID. */
+        data class DescriptorWritten(val charUuid: UUID, val status: Int) : RawEvent()
         data object Tick : RawEvent()
     }
 

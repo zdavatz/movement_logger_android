@@ -1,3 +1,1 @@
-Background sync: BLE sync now keeps running when you switch apps. A
-foreground-service notification shows the active download and percentage
-so long READs no longer stall when the phone is locked or backgrounded.
+Live tab: zeigt die 0,5-Hz-SensorStream-Snapshots des STBoxFs-Boards live an (Beschleunigung, Gyro, Magnet, Druck, GPS) mit zwei Sparklines. Tab-Reihenfolge ist jetzt Live → Sync → Replay, passend zur Desktop-App.

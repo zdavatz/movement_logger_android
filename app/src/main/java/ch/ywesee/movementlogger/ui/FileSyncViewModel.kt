@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import ch.ywesee.movementlogger.ble.BleSyncService
 import ch.ywesee.movementlogger.ble.FileSyncCore
+import ch.ywesee.movementlogger.ble.LiveSample
 import kotlinx.coroutines.flow.StateFlow
 
 data class DiscoveredDevice(val address: String, val name: String, val rssi: Int)
@@ -30,6 +31,33 @@ data class SessionRunning(
         (startedAtMillis + durationSeconds * 1000L - nowMillis).coerceAtLeast(0L)
 }
 
+/**
+ * Sparkline sample for the Live tab. `tSec` is seconds since the first
+ * sample of this connection (relative — the box has no RTC), `value` is
+ * already in display units (g for acc magnitude, hPa for pressure).
+ */
+data class LivePoint(val tSec: Double, val value: Double)
+
+/**
+ * Live SensorStream state. Cleared on disconnect.
+ *
+ * `latestSample` is the most recent 46-byte snapshot decoded into typed
+ * fields; `acc`/`pressure` histories are bounded rolling buffers for the
+ * sparklines (~4 min at 0.5 Hz).
+ */
+data class LiveState(
+    val latestSample: LiveSample? = null,
+    /** `System.currentTimeMillis()` when `latestSample` arrived. Used for
+     *  the "x s ago" freshness label so a stalled stream is obvious. */
+    val latestSampleAtMs: Long? = null,
+    val sampleCount: Long = 0,
+    val accHistory: List<LivePoint> = emptyList(),
+    val pressureHistory: List<LivePoint> = emptyList(),
+    /** True iff the connected firmware exposed the SensorStream char.
+     *  Surfaced in the UI so the user knows whether to expect live data. */
+    val streamCapable: Boolean = false,
+)
+
 data class FileSyncUiState(
     val connection: Connection = Connection.Disconnected,
     val scanning: Boolean = false,
@@ -41,6 +69,7 @@ data class FileSyncUiState(
     val log: List<String> = emptyList(),
     val sessionDurationSeconds: Int = 1800,  // 30-min default, matches desktop
     val sessionRunning: SessionRunning? = null,
+    val live: LiveState = LiveState(),
 )
 
 /**
