@@ -24,9 +24,11 @@ Reads from --play-dir:
   listings/<lang>/short-description.txt         → short desc (≤ 80 chars)
   listings/<lang>/full-description.txt          → full desc (≤ 4000 chars)
   listings/<lang>/video-url.txt                 → YouTube URL (optional)
-  listings/<lang>/graphics/phone-screenshots/*.png  → 2-8 phone screenshots
-  listings/<lang>/graphics/icon/icon.png        → 512x512 RGB PNG
-  release-notes/<lang>/default.txt              → "what's new" for this version
+  listings/<lang>/graphics/phone-screenshots/*.png   → 2-8 phone screenshots
+  listings/<lang>/graphics/tablet-screenshots/*.png  → 2-8 tablet shots (7"+10")
+  listings/<lang>/graphics/icon/icon.png             → 512x512 RGB PNG
+  listings/<lang>/graphics/feature-graphic/*.png     → 1024x500 RGB PNG
+  release-notes/<lang>/default.txt                   → "what's new" for this version
 """
 import argparse
 import base64
@@ -216,7 +218,30 @@ def publish(args: argparse.Namespace) -> None:
             print(f"  uploaded phone screenshot: {os.path.basename(shot)}")
         print(f"Total phone screenshots uploaded: {len(shot_files)}")
 
-        # 7. App icon (512x512 PNG, no alpha).
+        # 7. Tablet screenshots (7" + 10"). Same source files; Play just
+        # needs them registered under each image type.
+        tablet_dir = os.path.join(listing_dir, "graphics", "tablet-screenshots")
+        tablet_files = sorted(glob.glob(os.path.join(tablet_dir, "*.png")) +
+                              glob.glob(os.path.join(tablet_dir, "*.jpg")))
+        for image_type in ("sevenInchScreenshots", "tenInchScreenshots"):
+            try:
+                api_call(token, "DELETE",
+                         f"/edits/{edit}/listings/{default_lang}/{image_type}",
+                         args.package)
+            except urllib.error.HTTPError as e:
+                if e.code not in (404,):
+                    raise
+            for shot in tablet_files:
+                data = open(shot, "rb").read()
+                ctype = "image/png" if shot.lower().endswith(".png") else "image/jpeg"
+                api_call(
+                    token, "POST",
+                    f"/edits/{edit}/listings/{default_lang}/{image_type}?uploadType=media",
+                    args.package, body=data, content_type=ctype, upload=True,
+                )
+            print(f"  uploaded {len(tablet_files)} {image_type}")
+
+        # 8. App icon (512x512 PNG, no alpha).
         icon_path = os.path.join(listing_dir, "graphics", "icon", "icon.png")
         if os.path.exists(icon_path):
             try:
@@ -233,7 +258,26 @@ def publish(args: argparse.Namespace) -> None:
             )
             print("  uploaded icon")
 
-        # 8. Commit. Note: Google forced `changesNotSentForReview=true` to
+        # 9. Feature graphic (1024x500 RGB PNG, no alpha).
+        fg_path = os.path.join(listing_dir, "graphics", "feature-graphic",
+                                "feature-graphic.png")
+        if os.path.exists(fg_path):
+            try:
+                api_call(token, "DELETE",
+                         f"/edits/{edit}/listings/{default_lang}/featureGraphic",
+                         args.package)
+            except urllib.error.HTTPError as e:
+                if e.code not in (404,):
+                    raise
+            api_call(
+                token, "POST",
+                f"/edits/{edit}/listings/{default_lang}/featureGraphic?uploadType=media",
+                args.package, body=open(fg_path, "rb").read(),
+                content_type="image/png", upload=True,
+            )
+            print("  uploaded feature graphic")
+
+        # 10. Commit. Note: Google forced `changesNotSentForReview=true` to
         # be rejected as INVALID_ARGUMENT for this app — they auto-send for
         # review. So plain commit it is; relies on the app having all
         # Play-Console-side forms (data safety, content rating, target
