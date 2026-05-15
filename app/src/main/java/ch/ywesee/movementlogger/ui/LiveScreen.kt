@@ -197,6 +197,11 @@ private fun ReadoutGrid(s: LiveSample) {
                 "Y %+d".format(s.magMg[1].toInt()),
                 "Z %+d".format(s.magMg[2].toInt()),
             )
+            ReadoutRow("Angles (°)",
+                "Roll %+6.1f".format(s.rollDeg()),
+                "Pitch %+6.1f".format(s.pitchDeg()),
+                "Yaw %5.1f".format(s.headingDeg()),
+            )
             ReadoutRow("Baro",
                 "%.2f hPa".format(presHpa),
                 "%+.2f °C".format(tempC),

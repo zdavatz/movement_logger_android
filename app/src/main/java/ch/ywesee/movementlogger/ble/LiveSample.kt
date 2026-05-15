@@ -53,6 +53,51 @@ data class LiveSample(
         return kotlin.math.sqrt(x * x + y * y + z * z)
     }
 
+    /**
+     * Roll φ (around the X axis), in degrees, derived from the gravity
+     * component of accel. Meaningful only when net non-gravitational
+     * acceleration is small. Range (-180, 180].
+     */
+    fun rollDeg(): Double {
+        val ay = accMg[1].toDouble()
+        val az = accMg[2].toDouble()
+        return Math.toDegrees(kotlin.math.atan2(ay, az))
+    }
+
+    /** Pitch θ (around the Y axis), in degrees. Range [-90, 90]. */
+    fun pitchDeg(): Double {
+        val ax = accMg[0].toDouble()
+        val ay = accMg[1].toDouble()
+        val az = accMg[2].toDouble()
+        return Math.toDegrees(
+            kotlin.math.atan2(-ax, kotlin.math.sqrt(ay * ay + az * az))
+        )
+    }
+
+    /**
+     * Tilt-compensated compass heading ψ (yaw), in degrees, normalized to
+     * [0, 360). Uses accel-derived roll/pitch to project the mag vector
+     * onto the horizontal plane before taking atan2. Standard formula —
+     * see e.g. ST AN4248.
+     */
+    fun headingDeg(): Double {
+        val ax = accMg[0].toDouble()
+        val ay = accMg[1].toDouble()
+        val az = accMg[2].toDouble()
+        val mx = magMg[0].toDouble()
+        val my = magMg[1].toDouble()
+        val mz = magMg[2].toDouble()
+        val roll = kotlin.math.atan2(ay, az)
+        val pitch = kotlin.math.atan2(-ax, kotlin.math.sqrt(ay * ay + az * az))
+        val sR = kotlin.math.sin(roll); val cR = kotlin.math.cos(roll)
+        val sP = kotlin.math.sin(pitch); val cP = kotlin.math.cos(pitch)
+        val mxH = mx * cP + my * sR * sP + mz * cR * sP
+        val myH = my * cR - mz * sR
+        var deg = Math.toDegrees(kotlin.math.atan2(-myH, mxH))
+        if (deg < 0) deg += 360.0
+        return deg
+    }
+
     companion object {
         /** Wire-layout size, in bytes. */
         const val WIRE_SIZE = 46
