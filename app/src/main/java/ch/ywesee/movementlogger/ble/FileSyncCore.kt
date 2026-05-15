@@ -51,6 +51,28 @@ object FileSyncCore {
     private var appContext: Context? = null
     private var listener: Listener? = null
 
+    // ---- Sync-state (port of desktop sync_db.rs + issues #3/#4) ----
+    /** BLE MAC of the connected box, captured at Connect time (desktop
+     *  captures the peripheral id at Connect too). The DB partition key —
+     *  sync history is per-box. */
+    private var connectedBoxId: String? = null
+    /** Opened once in [ensureInit]; null only if SQLite itself failed
+     *  (then sync degrades to "nothing is synced" vs crashing the tab). */
+    private var syncDb: SyncDb? = null
+    /** Set by [syncNow], consumed by the next [BleEvent.ListDone] so the
+     *  auto-LIST on connect never triggers a sync (desktop sync flag). */
+    private var syncPending = false
+    /** Files this sync still has to pull, oldest-first; drained serially
+     *  because the BLE worker is single-op (one READ at a time). */
+    private val syncQueue = ArrayDeque<RemoteFile>()
+    /** Name of the file the *sync* is currently pulling (null for a manual
+     *  download), so [BleEvent.ReadDone] knows whether to advance. */
+    private var syncInFlight: String? = null
+    /** LIST-reported size per in-flight download. The DB key is
+     *  `(box, name, size)` and `size` must be the LIST size (matches what
+     *  a later isSynced check compares), not the received byte count. */
+    private val pendingSizes = HashMap<String, Long>()
+
     /** Hook for [BleSyncService] to react to state transitions. */
     interface Listener {
         fun onStateChanged(state: FileSyncUiState)
@@ -59,6 +81,7 @@ object FileSyncCore {
     fun ensureInit(context: Context) {
         if (ble != null) return
         appContext = context.applicationContext
+        syncDb = SyncDb.open(context.applicationContext)
         ble = BleClient(context.applicationContext)
         collectJob = scope.launch {
             ble!!.events.collect { onEvent(it) }
@@ -80,6 +103,7 @@ object FileSyncCore {
 
     fun connect(address: String) {
         _state.update { it.copy(connection = Connection.Connecting) }
+        connectedBoxId = address
         log("connect $address")
         ble?.send(BleCmd.Connect(address))
     }
@@ -99,8 +123,100 @@ object FileSyncCore {
         _state.update {
             it.copy(downloads = it.downloads + (file.name to DownloadProgress(0, file.size)))
         }
+        pendingSizes[file.name] = file.size
         log("READ ${file.name} (${file.size} B)")
         ble?.send(BleCmd.Read(file.name, file.size))
+    }
+
+    /**
+     * "Sync now" — pull every session file on the box that isn't already
+     * recorded locally, and remember what was pulled. Port of the desktop
+     * Sync tab's distinct-from-manual-transfer button (issue #3).
+     * Additive only: never issues DELETE.
+     */
+    fun syncNow() {
+        if (_state.value.connection != Connection.Connected) return
+        if (connectedBoxId == null || syncDb == null) {
+            log("ERROR: sync DB unavailable — sync disabled")
+            _state.update { it.copy(syncStatus = "Sync unavailable (no local DB)") }
+            return
+        }
+        syncPending = true
+        syncQueue.clear()
+        syncInFlight = null
+        _state.update {
+            it.copy(syncing = true, listing = true, files = emptyList(),
+                    syncStatus = "Sync: listing…")
+        }
+        log("Sync now — LIST")
+        ble?.send(BleCmd.List)
+    }
+
+    /**
+     * Session-data filter — same predicate as the Sync tab's grouping and
+     * the desktop's auto-sync set (Sens/Gps/Bat/Mic; AppleDouble excluded).
+     * Only these are auto-pulled by [syncNow]; FW_INFO / CHK / error logs
+     * stay manual-only.
+     */
+    private fun isSensorData(name: String): Boolean {
+        val n = name.lowercase()
+        if (n.startsWith("._")) return false
+        return (n.startsWith("sens") && n.endsWith(".csv")) ||
+            (n.startsWith("gps")  && n.endsWith(".csv")) ||
+            (n.startsWith("bat")  && n.endsWith(".csv")) ||
+            (n.startsWith("mic")  && n.endsWith(".wav"))
+    }
+
+    /**
+     * Diff the just-LISTed files against the sync DB and enqueue the
+     * session files we haven't pulled. Mirrors the desktop's ListDone
+     * sync handler: filter to session data, skip anything isSynced,
+     * enqueue the rest onto the existing serial download path.
+     */
+    private fun runSyncDiff() {
+        val box = connectedBoxId
+        val db = syncDb
+        if (box == null || db == null) {
+            _state.update { it.copy(syncing = false, syncStatus = "Sync unavailable (no local DB)") }
+            return
+        }
+        val candidates = _state.value.files.filter { isSensorData(it.name) }
+        val fresh = candidates.filter { !db.isSynced(box, it.name, it.size) }
+        val already = candidates.size - fresh.size
+        if (fresh.isEmpty()) {
+            _state.update {
+                it.copy(syncing = false,
+                        syncStatus = "Sync: up to date ($already already synced)")
+            }
+            log("Sync: up to date — $already already synced, 0 new")
+            return
+        }
+        syncQueue.clear()
+        syncQueue.addAll(fresh)
+        _state.update {
+            it.copy(syncStatus =
+                "Sync: ${fresh.size} new, $already already synced — downloading…")
+        }
+        log("Sync: ${fresh.size} new, $already already synced — downloading")
+        pumpSyncQueue()
+    }
+
+    /**
+     * Pull the next queued file. The BLE worker is single-op, so sync
+     * downloads must be strictly serial — the next READ is only issued
+     * from [BleEvent.ReadDone] of the previous one.
+     */
+    private fun pumpSyncQueue() {
+        val next = syncQueue.removeFirstOrNull()
+        if (next == null) {
+            if (_state.value.syncing) {
+                _state.update { it.copy(syncing = false, syncStatus = "Sync: complete") }
+                log("Sync: complete")
+            }
+            return
+        }
+        syncInFlight = next.name
+        download(next)
     }
 
     fun delete(file: RemoteFile) {
@@ -148,7 +264,22 @@ object FileSyncCore {
     private fun onEvent(e: BleEvent) {
         when (e) {
             is BleEvent.Status -> log(e.msg)
-            is BleEvent.Error -> log("ERROR: ${e.msg}")
+            is BleEvent.Error -> {
+                log("ERROR: ${e.msg}")
+                // A BLE error mid-sync would otherwise strand the queue
+                // (syncInFlight never clears). Abort cleanly so the next
+                // "Sync now" starts fresh; the size key means a partial
+                // file is just re-pulled next time (desktop-equivalent).
+                if (_state.value.syncing) {
+                    syncPending = false
+                    syncQueue.clear()
+                    syncInFlight = null
+                    _state.update {
+                        it.copy(syncing = false,
+                                syncStatus = "Sync aborted (BLE error) — try again")
+                    }
+                }
+            }
             is BleEvent.Discovered -> _state.update { s ->
                 if (s.discovered.any { it.address == e.address }) s
                 else s.copy(discovered = s.discovered + DiscoveredDevice(e.address, e.name, e.rssi))
@@ -165,11 +296,17 @@ object FileSyncCore {
                 // Drop the live-stream buffers too — the box may resume
                 // with a fresh timestamp axis on reconnect, and a stale
                 // sparkline would falsely suggest the stream is still alive.
+                connectedBoxId = null
+                syncPending = false
+                syncQueue.clear()
+                syncInFlight = null
+                pendingSizes.clear()
                 _state.update {
                     it.copy(
                         connection = Connection.Disconnected,
                         files = emptyList(),
                         listing = false,
+                        syncing = false,
                         downloads = emptyMap(),
                         live = LiveState(),
                     )
@@ -183,6 +320,10 @@ object FileSyncCore {
             BleEvent.ListDone -> {
                 _state.update { it.copy(listing = false) }
                 log("LIST done (${_state.value.files.size} files)")
+                if (syncPending) {
+                    syncPending = false
+                    runSyncDiff()
+                }
             }
             is BleEvent.ReadStarted -> Unit
             is BleEvent.ReadProgress -> _state.update { s ->
@@ -198,6 +339,19 @@ object FileSyncCore {
                     )
                 }
                 log("saved ${e.name} → $path")
+                // Register every successful save — manual *and*
+                // sync-driven — so a later "Sync now" skips it regardless
+                // of how it landed (desktop: "Manual downloads also
+                // register in the DB").
+                val size = pendingSizes.remove(e.name) ?: e.content.size.toLong()
+                val box = connectedBoxId
+                if (path.isNotEmpty() && box != null) {
+                    syncDb?.markSynced(box, e.name, size, path)
+                }
+                if (syncInFlight == e.name) {
+                    syncInFlight = null
+                    pumpSyncQueue()
+                }
             }
             is BleEvent.DeleteDone -> {
                 _state.update { s -> s.copy(files = s.files.filterNot { it.name == e.name }) }
@@ -253,6 +407,7 @@ object FileSyncCore {
         return s.connection != Connection.Disconnected ||
             s.scanning ||
             s.listing ||
+            s.syncing ||
             s.downloads.isNotEmpty()
     }
 

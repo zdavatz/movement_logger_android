@@ -144,6 +144,7 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                     onScan = vm::scan,
                     onDisconnect = vm::disconnect,
                     onList = vm::listFiles,
+                    onSyncNow = vm::syncNow,
                     onStopLog = vm::stopLog,
                     onSetDuration = vm::setSessionDuration,
                     onStartSession = vm::startSession,
@@ -175,6 +176,7 @@ private fun ConnectionBar(
     onScan: () -> Unit,
     onDisconnect: () -> Unit,
     onList: () -> Unit,
+    onSyncNow: () -> Unit,
     onStopLog: () -> Unit,
     onSetDuration: (Int) -> Unit,
     onStartSession: () -> Unit,
@@ -203,6 +205,10 @@ private fun ConnectionBar(
                         Text(if (state.listing) "Listing…" else "List files")
                     }
                     Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = onSyncNow, enabled = !state.listing && !state.syncing) {
+                        Text(if (state.syncing) "Syncing…" else "Sync now")
+                    }
+                    Spacer(Modifier.width(8.dp))
                     OutlinedButton(onClick = onStopLog) { Text("STOP_LOG") }
                     Spacer(Modifier.width(8.dp))
                     OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
@@ -210,6 +216,15 @@ private fun ConnectionBar(
             }
         }
         if (state.connection == Connection.Connected) {
+            state.syncStatus?.let { status ->
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    status,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (state.syncing) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Spacer(Modifier.height(8.dp))
             SessionStarter(
                 durationSeconds = state.sessionDurationSeconds,

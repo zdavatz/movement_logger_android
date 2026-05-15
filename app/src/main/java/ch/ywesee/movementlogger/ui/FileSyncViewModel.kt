@@ -66,6 +66,11 @@ data class FileSyncUiState(
     val downloads: Map<String, DownloadProgress> = emptyMap(),
     val savedPaths: Map<String, String> = emptyMap(),
     val listing: Boolean = false,
+    /** "Sync now" in progress (LIST -> diff -> serial pull of new files). */
+    val syncing: Boolean = false,
+    /** One-line sync result, mirrors the desktop status line
+     *  ("Sync: 3 new, 12 already synced — downloading…" / "up to date"). */
+    val syncStatus: String? = null,
     val log: List<String> = emptyList(),
     val sessionDurationSeconds: Int = 1800,  // 30-min default, matches desktop
     val sessionRunning: SessionRunning? = null,
@@ -100,6 +105,10 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
 
     fun disconnect() = FileSyncCore.disconnect()
     fun listFiles() = FileSyncCore.listFiles()
+    fun syncNow() {
+        BleSyncService.start(getApplication())
+        FileSyncCore.syncNow()
+    }
     fun download(file: RemoteFile) = FileSyncCore.download(file)
     fun delete(file: RemoteFile) = FileSyncCore.delete(file)
     fun stopLog() = FileSyncCore.stopLog()
