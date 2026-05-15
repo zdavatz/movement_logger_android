@@ -37,6 +37,7 @@ Scans for the box over BLE (advertise name `PumpTsueri` *or* `STBoxFs`), connect
 - **Scan / Connect** — runtime BLE permission prompts on first launch.
 - **List files** — splits results into a **Sensor** group (Sens\*.csv, Gps\*.csv, Bat\*.csv, Mic\*.wav) and a **Debug** group, matching the desktop GUI.
 - **Download** — saves each file to `Android/data/ch.ywesee.movementlogger/files/` under its original name. Visible in the system Files app. Long downloads keep running when you switch apps or lock the phone — a foreground notification shows the active file + percentage so the OS doesn't kill the worker mid-READ.
+- **Sync now** — distinct from per-file Download: pulls every session file (Sens\*/Gps\*/Bat\*.csv + Mic\*.wav) on the box not already mirrored locally, tracked in a local SQLite DB (`filesDir/sqlite/sync.db`) keyed per box. Manual downloads register too, so a later Sync skips them. Purely additive — never deletes anything on the box. Port of the desktop's SQLite-tracked sync.
 - **Delete** — removes a file from the SD card.
 - **Start session** — sends START_LOG with a user-set duration (default 30 min). The box reboots into LOG mode and is invisible to Scan until the duration elapses. An on-screen countdown banner ticks while the session runs; the physical button on the box aborts early.
 - **STOP_LOG** — gracefully closes any active logging session so subsequent LIST/READ stop returning BUSY. Does **not** reboot the box.
