@@ -66,6 +66,19 @@ class BleClient(private val context: Context) {
     private var streamChar: BluetoothGattCharacteristic? = null
     private var op: CurrentOp = CurrentOp.Idle
     private var scanning: Boolean = false
+    /** MAC of the box we last successfully subscribed to — the
+     *  reconnect target after an unexpected mid-transfer drop. */
+    private var lastConnectedAddress: String? = null
+    /** Bounded auto-reconnect state machine (desktop v0.0.11–13).
+     *  Driven by the 200 ms watchdog tick so it composes with the
+     *  single-worker model without new concurrency. null = inactive. */
+    private var reconnect: ReconnectState? = null
+    private data class ReconnectState(
+        val address: String,
+        var attempt: Int,
+        var phase: Phase,
+        var nextAtMs: Long,
+    ) { enum class Phase { WAITING, CONNECTING } }
     private var scanStopJob: Job? = null
 
     /** 3-chunk reassembly state for the SensorStream MTU-fallback path.
@@ -126,6 +139,18 @@ class BleClient(private val context: Context) {
         emit(BleEvent.Error(msg))
     }
 
+    /** Subscribe confirmed = we're (re)connected. Remember the box for
+     *  future reconnects; if a reconnect was running, clear it (success)
+     *  — the Connected event drives FileSyncCore's mirror-resume. */
+    private fun emitConnected() {
+        lastConnectedAddress = gatt?.device?.address
+        if (reconnect != null) {
+            reconnect = null
+            emit(BleEvent.Status("auto-reconnected — resuming transfer"))
+        }
+        emit(BleEvent.Connected)
+    }
+
     // -------------------------------------------------------------------------
     //  Command dispatch
     // -------------------------------------------------------------------------
@@ -134,7 +159,13 @@ class BleClient(private val context: Context) {
         when (cmd) {
             BleCmd.Scan -> startScan()
             is BleCmd.Connect -> connect(cmd.address)
-            BleCmd.Disconnect -> disconnectInner(emitEvent = true)
+            BleCmd.Disconnect -> {
+                // User-initiated: cancel any auto-reconnect and forget
+                // the box so a deliberate disconnect doesn't bounce back.
+                reconnect = null
+                lastConnectedAddress = null
+                disconnectInner(emitEvent = true)
+            }
             BleCmd.List -> sendList()
             is BleCmd.Read -> sendRead(cmd.name, cmd.size, cmd.offset)
             BleCmd.StopLog -> sendStopLog()
@@ -388,12 +419,12 @@ class BleClient(private val context: Context) {
                         // Soft-fail: log and proceed with Connected.
                         emit(BleEvent.Status("SensorStream subscribe failed — Live tab will be empty"))
                         op = CurrentOp.Idle
-                        emit(BleEvent.Connected)
+                        emitConnected()
                     }
                 } else {
                     Log.i(tag, "no SensorStream char — emitting Connected without it")
                     op = CurrentOp.Idle
-                    emit(BleEvent.Connected)
+                    emitConnected()
                 }
             }
             FileSyncProtocol.STREAM_UUID -> {
@@ -403,7 +434,7 @@ class BleClient(private val context: Context) {
                     emit(BleEvent.Status("SensorStream subscribed (live data at 0.5 Hz)"))
                 }
                 op = CurrentOp.Idle
-                emit(BleEvent.Connected)
+                emitConnected()
             }
         }
     }
@@ -421,7 +452,16 @@ class BleClient(private val context: Context) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 emitErr("disconnected (status $status)")
             }
-            disconnectInner(emitEvent = true)
+            val wasTransfer = op is CurrentOp.Reading
+            if (wasTransfer && lastConnectedAddress != null && reconnect == null) {
+                // Mid-READ remote drop: keep the partial (disconnectInner
+                // emits ReadAborted) and auto-reconnect instead of a hard
+                // Disconnected (desktop v0.0.11/12).
+                armReconnect()
+            } else if (reconnect == null) {
+                disconnectInner(emitEvent = true)
+            }
+            // else: stray callback while already reconnecting — ignore.
         }
     }
 
@@ -692,7 +732,68 @@ class BleClient(private val context: Context) {
     //  Watchdog
     // -------------------------------------------------------------------------
 
-    private fun tickWatchdog() {
+    /**
+     * Begin a bounded auto-reconnect after an unexpected mid-transfer
+     * drop/stall (desktop `auto_reconnect`). Tears the half-dead link
+     * down *without* a public Disconnected (we intend to come back),
+     * then lets [tickReconnect] drive connect rounds. No-op if we never
+     * had a connected box or a reconnect is already running. Android
+     * connects by MAC directly — no rescan phase needed (vs iOS).
+     */
+    private suspend fun armReconnect() {
+        val addr = lastConnectedAddress ?: return
+        if (reconnect != null) return
+        disconnectInner(emitEvent = false)
+        reconnect = ReconnectState(addr, 1, ReconnectState.Phase.WAITING,
+            now() + RECONNECT_WAIT_MS)
+        emit(BleEvent.Status("link lost — auto-reconnecting (attempt 1/$RECONNECT_ATTEMPTS)…"))
+    }
+
+    /** One step of the reconnect state machine, from the 200 ms tick.
+     *  Success is detected elsewhere (subscribe-confirmed clears it). */
+    private fun tickReconnect() {
+        val rc = reconnect ?: return
+        val n = now()
+        if (n < rc.nextAtMs) return
+        when (rc.phase) {
+            ReconnectState.Phase.WAITING -> {
+                val adapter = btAdapter
+                if (adapter == null) { failReconnectAttempt(rc, n); return }
+                try {
+                    val dev = adapter.getRemoteDevice(rc.address)
+                    gatt = dev.connectGatt(context, /* autoConnect = */ false, gattCallback)
+                    rc.phase = ReconnectState.Phase.CONNECTING
+                    rc.nextAtMs = n + RECONNECT_CONNECT_MS
+                } catch (e: Exception) {
+                    failReconnectAttempt(rc, n)
+                }
+            }
+            ReconnectState.Phase.CONNECTING -> {
+                // Subscribe-confirmed would have cleared `reconnect`; the
+                // attempt timed out. Drop and retry.
+                try { gatt?.disconnect(); gatt?.close() } catch (_: Exception) {}
+                gatt = null
+                failReconnectAttempt(rc, n)
+            }
+        }
+    }
+
+    private fun failReconnectAttempt(rc: ReconnectState, n: Long) {
+        rc.attempt++
+        if (rc.attempt > RECONNECT_ATTEMPTS) {
+            reconnect = null
+            emit(BleEvent.Status("auto-reconnect exhausted — reconnect manually"))
+            emit(BleEvent.Disconnected)
+            return
+        }
+        rc.phase = ReconnectState.Phase.WAITING
+        rc.nextAtMs = n + RECONNECT_WAIT_MS
+        emit(BleEvent.Status("auto-reconnecting (attempt ${rc.attempt}/$RECONNECT_ATTEMPTS)…"))
+    }
+
+    private suspend fun tickWatchdog() {
+        tickReconnect()
+        if (reconnect != null) return
         val now = now()
         // LIST inactivity-done fallback: ≥1 row received and no new bytes for
         // LIST_INACTIVITY_DONE → assume we missed the terminator and finish.
@@ -710,6 +811,7 @@ class BleClient(private val context: Context) {
             CurrentOp.Idle -> false
         }
         if (!stale) return
+        var stalledRead = false
         when (val o = op) {
             is CurrentOp.Listing -> emitErr("LIST timed out — no notifies for 20 s")
             is CurrentOp.Reading -> {
@@ -720,11 +822,19 @@ class BleClient(private val context: Context) {
                 emitErr(
                     "READ ${o.name} timed out at ${o.base + o.content.size}/${o.expected} B — no notifies for 20 s"
                 )
+                stalledRead = true
             }
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} timed out — no notify for 20 s")
             CurrentOp.Idle -> Unit
         }
         op = CurrentOp.Idle
+        // Stalled READ with the box still nominally connected (no formal
+        // disconnect — the case Peter hit). Tear the half-dead link down
+        // and auto-reconnect so the mirror resume can continue (desktop
+        // v0.0.12). Partial already handed back above.
+        if (stalledRead && lastConnectedAddress != null && reconnect == null) {
+            armReconnect()
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -830,6 +940,10 @@ class BleClient(private val context: Context) {
         private const val WATCHDOG_TICK_MS = 200L
         private const val OP_IDLE_TIMEOUT_MS = 20_000L
         private const val LIST_INACTIVITY_DONE_MS = 500L
+        // Bounded auto-reconnect (desktop RECONNECT_ATTEMPTS / INTERVAL).
+        private const val RECONNECT_ATTEMPTS = 10
+        private const val RECONNECT_WAIT_MS = 2_000L
+        private const val RECONNECT_CONNECT_MS = 10_000L
         private const val PROGRESS_CHUNK_BYTES = 4L * 1024
         private const val MAX_BUFFER_HINT = 16 * 1024 * 1024
         /**
