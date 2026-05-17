@@ -68,10 +68,10 @@ object FileSyncCore {
     /** Name of the file the *sync* is currently pulling (null for a manual
      *  download), so [BleEvent.ReadDone] knows whether to advance. */
     private var syncInFlight: String? = null
-    /** LIST-reported size per in-flight download. The DB key is
-     *  `(box, name, size)` and `size` must be the LIST size (matches what
-     *  a later isSynced check compares), not the received byte count. */
-    private val pendingSizes = HashMap<String, Long>()
+    /** "Keep synced" 30 s poll loop (desktop v0.0.14). The pass only
+     *  fetches each file's new tail; survives disconnect (its tick
+     *  guards on Connected so it resumes after a reconnect). */
+    private var keepSyncedJob: Job? = null
 
     /** Hook for [BleSyncService] to react to state transitions. */
     interface Listener {
@@ -120,12 +120,19 @@ object FileSyncCore {
     }
 
     fun download(file: RemoteFile) {
-        _state.update {
-            it.copy(downloads = it.downloads + (file.name to DownloadProgress(0, file.size)))
+        // Live-mirror: resume/grow from whatever is already on disk. The
+        // firmware seeks to `offset`, so an interrupted file continues
+        // and a grown log only fetches its new tail (desktop v0.0.14).
+        val offset = mirrorOffset(file.name, file.size)
+        if (file.size > 0 && offset >= file.size) {
+            log("${file.name} already mirrored (${file.size} B)")
+            return
         }
-        pendingSizes[file.name] = file.size
-        log("READ ${file.name} (${file.size} B)")
-        ble?.send(BleCmd.Read(file.name, file.size))
+        _state.update {
+            it.copy(downloads = it.downloads + (file.name to DownloadProgress(offset, file.size)))
+        }
+        log("READ ${file.name} @$offset/${file.size} B")
+        ble?.send(BleCmd.Read(file.name, file.size, offset))
     }
 
     /**
@@ -134,11 +141,43 @@ object FileSyncCore {
      * Sync tab's distinct-from-manual-transfer button (issue #3).
      * Additive only: never issues DELETE.
      */
-    fun syncNow() {
+    fun syncNow() = startSyncPass("Sync now")
+
+    /**
+     * "Keep synced" — while connected and idle, re-run a sync pass every
+     * 30 s so a continuously-growing log keeps mirrored (desktop
+     * v0.0.14). The pass itself only fetches each file's new tail.
+     */
+    fun setKeepSynced(on: Boolean) {
+        _state.update { it.copy(keepSynced = on) }
+        log("Keep synced ${if (on) "on" else "off"}")
+        keepSyncedJob?.cancel()
+        keepSyncedJob = null
+        if (!on) return
+        keepSyncedJob = scope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(SYNC_POLL_INTERVAL_MS)
+                val s = _state.value
+                if (s.keepSynced && s.connection == Connection.Connected &&
+                    !s.listing && !s.syncing && s.downloads.isEmpty() &&
+                    syncInFlight == null
+                ) {
+                    startSyncPass("Keep synced")
+                }
+            }
+        }
+    }
+
+    /**
+     * Begin one sync pass: fresh LIST, then the diff runs in the
+     * [BleEvent.ListDone] handler (gated on `syncPending` so the auto-
+     * LIST on connect never starts a sync by itself). Shared by the
+     * button and the continuous loop (desktop `start_sync_pass`).
+     */
+    private fun startSyncPass(reason: String) {
         if (_state.value.connection != Connection.Connected) return
-        if (connectedBoxId == null || syncDb == null) {
-            log("ERROR: sync DB unavailable — sync disabled")
-            _state.update { it.copy(syncStatus = "Sync unavailable (no local DB)") }
+        if (connectedBoxId == null) {
+            _state.update { it.copy(syncStatus = "Sync: no box id (reconnect and retry)") }
             return
         }
         syncPending = true
@@ -146,9 +185,9 @@ object FileSyncCore {
         syncInFlight = null
         _state.update {
             it.copy(syncing = true, listing = true, files = emptyList(),
-                    syncStatus = "Sync: listing…")
+                    syncStatus = "Sync: listing SD card…")
         }
-        log("Sync now — LIST")
+        log("$reason — LIST")
         ble?.send(BleCmd.List)
     }
 
@@ -168,36 +207,36 @@ object FileSyncCore {
     }
 
     /**
-     * Diff the just-LISTed files against the sync DB and enqueue the
-     * session files we haven't pulled. Mirrors the desktop's ListDone
-     * sync handler: filter to session data, skip anything isSynced,
-     * enqueue the rest onto the existing serial download path.
+     * Decide what to fetch by **local mirror size vs box size**, not a
+     * DB lookup (desktop v0.0.14). That's what makes a continuously-
+     * growing log work: each pass fetches only the new tail (offset =
+     * local size) instead of re-pulling the whole file, so no single
+     * big file can starve GPS/BAT in the serial queue either. The
+     * SQLite DB is now an audit log, not the fetch decision.
      */
     private fun runSyncDiff() {
-        val box = connectedBoxId
-        val db = syncDb
-        if (box == null || db == null) {
-            _state.update { it.copy(syncing = false, syncStatus = "Sync unavailable (no local DB)") }
-            return
-        }
         val candidates = _state.value.files.filter { isSensorData(it.name) }
-        val fresh = candidates.filter { !db.isSynced(box, it.name, it.size) }
-        val already = candidates.size - fresh.size
-        if (fresh.isEmpty()) {
+        val fetch = ArrayList<RemoteFile>()
+        var upToDate = 0
+        for (f in candidates) {
+            // local < box → grow/resume; local > box → rotated
+            // (mirrorOffset resets it). Either way, fetch.
+            if (mirrorLocalSize(f.name) == f.size) upToDate++ else fetch.add(f)
+        }
+        if (fetch.isEmpty()) {
             _state.update {
                 it.copy(syncing = false,
-                        syncStatus = "Sync: up to date ($already already synced)")
+                        syncStatus = "Sync: up to date ($upToDate files)")
             }
-            log("Sync: up to date — $already already synced, 0 new")
+            log("Sync: up to date — $upToDate files")
             return
         }
         syncQueue.clear()
-        syncQueue.addAll(fresh)
+        syncQueue.addAll(fetch)
         _state.update {
-            it.copy(syncStatus =
-                "Sync: ${fresh.size} new, $already already synced — downloading…")
+            it.copy(syncStatus = "Sync: fetching ${fetch.size} ($upToDate up to date)…")
         }
-        log("Sync: ${fresh.size} new, $already already synced — downloading")
+        log("Sync: fetching ${fetch.size}, $upToDate up to date")
         pumpSyncQueue()
     }
 
@@ -312,7 +351,9 @@ object FileSyncCore {
                 syncPending = false
                 syncQueue.clear()
                 syncInFlight = null
-                pendingSizes.clear()
+                // Keep the "Keep synced" toggle + poll job alive across a
+                // disconnect — its tick guards on Connected, so it simply
+                // resumes after a reconnect (sets up Stage 3 auto-resume).
                 _state.update {
                     it.copy(
                         connection = Connection.Disconnected,
@@ -344,22 +385,22 @@ object FileSyncCore {
                 s.copy(downloads = s.downloads + (e.name to cur.copy(bytesDone = e.bytesDone)))
             }
             is BleEvent.ReadDone -> {
-                val path = saveFile(e.name, e.content)
+                // Append the streamed segment into the local mirror at
+                // the resume offset (desktop v0.0.14). The mirror file
+                // *is* the saved download — always a valid prefix.
+                val (path, localSize) = appendMirror(e.name, e.base, e.content)
                 _state.update { s ->
                     s.copy(
                         downloads = s.downloads - e.name,
                         savedPaths = s.savedPaths + (e.name to path),
                     )
                 }
-                log("saved ${e.name} → $path")
-                // Register every successful save — manual *and*
-                // sync-driven — so a later "Sync now" skips it regardless
-                // of how it landed (desktop: "Manual downloads also
-                // register in the DB").
-                val size = pendingSizes.remove(e.name) ?: e.content.size.toLong()
+                log("saved ${e.name} → $path ($localSize B)")
+                // DB is an audit log now (not the fetch decision): record
+                // that this file reached this size, saved here.
                 val box = connectedBoxId
                 if (path.isNotEmpty() && box != null) {
-                    syncDb?.markSynced(box, e.name, size, path)
+                    syncDb?.markSynced(box, e.name, localSize, path)
                 }
                 if (syncInFlight == e.name) {
                     syncInFlight = null
@@ -402,12 +443,60 @@ object FileSyncCore {
         }
     }
 
-    private fun saveFile(name: String, bytes: ByteArray): String {
-        val ctx = appContext ?: return ""
-        val dir: File = ctx.getExternalFilesDir(null) ?: ctx.filesDir
-        val outFile = File(dir, name)
-        outFile.writeBytes(bytes)
-        return outFile.absolutePath
+    // ---------------- Live mirror (desktop v0.0.14) -----------------------
+    //
+    // The local file `<filesDir>/<name>` *is* the running mirror — we
+    // accumulate straight into it (no .part/rename). The box's logs grow
+    // continuously, so "done" is a moving target; what matters is the local
+    // file is always a valid prefix and we only fetch bytes we don't have.
+    // Local size is the single source of truth for the resume/grow offset.
+    // The DB is a separate audit log.
+
+    private fun mirrorDir(): File =
+        (appContext?.getExternalFilesDir(null) ?: appContext?.filesDir)!!
+
+    private fun mirrorFile(name: String): File = File(mirrorDir(), name)
+
+    /** Current local mirror length, 0 if absent. */
+    private fun mirrorLocalSize(name: String): Long {
+        val f = mirrorFile(name)
+        return if (f.exists()) f.length() else 0L
+    }
+
+    /**
+     * Resume offset given the box's current size:
+     * missing → 0; local ≤ box → local (resume/grow); local > box → the
+     * file rotated (name reused, box file shorter) → drop local, 0.
+     */
+    private fun mirrorOffset(name: String, boxSize: Long): Long {
+        val f = mirrorFile(name)
+        if (!f.exists()) return 0L
+        val len = f.length()
+        if (len <= boxSize) return len
+        f.delete()  // rotated/stale
+        return 0L
+    }
+
+    /**
+     * Append a streamed segment at `base` (creating the file). If the
+     * file length doesn't match `base` the resume is misaligned —
+     * realign to `base` so we never interleave a corrupt prefix.
+     * Returns (absolutePath, new local size).
+     */
+    private fun appendMirror(name: String, base: Long, bytes: ByteArray): Pair<String, Long> {
+        return try {
+            val f = mirrorFile(name)
+            f.parentFile?.mkdirs()
+            java.io.RandomAccessFile(f, "rw").use { raf ->
+                if (raf.length() != base) raf.setLength(base.coerceAtMost(raf.length()))
+                raf.seek(raf.length())
+                raf.write(bytes)
+                Pair(f.absolutePath, raf.length())
+            }
+        } catch (ex: Exception) {
+            log("ERROR: mirror $name: ${ex.message}")
+            Pair("", base + bytes.size)
+        }
     }
 
     private fun log(msg: String) {
@@ -427,6 +516,8 @@ object FileSyncCore {
             s.downloads.isNotEmpty()
     }
 
+    /** "Keep synced" idle poll interval (desktop SYNC_POLL_INTERVAL). */
+    private const val SYNC_POLL_INTERVAL_MS = 30_000L
     private const val MAX_LOG_LINES = 200
     /** Bounded rolling buffer for the Live tab sparklines. 120 × 2 s = 4 min. */
     private const val LIVE_HISTORY_LEN = 120

@@ -31,6 +31,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -148,6 +149,7 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                     onDisconnect = vm::disconnect,
                     onList = vm::listFiles,
                     onSyncNow = vm::syncNow,
+                    onSetKeepSynced = vm::setKeepSynced,
                     onStopLog = vm::stopLog,
                     onSetDuration = vm::setSessionDuration,
                     onStartSession = vm::startSession,
@@ -186,6 +188,7 @@ private fun ConnectionBar(
     onDisconnect: () -> Unit,
     onList: () -> Unit,
     onSyncNow: () -> Unit,
+    onSetKeepSynced: (Boolean) -> Unit,
     onStopLog: () -> Unit,
     onSetDuration: (Int) -> Unit,
     onStartSession: () -> Unit,
@@ -225,6 +228,15 @@ private fun ConnectionBar(
             }
         }
         if (state.connection == Connection.Connected) {
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = state.keepSynced,
+                    onCheckedChange = onSetKeepSynced,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Keep synced", style = MaterialTheme.typography.bodySmall)
+            }
             state.syncStatus?.let { status ->
                 Spacer(Modifier.height(8.dp))
                 Text(

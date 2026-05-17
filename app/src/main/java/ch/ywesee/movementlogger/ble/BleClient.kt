@@ -136,7 +136,7 @@ class BleClient(private val context: Context) {
             is BleCmd.Connect -> connect(cmd.address)
             BleCmd.Disconnect -> disconnectInner(emitEvent = true)
             BleCmd.List -> sendList()
-            is BleCmd.Read -> sendRead(cmd.name, cmd.size)
+            is BleCmd.Read -> sendRead(cmd.name, cmd.size, cmd.offset)
             BleCmd.StopLog -> sendStopLog()
             is BleCmd.StartLog -> sendStartLog(cmd.durationSeconds)
             is BleCmd.Delete -> sendDelete(cmd.name)
@@ -219,7 +219,7 @@ class BleClient(private val context: Context) {
     private suspend fun disconnectInner(emitEvent: Boolean) {
         when (val o = op) {
             is CurrentOp.Reading -> emitErr(
-                "READ ${o.name} aborted by disconnect at ${o.content.size}/${o.expected} B"
+                "READ ${o.name} aborted by disconnect at ${o.base + o.content.size}/${o.expected} B"
             )
             is CurrentOp.Listing -> emitErr("LIST aborted by disconnect")
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} aborted by disconnect")
@@ -273,19 +273,33 @@ class BleClient(private val context: Context) {
         emit(BleEvent.Status("LIST sent"))
     }
 
-    private fun sendRead(name: String, size: Long) {
+    private fun sendRead(name: String, size: Long, offset: Long) {
         if (op !is CurrentOp.Idle) {
             emitErr("another op is in flight — wait or Disconnect"); return
         }
-        val payload = ByteArray(1 + name.length)
+        // Opcode payload: 0x02 + name + NUL + 4-byte LE start offset.
+        // The firmware seeks to `offset` before streaming, so a resumed
+        // or grown file continues mid-file. offset is u32 on the wire —
+        // SD files are well under 4 GiB.
+        val nameBytes = name.toByteArray(Charsets.UTF_8)
+        val payload = ByteArray(1 + nameBytes.size + 1 + 4)
         payload[0] = FileSyncProtocol.OP_READ
-        System.arraycopy(name.toByteArray(Charsets.UTF_8), 0, payload, 1, name.length)
+        System.arraycopy(nameBytes, 0, payload, 1, nameBytes.size)
+        payload[1 + nameBytes.size] = 0x00
+        val off = offset.toInt()
+        val p = 1 + nameBytes.size + 1
+        payload[p]     = (off and 0xFF).toByte()
+        payload[p + 1] = ((off ushr 8) and 0xFF).toByte()
+        payload[p + 2] = ((off ushr 16) and 0xFF).toByte()
+        payload[p + 3] = ((off ushr 24) and 0xFF).toByte()
         if (!writeCmdBytes(payload)) return
+        val remaining = (size - offset).coerceAtLeast(0)
         op = CurrentOp.Reading(
             name = name,
             expected = size,
-            content = ArrayList(size.coerceAtMost(MAX_BUFFER_HINT.toLong()).toInt()),
-            lastEmit = 0,
+            base = offset,
+            content = ArrayList(remaining.coerceAtMost(MAX_BUFFER_HINT.toLong()).toInt()),
+            lastEmit = offset,
             lastProgress = now(),
             firstPacket = true,
         )
@@ -627,7 +641,10 @@ class BleClient(private val context: Context) {
         state.firstPacket = false
 
         for (b in value) state.content.add(b)
-        val done = state.content.size.toLong()
+        // `done` is the absolute byte position in the file: the resume
+        // base plus what this segment has received. EOF is the box's
+        // full size, not the segment length.
+        val done = state.base + state.content.size.toLong()
 
         // Progress throttling: every ~4 KB or at EOF. BLE FileSync runs
         // ~1-3 KB/s so this updates the bar every 1-4 s.
@@ -637,9 +654,10 @@ class BleClient(private val context: Context) {
         }
 
         if (done >= state.expected) {
-            val bytes = ByteArray(state.expected.toInt())
-            for (i in 0 until state.expected.toInt()) bytes[i] = state.content[i]
-            emit(BleEvent.ReadDone(state.name, bytes))
+            val take = (state.expected - state.base).coerceAtLeast(0).toInt()
+            val bytes = ByteArray(take)
+            for (i in 0 until take) bytes[i] = state.content[i]
+            emit(BleEvent.ReadDone(state.name, bytes, state.base))
             op = CurrentOp.Idle
         }
     }
@@ -689,7 +707,7 @@ class BleClient(private val context: Context) {
         when (val o = op) {
             is CurrentOp.Listing -> emitErr("LIST timed out — no notifies for 20 s")
             is CurrentOp.Reading -> emitErr(
-                "READ ${o.name} timed out at ${o.content.size}/${o.expected} B — no notifies for 20 s"
+                "READ ${o.name} timed out at ${o.base + o.content.size}/${o.expected} B — no notifies for 20 s"
             )
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} timed out — no notify for 20 s")
             CurrentOp.Idle -> Unit
@@ -772,6 +790,7 @@ class BleClient(private val context: Context) {
         data class Reading(
             val name: String,
             val expected: Long,
+            val base: Long,
             val content: ArrayList<Byte>,
             var lastEmit: Long,
             var lastProgress: Long,

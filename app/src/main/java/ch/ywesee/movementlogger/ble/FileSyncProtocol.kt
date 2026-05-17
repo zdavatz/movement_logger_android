@@ -57,7 +57,15 @@ sealed class BleCmd {
     data class Connect(val address: String) : BleCmd()
     data object Disconnect : BleCmd()
     data object List : BleCmd()
-    data class Read(val name: String, val size: Long) : BleCmd()
+    /**
+     * `size` is the full file length from the prior LIST (EOF marker).
+     * `offset` is the byte position to resume/grow from (0 = whole
+     * file) — the firmware seeks there before streaming, so an
+     * interrupted or grown file continues instead of restarting.
+     * Wire: `0x02 + name + 0x00 + offset(u32-LE)` (port of desktop
+     * v0.0.11/#8).
+     */
+    data class Read(val name: String, val size: Long, val offset: Long) : BleCmd()
     data object StopLog : BleCmd()
     data class StartLog(val durationSeconds: Int) : BleCmd()
     data class Delete(val name: String) : BleCmd()
@@ -73,10 +81,17 @@ sealed class BleEvent {
     data object ListDone : BleEvent()
     data class ReadStarted(val name: String, val size: Long) : BleEvent()
     data class ReadProgress(val name: String, val bytesDone: Long) : BleEvent()
-    data class ReadDone(val name: String, val content: ByteArray) : BleEvent() {
+    /**
+     * `base` is the offset the streamed segment started at (= the
+     * resume offset requested). The consumer appends `content` to the
+     * local mirror at `base` (desktop v0.0.14 live-mirror model).
+     */
+    data class ReadDone(val name: String, val content: ByteArray, val base: Long) : BleEvent() {
         override fun equals(other: Any?): Boolean =
-            other is ReadDone && name == other.name && content.contentEquals(other.content)
-        override fun hashCode(): Int = 31 * name.hashCode() + content.contentHashCode()
+            other is ReadDone && name == other.name && base == other.base &&
+                content.contentEquals(other.content)
+        override fun hashCode(): Int =
+            (31 * name.hashCode() + content.contentHashCode()) * 31 + base.hashCode()
     }
     data class DeleteDone(val name: String) : BleEvent()
     data class Error(val msg: String) : BleEvent()
