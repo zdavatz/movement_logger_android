@@ -220,8 +220,13 @@ object FileSyncCore {
     }
 
     fun delete(file: RemoteFile) {
+        _state.update { it.copy(deleteError = null) }  // clear stale rejection
         log("DELETE ${file.name}")
         ble?.send(BleCmd.Delete(file.name))
+    }
+
+    fun dismissDeleteError() {
+        _state.update { it.copy(deleteError = null) }
     }
 
     fun stopLog() {
@@ -266,6 +271,13 @@ object FileSyncCore {
             is BleEvent.Status -> log(e.msg)
             is BleEvent.Error -> {
                 log("ERROR: ${e.msg}")
+                // Surface DELETE rejections prominently — the box refuses
+                // some Debug rows (8.3-name miss -> NOT_FOUND, >15 chars
+                // -> BAD_REQUEST, logging active -> BUSY). Without this it
+                // only hits the log and looks like the tap did nothing (#7).
+                if (e.msg.startsWith("DELETE ")) {
+                    _state.update { it.copy(deleteError = e.msg) }
+                }
                 // A BLE error mid-sync would otherwise strand the queue
                 // (syncInFlight never clears). Abort cleanly so the next
                 // "Sync now" starts fresh; the size key means a partial
@@ -309,6 +321,7 @@ object FileSyncCore {
                         syncing = false,
                         downloads = emptyMap(),
                         live = LiveState(),
+                        deleteError = null,
                     )
                 }
                 liveT0Ms = null
@@ -354,7 +367,10 @@ object FileSyncCore {
                 }
             }
             is BleEvent.DeleteDone -> {
-                _state.update { s -> s.copy(files = s.files.filterNot { it.name == e.name }) }
+                _state.update { s ->
+                    s.copy(files = s.files.filterNot { it.name == e.name },
+                           deleteError = null)
+                }
                 log("deleted ${e.name}")
             }
             is BleEvent.Sample -> onSample(e.sample)

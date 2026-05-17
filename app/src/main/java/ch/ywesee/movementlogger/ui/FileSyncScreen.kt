@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -30,6 +31,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -50,6 +52,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -155,7 +158,13 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                 when (state.connection) {
                     Connection.Disconnected -> DiscoveredList(state, vm::connect)
                     Connection.Connecting -> CenteredSpinner(label = "connecting…")
-                    Connection.Connected -> FilesPanel(state, vm::download, vm::delete)
+                    Connection.Connected -> {
+                        state.deleteError?.let { err ->
+                            DeleteErrorBanner(err) { vm.dismissDeleteError() }
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        FilesPanel(state, vm::download, vm::delete)
+                    }
                 }
 
                 Spacer(Modifier.height(12.dp))
@@ -424,6 +433,7 @@ private fun FileRow(
 ) {
     val progress = state.downloads[f.name]
     val savedPath = state.savedPaths[f.name]
+    val deleteReason = deleteUnsupported(f.name)
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         colors = CardDefaults.cardColors(
@@ -454,7 +464,17 @@ private fun FileRow(
                     enabled = progress == null,
                 ) { Text(if (progress == null) "Download" else "…") }
                 Spacer(Modifier.width(4.dp))
-                OutlinedButton(onClick = { onDelete(f) }) { Text("Delete") }
+                OutlinedButton(
+                    onClick = { onDelete(f) },
+                    enabled = progress == null && deleteReason == null,
+                ) { Text("Delete") }
+            }
+            if (deleteReason != null) {
+                Text(
+                    "Can't delete: $deleteReason",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             if (progress != null) {
                 Spacer(Modifier.height(8.dp))
@@ -487,6 +507,53 @@ private fun isSensorData(name: String): Boolean {
         (n.startsWith("gps")  && n.endsWith(".csv")) ||
         (n.startsWith("bat")  && n.endsWith(".csv")) ||
         (n.startsWith("mic")  && n.endsWith(".wav"))
+}
+
+/**
+ * Rows the box firmware can *never* delete — return the reason so the
+ * trash button can be disabled with an explanation instead of looking
+ * like a silent no-op. Port of the desktop's `delete_unsupported`
+ * (movement_logger_desktop v0.0.10 / issue #7): `ble.c` caps DELETE
+ * names at 15 bytes (longer ⇒ BAD_REQUEST) and `SDFat_Delete` only
+ * matches a real FAT 8.3 short name, so `._*` AppleDouble sidecars and
+ * the virtual `PUMPTSUE.RI` placeholder always come back NOT_FOUND.
+ */
+private fun deleteUnsupported(name: String): String? = when {
+    name.startsWith("._") ->
+        "macOS metadata sidecar — not a real file on the box's SD card"
+    name.equals("PUMPTSUE.RI", ignoreCase = true) ->
+        "virtual placeholder entry — nothing to delete"
+    name.toByteArray().size > 15 ->
+        "filename too long for the box's delete command (15-char firmware cap)"
+    else -> null
+}
+
+/**
+ * Prominent dismissable banner for a DELETE the box rejected (BUSY /
+ * NOT_FOUND / IO_ERROR / BAD_REQUEST). Port of the desktop's
+ * `ble_delete_err` frame (v0.0.10) — without it a rejected delete only
+ * shows in the log and looks like the tap did nothing.
+ */
+@Composable
+private fun DeleteErrorBanner(message: String, onDismiss: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5)),
+        border = BorderStroke(1.dp, Color(0xFFC75050)),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "⚠ $message",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFFAA1E1E),
+            )
+            TextButton(onClick = onDismiss) { Text("Dismiss") }
+        }
+    }
 }
 
 @Composable

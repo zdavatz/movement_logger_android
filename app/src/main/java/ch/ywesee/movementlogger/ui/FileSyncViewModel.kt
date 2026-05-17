@@ -71,6 +71,10 @@ data class FileSyncUiState(
     /** One-line sync result, mirrors the desktop status line
      *  ("Sync: 3 new, 12 already synced — downloading…" / "up to date"). */
     val syncStatus: String? = null,
+    /** A DELETE the box rejected (BUSY / NOT_FOUND / IO_ERROR /
+     *  BAD_REQUEST). Surfaced as a dismissable banner; cleared on a
+     *  successful delete, a fresh attempt, or disconnect (desktop #7). */
+    val deleteError: String? = null,
     val log: List<String> = emptyList(),
     val sessionDurationSeconds: Int = 1800,  // 30-min default, matches desktop
     val sessionRunning: SessionRunning? = null,
@@ -111,6 +115,7 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun download(file: RemoteFile) = FileSyncCore.download(file)
     fun delete(file: RemoteFile) = FileSyncCore.delete(file)
+    fun dismissDeleteError() = FileSyncCore.dismissDeleteError()
     fun stopLog() = FileSyncCore.stopLog()
     fun setSessionDuration(seconds: Int) = FileSyncCore.setSessionDuration(seconds)
     fun startSession() = FileSyncCore.startSession()
