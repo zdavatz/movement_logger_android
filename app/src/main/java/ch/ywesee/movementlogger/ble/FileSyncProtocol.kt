@@ -93,6 +93,19 @@ sealed class BleEvent {
         override fun hashCode(): Int =
             (31 * name.hashCode() + content.contentHashCode()) * 31 + base.hashCode()
     }
+    /**
+     * A READ cut short by a link drop / 20 s stall. Carries the partial
+     * segment so the consumer appends it to the mirror — the resume
+     * then continues from the *true* break point, not the last
+     * completed segment (desktop v0.0.9/#6). Followed by an `Error`.
+     */
+    data class ReadAborted(val name: String, val content: ByteArray, val base: Long) : BleEvent() {
+        override fun equals(other: Any?): Boolean =
+            other is ReadAborted && name == other.name && base == other.base &&
+                content.contentEquals(other.content)
+        override fun hashCode(): Int =
+            (31 * name.hashCode() + content.contentHashCode()) * 31 + base.hashCode()
+    }
     data class DeleteDone(val name: String) : BleEvent()
     data class Error(val msg: String) : BleEvent()
     /**

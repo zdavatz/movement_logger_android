@@ -73,6 +73,11 @@ data class FileSyncUiState(
     val syncStatus: String? = null,
     /** "Keep synced" continuous-mirror toggle (desktop v0.0.14). */
     val keepSynced: Boolean = false,
+    /** A transfer was cut by a link drop / stall; the partial is safe
+     *  in the mirror. Drives the reconnect banner and the auto-resume
+     *  on the next Connected (desktop v0.0.9). Persists across the
+     *  disconnect on purpose. */
+    val transferInterrupted: Boolean = false,
     /** A DELETE the box rejected (BUSY / NOT_FOUND / IO_ERROR /
      *  BAD_REQUEST). Surfaced as a dismissable banner; cleared on a
      *  successful delete, a fresh attempt, or disconnect (desktop #7). */

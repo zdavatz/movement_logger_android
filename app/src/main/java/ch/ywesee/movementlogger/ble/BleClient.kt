@@ -218,9 +218,15 @@ class BleClient(private val context: Context) {
 
     private suspend fun disconnectInner(emitEvent: Boolean) {
         when (val o = op) {
-            is CurrentOp.Reading -> emitErr(
-                "READ ${o.name} aborted by disconnect at ${o.base + o.content.size}/${o.expected} B"
-            )
+            is CurrentOp.Reading -> {
+                // Hand back the partial so the resume continues from the
+                // true break point (appended to the mirror), then
+                // surface the abort (desktop v0.0.9 disconnect_inner).
+                emit(BleEvent.ReadAborted(o.name, o.content.toByteArray(), o.base))
+                emitErr(
+                    "READ ${o.name} aborted by disconnect at ${o.base + o.content.size}/${o.expected} B"
+                )
+            }
             is CurrentOp.Listing -> emitErr("LIST aborted by disconnect")
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} aborted by disconnect")
             CurrentOp.Idle -> Unit
@@ -706,9 +712,15 @@ class BleClient(private val context: Context) {
         if (!stale) return
         when (val o = op) {
             is CurrentOp.Listing -> emitErr("LIST timed out — no notifies for 20 s")
-            is CurrentOp.Reading -> emitErr(
-                "READ ${o.name} timed out at ${o.base + o.content.size}/${o.expected} B — no notifies for 20 s"
-            )
+            is CurrentOp.Reading -> {
+                // Stalled (GATT still thinks it's connected). Hand back
+                // the partial so the resume continues from here, not the
+                // last completed segment (desktop v0.0.12 tick_watchdog).
+                emit(BleEvent.ReadAborted(o.name, o.content.toByteArray(), o.base))
+                emitErr(
+                    "READ ${o.name} timed out at ${o.base + o.content.size}/${o.expected} B — no notifies for 20 s"
+                )
+            }
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} timed out — no notify for 20 s")
             CurrentOp.Idle -> Unit
         }

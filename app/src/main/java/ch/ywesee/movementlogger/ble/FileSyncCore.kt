@@ -325,9 +325,14 @@ object FileSyncCore {
                     syncPending = false
                     syncQueue.clear()
                     syncInFlight = null
+                    // A resumable interruption (ReadAborted already
+                    // fired) keeps its own resume message + banner —
+                    // don't stomp it with "try again".
+                    val resumable = _state.value.transferInterrupted
                     _state.update {
                         it.copy(syncing = false,
-                                syncStatus = "Sync aborted (BLE error) — try again")
+                                syncStatus = if (resumable) it.syncStatus
+                                    else "Sync aborted (BLE error) — try again")
                     }
                 }
             }
@@ -342,6 +347,18 @@ object FileSyncCore {
             BleEvent.Connected -> {
                 _state.update { it.copy(connection = Connection.Connected) }
                 log("connected")
+                // Resume after an interrupted transfer (desktop v0.0.9):
+                // the aborted partial is already in the mirror, so a
+                // fresh sync pass skips every complete file and re-pulls
+                // only the unfinished one from its mirror offset. Also
+                // resume if "Keep synced" is on. A plain first connect
+                // does neither.
+                val st = _state.value
+                if (st.transferInterrupted || st.keepSynced) {
+                    val why = if (st.transferInterrupted) "Resume" else "Keep synced"
+                    _state.update { it.copy(transferInterrupted = false) }
+                    startSyncPass(why)
+                }
             }
             BleEvent.Disconnected -> {
                 // Drop the live-stream buffers too — the box may resume
@@ -406,6 +423,25 @@ object FileSyncCore {
                     syncInFlight = null
                     pumpSyncQueue()
                 }
+            }
+            is BleEvent.ReadAborted -> {
+                // Link dropped / stalled mid-file. Persist the partial
+                // into the mirror so the resume continues from the
+                // *true* break point (desktop v0.0.9). NOT markSynced —
+                // incomplete; the next pass re-pulls only the remaining
+                // tail via mirrorOffset. The Error that follows clears
+                // the queue.
+                val (_, have) = appendMirror(e.name, e.base, e.content)
+                syncInFlight = null
+                _state.update {
+                    it.copy(
+                        downloads = it.downloads - e.name,
+                        transferInterrupted = true,
+                        syncStatus = "Transfer interrupted — reconnect to resume " +
+                            "($have B of ${e.name} kept)",
+                    )
+                }
+                log("kept $have B of ${e.name} for resume")
             }
             is BleEvent.DeleteDone -> {
                 _state.update { s ->

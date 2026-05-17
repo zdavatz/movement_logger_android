@@ -155,6 +155,11 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                     onStartSession = vm::startSession,
                 )
 
+                if (state.transferInterrupted && state.connection != Connection.Connected) {
+                    Spacer(Modifier.height(8.dp))
+                    TransferInterruptedBanner()
+                }
+
                 Spacer(Modifier.height(12.dp))
 
                 when (state.connection) {
@@ -546,6 +551,30 @@ private fun deleteUnsupported(name: String): String? = when {
  * `ble_delete_err` frame (v0.0.10) — without it a rejected delete only
  * shows in the log and looks like the tap did nothing.
  */
+/**
+ * Amber banner shown while disconnected after a transfer was cut by a
+ * link drop / stall. Port of the desktop v0.0.9 resume banner — the
+ * partial is already safe in the mirror, so reconnecting resumes
+ * automatically and skips every file already complete.
+ */
+@Composable
+private fun TransferInterruptedBanner() {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF2CC)),
+        border = BorderStroke(1.dp, Color(0xFFD9A832)),
+    ) {
+        Text(
+            "⚠ Transfer interrupted (BLE link lost). Scan and reconnect to " +
+                "the same box — the sync resumes automatically and skips " +
+                "files already saved.",
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = Color(0xFF8C5A00),
+        )
+    }
+}
+
 @Composable
 private fun DeleteErrorBanner(message: String, onDismiss: () -> Unit) {
     Card(
