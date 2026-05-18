@@ -12,6 +12,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -23,7 +25,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -59,6 +60,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -177,12 +180,13 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                 Spacer(Modifier.height(12.dp))
                 HorizontalDivider()
                 Spacer(Modifier.height(8.dp))
-                LogPanel(state.log)
+                LogSection(vm.logFilePath())
             }
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ConnectionBar(
     state: FileSyncUiState,
@@ -199,7 +203,10 @@ private fun ConnectionBar(
     onStartSession: () -> Unit,
 ) {
     Column {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        // FlowRow so the action buttons wrap onto the next line on narrow
+        // screens instead of the last one (Disconnect) being squeezed into
+        // an unusable tall sliver.
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             when (state.connection) {
                 Connection.Disconnected -> {
                     if (!permsGranted) {
@@ -208,27 +215,29 @@ private fun ConnectionBar(
                         Button(onClick = onScan, enabled = !state.scanning) {
                             Text(if (state.scanning) "Scanning…" else "Scan for PumpTsueri")
                         }
-                        Spacer(Modifier.width(8.dp))
                         OutlinedButton(onClick = onEnableBt) { Text("Bluetooth…") }
                     }
                 }
                 Connection.Connecting -> {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(8.dp))
-                    Text("connecting…")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("connecting…")
+                    }
                 }
                 Connection.Connected -> {
                     Button(onClick = onList, enabled = !state.listing) {
                         Text(if (state.listing) "Listing…" else "List files")
                     }
-                    Spacer(Modifier.width(8.dp))
                     OutlinedButton(onClick = onSyncNow, enabled = !state.listing && !state.syncing) {
                         Text(if (state.syncing) "Syncing…" else "Sync now")
                     }
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = onStopLog) { Text("STOP_LOG") }
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
+                    // STOP_LOG and Disconnect buttons removed (user request):
+                    // the current firmware auto-starts logging at boot and has
+                    // no START_LOG opcode, so STOP_LOG would silently kill
+                    // recording until a power-cycle. Disconnect isn't needed —
+                    // the link drops on its own when out of range / box reboots.
+                    // vm.stopLog()/vm.disconnect() plumbing is kept for now.
                 }
             }
         }
@@ -597,29 +606,77 @@ private fun DeleteErrorBanner(message: String, onDismiss: () -> Unit) {
     }
 }
 
+/**
+ * Replaces the always-on 180 dp panel with a single "Log" button. The
+ * full transcript is written to `<externalFilesDir>/movement_logger.log`
+ * regardless; tapping the button opens that file in a viewer dialog
+ * (with Share to export it). Mirrors the iOS LogSection / LogFileViewer.
+ */
 @Composable
-private fun LogPanel(lines: List<String>) {
-    val listState = rememberLazyListState()
-    LaunchedEffect(lines.size) {
-        if (lines.isNotEmpty()) listState.animateScrollToItem(lines.size - 1)
+private fun LogSection(filePath: String?) {
+    var showing by remember { mutableStateOf(false) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OutlinedButton(onClick = { showing = true }) { Text("Log") }
+        Spacer(Modifier.width(8.dp))
+        Text(
+            "→ movement_logger.log",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(180.dp)
-            .background(
-                MaterialTheme.colorScheme.surfaceContainerLow,
-                RoundedCornerShape(8.dp),
-            )
-            .padding(8.dp),
+    if (showing) {
+        LogFileViewer(filePath = filePath, onDismiss = { showing = false })
+    }
+}
+
+/**
+ * Full-screen viewer: reads `movement_logger.log` from disk, shows it
+ * scrollable + monospaced (scrolled to the end), with a Share action
+ * that hands the file to any app via the FileProvider.
+ */
+@Composable
+private fun LogFileViewer(filePath: String?, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val text = remember(filePath) {
+        if (filePath == null) ""
+        else runCatching { java.io.File(filePath).readText() }.getOrDefault("")
+    }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
-        if (lines.isEmpty()) {
-            Text("log", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else {
-            LazyColumn(state = listState) {
-                items(lines) { line ->
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Text(
-                        line,
+                        "movement_logger.log",
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = { shareLogFile(context, filePath) },
+                        enabled = filePath != null && text.isNotEmpty(),
+                    ) { Text("Share") }
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+                HorizontalDivider()
+                val scroll = rememberScrollState()
+                LaunchedEffect(text, scroll.maxValue) { scroll.scrollTo(scroll.maxValue) }
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(scroll)
+                        .padding(12.dp),
+                ) {
+                    Text(
+                        text.ifEmpty {
+                            "(log file is empty — connect to a box to generate entries)"
+                        },
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurface,
@@ -628,6 +685,24 @@ private fun LogPanel(lines: List<String>) {
             }
         }
     }
+}
+
+private fun shareLogFile(context: android.content.Context, path: String?) {
+    if (path == null) return
+    val file = java.io.File(path)
+    if (!file.exists()) return
+    val uri = androidx.core.content.FileProvider.getUriForFile(
+        context, "${context.packageName}.fileprovider", file,
+    )
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(
+        Intent.createChooser(send, "Share log")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+    )
 }
 
 @Composable

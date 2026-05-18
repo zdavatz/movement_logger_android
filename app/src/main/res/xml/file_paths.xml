@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shareable paths for androidx FileProvider. The diagnostic log lives in
+     getExternalFilesDir(null); filesDir is the fallback when external is
+     unavailable, so expose both. -->
+<paths>
+    <external-files-path name="ext_files" path="." />
+    <files-path name="int_files" path="." />
+</paths>

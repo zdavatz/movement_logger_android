@@ -128,4 +128,5 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
     fun setSessionDuration(seconds: Int) = FileSyncCore.setSessionDuration(seconds)
     fun startSession() = FileSyncCore.startSession()
     fun clearSession() = FileSyncCore.clearSession()
+    fun logFilePath(): String? = FileSyncCore.logFilePath()
 }

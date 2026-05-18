@@ -44,6 +44,8 @@ object FileSyncCore {
     val state: StateFlow<FileSyncUiState> = _state.asStateFlow()
 
     private val tsFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    /** File log keeps the date too — one file spans many sessions/days. */
+    private val fileTsFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private var ble: BleClient? = null
@@ -536,10 +538,46 @@ object FileSyncCore {
     }
 
     private fun log(msg: String) {
-        val stamp = tsFmt.format(Date())
+        val now = Date()
+        val stamp = tsFmt.format(now)
         _state.update { it.copy(log = (it.log + "$stamp  $msg").takeLast(MAX_LOG_LINES)) }
         listener?.onStateChanged(_state.value)
+        appendLogFile(fileTsFmt.format(now), msg)
     }
+
+    /**
+     * Persist every log line to `<externalFilesDir>/movement_logger.log`
+     * (same folder as the downloaded recordings, so it survives app
+     * restarts and is reachable via the device's file manager / adb).
+     * Append-only with a soft size cap: once the file passes
+     * [MAX_LOG_FILE_BYTES] it's rotated to `.1` so it can't grow forever.
+     */
+    @Synchronized
+    private fun appendLogFile(stamp: String, msg: String) {
+        val f = logFile() ?: return
+        try {
+            if (f.length() > MAX_LOG_FILE_BYTES) {
+                val bak = File(f.parentFile, f.name + ".1")
+                bak.delete()
+                f.renameTo(bak)
+            }
+            f.parentFile?.mkdirs()
+            java.io.FileOutputStream(f, true).bufferedWriter().use {
+                it.append(stamp).append("  ").append(msg).append('\n')
+            }
+        } catch (_: Exception) {
+            // Logging must never crash the app — a full disk / revoked
+            // storage just means no on-disk copy this run.
+        }
+    }
+
+    private fun logFile(): File? {
+        val dir = appContext?.getExternalFilesDir(null) ?: appContext?.filesDir ?: return null
+        return File(dir, "movement_logger.log")
+    }
+
+    /** Absolute path of the on-disk log, or null before [ensureInit]. */
+    fun logFilePath(): String? = logFile()?.absolutePath
 
     /** True while BLE work is active — used by [BleSyncService] to decide
      *  whether to stay foreground or stop itself. */
@@ -555,6 +593,8 @@ object FileSyncCore {
     /** "Keep synced" idle poll interval (desktop SYNC_POLL_INTERVAL). */
     private const val SYNC_POLL_INTERVAL_MS = 30_000L
     private const val MAX_LOG_LINES = 200
+    /** Rotate the on-disk log past this size (1 MiB ≈ tens of sessions). */
+    private const val MAX_LOG_FILE_BYTES = 1L * 1024 * 1024
     /** Bounded rolling buffer for the Live tab sparklines. 120 × 2 s = 4 min. */
     private const val LIVE_HISTORY_LEN = 120
 }

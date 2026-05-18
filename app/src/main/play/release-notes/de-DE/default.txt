@@ -1,1 +1,1 @@
-Live tab zeigt jetzt zusätzlich Roll, Pitch und Yaw in Grad an, berechnet aus Beschleunigungs- und Magnetsensor (tilt-kompensierter Kompasswinkel nach ST AN4248).
+Sync-Tab: Das Diagnose-Log wird jetzt in die Datei movement_logger.log geschrieben (gleicher Ordner wie die Downloads). Der neue "Log"-Button öffnet einen Viewer mit dem Datei-Inhalt samt Teilen-Funktion. STOP_LOG- und Disconnect-Button entfernt (neue Firmware loggt durchgängig); die Button-Reihe bricht jetzt sauber um statt zu überlaufen.
