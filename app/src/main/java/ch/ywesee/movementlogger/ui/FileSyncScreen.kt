@@ -3,6 +3,7 @@ package ch.ywesee.movementlogger.ui
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
+import ch.ywesee.movementlogger.BuildConfig
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -123,9 +125,19 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
     }
 
     Scaffold(
+        // The outer MainNav Scaffold already insets for the status bar;
+        // zero insets here so we don't double-count and leave a blank
+        // band above the title.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
-                title = { Text("Movement Logger") },
+                windowInsets = WindowInsets(0, 0, 0, 0),
+                title = {
+                    Text(
+                        "Movement Logger ${BuildConfig.VERSION_NAME}" +
+                            if (BuildConfig.DEBUG) " (debug)" else ""
+                    )
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                 ),
@@ -459,8 +471,12 @@ private fun FilesPanel(
     }
     // Match the desktop GUI: sensor-data files (per-session recordings) on top,
     // everything else under a "Debug" section the user usually ignores.
+    // Newest first: the per-session counter in the name (SensNNN.csv) is the
+    // recency proxy — higher NNN = later session. No-digit names sort last.
     val sensor = state.files.filter { isSensorData(it.name) }
+        .sortedByDescending { recencyKey(it.name) }
     val debug = state.files.filterNot { isSensorData(it.name) }
+        .sortedByDescending { recencyKey(it.name) }
     LazyColumn {
         if (sensor.isNotEmpty()) {
             item(key = "header-sensor") { GroupHeader("Sensor", sensor.size) }
@@ -561,6 +577,14 @@ private fun FileRow(
         }
     }
 }
+
+/**
+ * Recency rank for the file list: the trailing per-session counter in
+ * `SensNNN.csv` / `GpsNNN.csv` / … — higher = later session = shown
+ * first. Names without a number sort last (key -1).
+ */
+private fun recencyKey(name: String): Int =
+    Regex("(\\d+)").findAll(name).lastOrNull()?.value?.toIntOrNull() ?: -1
 
 /**
  * Per-session sensor-data files the firmware writes: Sens*.csv, Gps*.csv,

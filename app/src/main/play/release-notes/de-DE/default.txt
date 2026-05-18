@@ -1,1 +1,1 @@
-Sync-Tab: Neuer Log-Modus-Schalter "Auto" / "Manuell". Bei "Auto" zeichnet die Box wie bisher ab dem Einschalten auf. Bei "Manuell" bleibt sie im Leerlauf und startet erst über "Start Session" eine Aufnahme mit fester Dauer. Die Einstellung wird auf der Box gespeichert (neue Firmware erforderlich).
+Versionsnummer wird jetzt neben dem App-Namen angezeigt. Datei-Liste zeigt die neueste Aufnahme zuerst (kein Scrollen mehr ans Listenende). Verschwendeter Leerraum über dem Titel entfernt; alle Tabs (Live/Sync/Replay) haben jetzt einheitlich die violette Titelleiste.

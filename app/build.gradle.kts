@@ -29,8 +29,8 @@ android {
         applicationId = "ch.ywesee.movementlogger"
         minSdk = 26
         targetSdk = 35
-        versionCode = cliVersionCode ?: 5
-        versionName = cliVersionName ?: "0.0.5"
+        versionCode = cliVersionCode ?: 26
+        versionName = cliVersionName ?: "0.0.26"
     }
 
     if (signingProps != null) {
@@ -64,7 +64,7 @@ android {
 
     kotlinOptions { jvmTarget = "17" }
 
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
 
     packaging {
         resources.excludes += setOf(
