@@ -1,1 +1,1 @@
-Versionsnummer wird jetzt neben dem App-Namen angezeigt. Datei-Liste zeigt die neueste Aufnahme zuerst (kein Scrollen mehr ans Listenende). Verschwendeter Leerraum über dem Titel entfernt; alle Tabs (Live/Sync/Replay) haben jetzt einheitlich die violette Titelleiste.
+"Disconnect"-Button ist zurück: synchronisieren, Verbindung trennen, Box weitergeben — die nächste Person kann dann verbinden und ebenfalls syncen. Bereits vollständig heruntergeladene Dateien zeigen jetzt "✓ Downloaded" statt eines erneuten Download-Buttons.

@@ -247,12 +247,11 @@ private fun ConnectionBar(
                     OutlinedButton(onClick = onSyncNow, enabled = !state.listing && !state.syncing) {
                         Text(if (state.syncing) "Syncing…" else "Sync now")
                     }
-                    // STOP_LOG and Disconnect buttons removed (user request):
-                    // the current firmware auto-starts logging at boot and has
-                    // no START_LOG opcode, so STOP_LOG would silently kill
-                    // recording until a power-cycle. Disconnect isn't needed —
-                    // the link drops on its own when out of range / box reboots.
-                    // vm.stopLog()/vm.disconnect() plumbing is kept for now.
+                    // Disconnect is back so one person can sync, drop the
+                    // link, and hand the box to the next person to sync.
+                    // STOP_LOG stays removed: with the always-on firmware
+                    // it would silently kill recording until a power-cycle.
+                    OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
                 }
             }
         }
@@ -520,6 +519,10 @@ private fun FileRow(
     val progress = state.downloads[f.name]
     val savedPath = state.savedPaths[f.name]
     val deleteReason = deleteUnsupported(f.name)
+    // Fully downloaded = local mirror has at least the box's reported
+    // size. Then the Download button is replaced by a "✓ Downloaded"
+    // marker instead of inviting a redundant re-download.
+    val downloaded = f.size > 0L && (state.localBytes[f.name] ?: 0L) >= f.size
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         colors = CardDefaults.cardColors(
@@ -545,10 +548,19 @@ private fun FileRow(
                         )
                     }
                 }
-                OutlinedButton(
-                    onClick = { onDownload(f) },
-                    enabled = progress == null,
-                ) { Text(if (progress == null) "Download" else "…") }
+                if (downloaded && progress == null) {
+                    Text(
+                        "✓ Downloaded",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                } else {
+                    OutlinedButton(
+                        onClick = { onDownload(f) },
+                        enabled = progress == null,
+                    ) { Text(if (progress == null) "Download" else "…") }
+                }
                 Spacer(Modifier.width(4.dp))
                 OutlinedButton(
                     onClick = { onDelete(f) },

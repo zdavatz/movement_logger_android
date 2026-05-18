@@ -65,6 +65,12 @@ data class FileSyncUiState(
     val files: List<RemoteFile> = emptyList(),
     val downloads: Map<String, DownloadProgress> = emptyMap(),
     val savedPaths: Map<String, String> = emptyMap(),
+    /**
+     * Bytes already in the local mirror per file, refreshed on LIST and
+     * after each download. A file counts as fully downloaded (no more
+     * "Download" button) when its mirror size ≥ the box's reported size.
+     */
+    val localBytes: Map<String, Long> = emptyMap(),
     val listing: Boolean = false,
     /** "Sync now" in progress (LIST -> diff -> serial pull of new files). */
     val syncing: Boolean = false,

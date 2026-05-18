@@ -400,7 +400,14 @@ object FileSyncCore {
                 s.copy(files = s.files + RemoteFile(e.name, e.size))
             }
             BleEvent.ListDone -> {
-                _state.update { it.copy(listing = false) }
+                _state.update { s ->
+                    s.copy(
+                        listing = false,
+                        // Refresh per-file mirror sizes so the UI knows
+                        // which files are already fully downloaded.
+                        localBytes = s.files.associate { it.name to localSizeOf(it.name) },
+                    )
+                }
                 log("LIST done (${_state.value.files.size} files)")
                 if (syncPending) {
                     syncPending = false
@@ -421,6 +428,7 @@ object FileSyncCore {
                     s.copy(
                         downloads = s.downloads - e.name,
                         savedPaths = s.savedPaths + (e.name to path),
+                        localBytes = s.localBytes + (e.name to localSize),
                     )
                 }
                 log("saved ${e.name} → $path ($localSize B)")
@@ -507,6 +515,10 @@ object FileSyncCore {
         (appContext?.getExternalFilesDir(null) ?: appContext?.filesDir)!!
 
     private fun mirrorFile(name: String): File = File(mirrorDir(), name)
+
+    /** Local mirror size in bytes (0 if not downloaded yet). */
+    private fun localSizeOf(name: String): Long =
+        mirrorFile(name).let { if (it.exists()) it.length() else 0L }
 
     /** Current local mirror length, 0 if absent. */
     private fun mirrorLocalSize(name: String): Long {
