@@ -282,25 +282,30 @@ object FileSyncCore {
 
     fun startSession() {
         val dur = _state.value.sessionDurationSeconds
-        log("START_LOG $dur s — box rebooting to LOG mode")
+        // Current firmware does not reboot on START_LOG — it opens a
+        // session and auto-stops after `dur` s, the link stays up. Only
+        // meaningful in manual mode (in auto the box is already logging).
+        log("START_LOG $dur s")
         ble?.send(BleCmd.StartLog(dur))
-        ble?.send(BleCmd.Disconnect)
         _state.update {
             it.copy(
                 sessionRunning = SessionRunning(
                     startedAtMillis = System.currentTimeMillis(),
                     durationSeconds = dur,
                 ),
-                files = emptyList(),
-                downloads = emptyMap(),
-                listing = false,
             )
         }
     }
 
+    /** Persist the box log-mode and remember it locally. */
+    fun setLogMode(manual: Boolean) {
+        log("SET_MODE ${if (manual) "manual" else "auto"}")
+        ble?.send(BleCmd.SetLogMode(manual))
+    }
+
     fun clearSession() {
         if (_state.value.sessionRunning != null) {
-            log("LOG session deadline reached — box should be advertising again")
+            log("LOG session duration reached — box is idle again (manual mode)")
             _state.update { it.copy(sessionRunning = null) }
         }
     }
@@ -349,6 +354,10 @@ object FileSyncCore {
             BleEvent.Connected -> {
                 _state.update { it.copy(connection = Connection.Connected) }
                 log("connected")
+                // Ask the box which log-mode it's in so the UI toggle
+                // reflects reality. Legacy PumpTsueri ignores 0x07 (no
+                // reply) — the toggle just stays at its last/unknown state.
+                ble?.send(BleCmd.GetLogMode)
                 // Resume after an interrupted transfer (desktop v0.0.9):
                 // the aborted partial is already in the mirror, so a
                 // fresh sync pass skips every complete file and re-pulls
@@ -451,6 +460,10 @@ object FileSyncCore {
                            deleteError = null)
                 }
                 log("deleted ${e.name}")
+            }
+            is BleEvent.LogMode -> {
+                _state.update { it.copy(logModeManual = e.manual) }
+                log("box log mode: ${if (e.manual) "manual" else "auto"}")
             }
             is BleEvent.Sample -> onSample(e.sample)
         }

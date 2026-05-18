@@ -171,6 +171,8 @@ class BleClient(private val context: Context) {
             BleCmd.StopLog -> sendStopLog()
             is BleCmd.StartLog -> sendStartLog(cmd.durationSeconds)
             is BleCmd.Delete -> sendDelete(cmd.name)
+            is BleCmd.SetLogMode -> sendSetMode(cmd.manual)
+            BleCmd.GetLogMode -> sendGetMode()
         }
     }
 
@@ -260,6 +262,9 @@ class BleClient(private val context: Context) {
             }
             is CurrentOp.Listing -> emitErr("LIST aborted by disconnect")
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} aborted by disconnect")
+            is CurrentOp.ModeReq -> emitErr(
+                "${if (o.isSet) "SET_MODE" else "GET_MODE"} aborted by disconnect"
+            )
             CurrentOp.Idle -> Unit
         }
         op = CurrentOp.Idle
@@ -369,11 +374,36 @@ class BleClient(private val context: Context) {
             (durationSeconds ushr 24 and 0xFF).toByte(),
         )
         if (!writeCmdBytes(payload)) return
-        // Mirror the Rust client: write-w/o-response returns once bytes are
-        // queued, not when transmitted. If the caller queues a Disconnect
-        // right behind us, we'd tear down before the opcode hits the air.
+        // write-w/o-response returns once bytes are queued, not when
+        // transmitted — settle before any follow-up command.
         delay(500)
-        emit(BleEvent.Status("START_LOG sent (${durationSeconds}s) — box rebooting to LOG mode"))
+        // Current firmware does NOT reboot on START_LOG: it just opens a
+        // session and auto-stops after the duration. (Legacy PumpTsueri
+        // rebooted; we no longer rely on that.)
+        emit(BleEvent.Status("START_LOG sent (${durationSeconds}s)"))
+    }
+
+    private fun sendSetMode(manual: Boolean) {
+        if (op !is CurrentOp.Idle) {
+            emitErr("SET_MODE rejected — another op in flight")
+            return
+        }
+        val payload = byteArrayOf(
+            FileSyncProtocol.OP_SET_MODE,
+            if (manual) 1 else 0,
+        )
+        if (!writeCmdBytes(payload)) return
+        op = CurrentOp.ModeReq(isSet = true, manual = manual, lastProgress = now())
+        emit(BleEvent.Status("SET_MODE ${if (manual) "manual" else "auto"} sent"))
+    }
+
+    private fun sendGetMode() {
+        if (op !is CurrentOp.Idle) {
+            emitErr("GET_MODE rejected — another op in flight")
+            return
+        }
+        if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_GET_MODE))) return
+        op = CurrentOp.ModeReq(isSet = false, manual = false, lastProgress = now())
     }
 
     // -------------------------------------------------------------------------
@@ -590,6 +620,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Listing -> handleListNotify(current, value)
             is CurrentOp.Reading -> handleReadNotify(current, value)
             is CurrentOp.Deleting -> handleDeleteNotify(current, value)
+            is CurrentOp.ModeReq -> handleModeNotify(current, value)
         }
     }
 
@@ -720,6 +751,27 @@ class BleClient(private val context: Context) {
         op = CurrentOp.Idle
     }
 
+    private fun handleModeNotify(state: CurrentOp.ModeReq, value: ByteArray) {
+        if (value.isEmpty()) return  // shouldn't happen; tolerate
+        val b = value[0]
+        if (state.isSet) {
+            // Reply is a status byte. OK ⇒ the box is now in `manual`.
+            if (b == FileSyncProtocol.STATUS_OK) {
+                emit(BleEvent.LogMode(state.manual))
+                emit(BleEvent.Status(
+                    "log mode set to ${if (state.manual) "manual" else "auto"}"
+                ))
+            } else {
+                emitErr("SET_MODE: ${FileSyncProtocol.statusMessage(b)} " +
+                    "(0x${"%02X".format(b.toInt() and 0xFF)})")
+            }
+        } else {
+            // GET_MODE reply: 0 = auto, 1 = manual.
+            emit(BleEvent.LogMode(manual = b.toInt() != 0))
+        }
+        op = CurrentOp.Idle
+    }
+
     private fun parseListRow(line: String): Pair<String, Long>? {
         val comma = line.lastIndexOf(',')
         if (comma < 0) return null
@@ -808,6 +860,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Listing -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.Reading -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.Deleting -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
+            is CurrentOp.ModeReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             CurrentOp.Idle -> false
         }
         if (!stale) return
@@ -825,6 +878,9 @@ class BleClient(private val context: Context) {
                 stalledRead = true
             }
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} timed out — no notify for 20 s")
+            is CurrentOp.ModeReq -> emitErr(
+                "${if (o.isSet) "SET_MODE" else "GET_MODE"} timed out — no reply for 20 s"
+            )
             CurrentOp.Idle -> Unit
         }
         op = CurrentOp.Idle
@@ -919,6 +975,14 @@ class BleClient(private val context: Context) {
             var firstPacket: Boolean,
         ) : CurrentOp()
         data class Deleting(val name: String, var lastProgress: Long) : CurrentOp()
+        /** SET_MODE / GET_MODE: both get one FileData reply byte.
+         *  `isSet` true = SET (reply is a status byte; on OK the box is
+         *  now in `manual`), false = GET (reply is 0/1 = the mode). */
+        data class ModeReq(
+            val isSet: Boolean,
+            val manual: Boolean,
+            var lastProgress: Long,
+        ) : CurrentOp()
     }
 
     private sealed class RawEvent {

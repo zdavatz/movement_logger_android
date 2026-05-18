@@ -36,6 +36,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -156,6 +157,7 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                     onStopLog = vm::stopLog,
                     onSetDuration = vm::setSessionDuration,
                     onStartSession = vm::startSession,
+                    onSetLogMode = vm::setLogMode,
                 )
 
                 if (state.transferInterrupted && state.connection != Connection.Connected) {
@@ -201,6 +203,7 @@ private fun ConnectionBar(
     onStopLog: () -> Unit,
     onSetDuration: (Int) -> Unit,
     onStartSession: () -> Unit,
+    onSetLogMode: (Boolean) -> Unit,
 ) {
     Column {
         // FlowRow so the action buttons wrap onto the next line on narrow
@@ -261,13 +264,54 @@ private fun ConnectionBar(
                 )
             }
             Spacer(Modifier.height(8.dp))
-            SessionStarter(
-                durationSeconds = state.sessionDurationSeconds,
-                onDurationChange = onSetDuration,
-                onStart = onStartSession,
-            )
+            LogModeSelector(state.logModeManual, onSetLogMode)
+            if (state.logModeManual == true) {
+                Spacer(Modifier.height(8.dp))
+                SessionStarter(
+                    durationSeconds = state.sessionDurationSeconds,
+                    onDurationChange = onSetDuration,
+                    onStart = onStartSession,
+                )
+            }
         }
     }
+}
+
+/**
+ * Auto / Manual box log-mode. AUTO = the box opens a session on every
+ * cold boot (data-safe default). MANUAL = it boots idle and only
+ * records after Start session, for the chosen duration — the box can
+ * then be powered yet not recording, so it's opt-in. `manual == null`
+ * means not yet known (legacy firmware that ignores GET_MODE, or the
+ * reply hasn't arrived); neither chip is selected until the box answers.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LogModeSelector(manual: Boolean?, onSet: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Log mode", style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.width(8.dp))
+        FilterChip(
+            selected = manual == false,
+            onClick = { onSet(false) },
+            label = { Text("Auto") },
+        )
+        Spacer(Modifier.width(6.dp))
+        FilterChip(
+            selected = manual == true,
+            onClick = { onSet(true) },
+            label = { Text("Manual") },
+        )
+    }
+    Text(
+        when (manual) {
+            false -> "Box records automatically on power-on."
+            true -> "Box stays idle on power-on — start a session below."
+            null -> "Querying box… (legacy firmware can't report this)"
+        },
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable

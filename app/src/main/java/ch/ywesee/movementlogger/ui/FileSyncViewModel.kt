@@ -73,6 +73,12 @@ data class FileSyncUiState(
     val syncStatus: String? = null,
     /** "Keep synced" continuous-mirror toggle (desktop v0.0.14). */
     val keepSynced: Boolean = false,
+    /**
+     * Box log-mode: null = unknown (not yet queried / legacy firmware
+     * that ignores GET_MODE), false = auto (logs on boot), true =
+     * manual (idle until START_LOG).
+     */
+    val logModeManual: Boolean? = null,
     /** A transfer was cut by a link drop / stall; the partial is safe
      *  in the mirror. Drives the reconnect banner and the auto-resume
      *  on the next Connected (desktop v0.0.9). Persists across the
@@ -129,4 +135,5 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
     fun startSession() = FileSyncCore.startSession()
     fun clearSession() = FileSyncCore.clearSession()
     fun logFilePath(): String? = FileSyncCore.logFilePath()
+    fun setLogMode(manual: Boolean) = FileSyncCore.setLogMode(manual)
 }

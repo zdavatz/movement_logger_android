@@ -32,6 +32,10 @@ object FileSyncProtocol {
     const val OP_DELETE: Byte = 0x03
     const val OP_STOP_LOG: Byte = 0x04
     const val OP_START_LOG: Byte = 0x05
+    /** SET_MODE `<u8>`: 0 = auto, 1 = manual. Persisted on the box. */
+    const val OP_SET_MODE: Byte = 0x06
+    /** GET_MODE: box replies one byte 0 = auto, 1 = manual. */
+    const val OP_GET_MODE: Byte = 0x07
 
     // Status bytes returned in single-byte FileData notifies.
     const val STATUS_OK: Byte = 0x00
@@ -69,6 +73,10 @@ sealed class BleCmd {
     data object StopLog : BleCmd()
     data class StartLog(val durationSeconds: Int) : BleCmd()
     data class Delete(val name: String) : BleCmd()
+    /** Persist the box log-mode (false = auto, true = manual). */
+    data class SetLogMode(val manual: Boolean) : BleCmd()
+    /** Query the box's current log-mode; reply arrives as [BleEvent.LogMode]. */
+    data object GetLogMode : BleCmd()
 }
 
 sealed class BleEvent {
@@ -107,6 +115,12 @@ sealed class BleEvent {
             (31 * name.hashCode() + content.contentHashCode()) * 31 + base.hashCode()
     }
     data class DeleteDone(val name: String) : BleEvent()
+    /**
+     * The box's current log-mode, from a GET_MODE reply or a confirmed
+     * SET_MODE. `manual = false` → auto (logs on boot), `true` → manual
+     * (idle until START_LOG).
+     */
+    data class LogMode(val manual: Boolean) : BleEvent()
     data class Error(val msg: String) : BleEvent()
     /**
      * One decoded SensorStream snapshot (0.5 Hz). Only emitted while
