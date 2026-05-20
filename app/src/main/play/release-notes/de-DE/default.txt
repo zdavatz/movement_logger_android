@@ -1,1 +1,1 @@
-"Disconnect"-Button ist zurück: synchronisieren, Verbindung trennen, Box weitergeben — die nächste Person kann dann verbinden und ebenfalls syncen. Bereits vollständig heruntergeladene Dateien zeigen jetzt "✓ Downloaded" statt eines erneuten Download-Buttons.
+Hintergrund-Sync: Wenn die Box im AUTO-Modus ist und "Keep synced" an, mirrort die App jetzt alle ~15 Minuten neue Aufzeichnungen automatisch — auch wenn die App geschlossen oder das Telefon neu gestartet wurde. Pendant zum Desktop-Login-Agent.

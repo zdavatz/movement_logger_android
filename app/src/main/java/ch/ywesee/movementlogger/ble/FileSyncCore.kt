@@ -2,6 +2,8 @@ package ch.ywesee.movementlogger.ble
 
 import android.annotation.SuppressLint
 import android.content.Context
+import ch.ywesee.movementlogger.sync.AgentConfig
+import ch.ywesee.movementlogger.sync.BackgroundSync
 import ch.ywesee.movementlogger.ui.Connection
 import ch.ywesee.movementlogger.ui.DiscoveredDevice
 import ch.ywesee.movementlogger.ui.DownloadProgress
@@ -106,6 +108,12 @@ object FileSyncCore {
     fun connect(address: String) {
         _state.update { it.copy(connection = Connection.Connecting) }
         connectedBoxId = address
+        // Persist + (re-)arm the background sync now that we know which box
+        // is "ours". Matches desktop `SyncCore::persist_config` on Connect.
+        appContext?.let { ctx ->
+            AgentConfig.setBoxId(ctx, address)
+            BackgroundSync.refresh(ctx)
+        }
         log("connect $address")
         ble?.send(BleCmd.Connect(address))
     }
@@ -153,6 +161,13 @@ object FileSyncCore {
     fun setKeepSynced(on: Boolean) {
         _state.update { it.copy(keepSynced = on) }
         log("Keep synced ${if (on) "on" else "off"}")
+        // Persist + reconcile the background WorkManager schedule. Gating
+        // also depends on log mode + boxId — [BackgroundSync.refresh] reads
+        // [AgentConfig.active] for the actual cancel/enqueue decision.
+        appContext?.let { ctx ->
+            AgentConfig.setKeepSynced(ctx, on)
+            BackgroundSync.refresh(ctx)
+        }
         keepSyncedJob?.cancel()
         keepSyncedJob = null
         if (!on) return
@@ -471,6 +486,12 @@ object FileSyncCore {
             }
             is BleEvent.LogMode -> {
                 _state.update { it.copy(logModeManual = e.manual) }
+                // Mirror desktop's `autostart::sync_with_mode(manual)`:
+                // AUTO arms the schedule, MANUAL cancels it.
+                appContext?.let { ctx ->
+                    AgentConfig.setLogModeManual(ctx, e.manual)
+                    BackgroundSync.refresh(ctx)
+                }
                 log("box log mode: ${if (e.manual) "manual" else "auto"}")
             }
             is BleEvent.Sample -> onSample(e.sample)
