@@ -79,6 +79,24 @@ data class FileSyncUiState(
     val syncStatus: String? = null,
     /** "Keep synced" continuous-mirror toggle (desktop v0.0.14). */
     val keepSynced: Boolean = false,
+    /** Name of the file the *sync* pass is currently pulling, or null for
+     *  a manual download / idle. Drives the per-file row in the progress
+     *  card so the user sees which file is mid-READ. */
+    val syncInFlight: String? = null,
+    /** Total file count of the current sync pass (set at start, reset on
+     *  completion). Renders "Syncing X of N files". */
+    val syncPassTotal: Int = 0,
+    /** Files still queued for this pass, drained one-at-a-time. Used by
+     *  the progress card to render "N of M" as `total - queue - inFlight`. */
+    val syncQueueRemaining: Int = 0,
+    /** Sum of every queued file's box-reported size — constant across the
+     *  pass; the cumulative progress bar's denominator. */
+    val syncPassTotalBytes: Long = 0,
+    /** Bytes drained: sum of completed files' final on-disk sizes. The
+     *  in-flight file's contribution comes from `downloads[name].bytesDone`
+     *  via [syncCumulativeBytes] so the bar moves while the current READ
+     *  streams. */
+    val syncPassCompletedBytes: Long = 0,
     /**
      * Box log-mode: null = unknown (not yet queried / legacy firmware
      * that ignores GET_MODE), false = auto (logs on boot), true =
@@ -98,7 +116,17 @@ data class FileSyncUiState(
     val sessionDurationSeconds: Int = 1800,  // 30-min default, matches desktop
     val sessionRunning: SessionRunning? = null,
     val live: LiveState = LiveState(),
-)
+) {
+    /** Live cumulative bytes pulled in the current sync pass: completed
+     *  files' final sizes + the in-flight file's `bytesDone`. Use this
+     *  for the overall progress-bar numerator. */
+    val syncCumulativeBytes: Long
+        get() = syncPassCompletedBytes + (syncInFlight?.let { downloads[it]?.bytesDone } ?: 0L)
+    /** 0…1 overall progress of the in-flight sync pass. */
+    val syncCumulativeFraction: Float
+        get() = if (syncPassTotalBytes <= 0) 0f
+            else (syncCumulativeBytes.toFloat() / syncPassTotalBytes).coerceIn(0f, 1f)
+}
 
 /**
  * Thin wrapper over [FileSyncCore]. The core owns the BleClient + state so

@@ -241,10 +241,17 @@ private fun ConnectionBar(
                     }
                 }
                 Connection.Connected -> {
-                    Button(onClick = onList, enabled = !state.listing) {
+                    // Disable while ANY worker op is in flight — a big
+                    // keep-synced READ holds the BLE worker busy for
+                    // minutes, and tap-while-busy used to collide with
+                    // the "another op is in flight" rejection and leave
+                    // the UI confused (port of iOS Sync UX fix).
+                    val workerBusy = state.listing || state.syncing ||
+                            state.downloads.isNotEmpty()
+                    Button(onClick = onList, enabled = !workerBusy) {
                         Text(if (state.listing) "Listing…" else "List files")
                     }
-                    OutlinedButton(onClick = onSyncNow, enabled = !state.listing && !state.syncing) {
+                    OutlinedButton(onClick = onSyncNow, enabled = !workerBusy) {
                         Text(if (state.syncing) "Syncing…" else "Sync now")
                     }
                     // Disconnect is back so one person can sync, drop the
@@ -274,6 +281,14 @@ private fun ConnectionBar(
                             else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            // Cumulative byte-progress card so the user can tell that
+            // keep-synced IS pulling files even while the file list above
+            // is empty (deliberately blanked during sync). Per-file row
+            // underneath shows the in-flight READ.
+            if (state.syncing) {
+                Spacer(Modifier.height(8.dp))
+                SyncProgressRow(state)
+            }
             Spacer(Modifier.height(8.dp))
             LogModeSelector(state.logModeManual, onSetLogMode)
             if (state.logModeManual == true) {
@@ -282,6 +297,95 @@ private fun ConnectionBar(
                     durationSeconds = state.sessionDurationSeconds,
                     onDurationChange = onSetDuration,
                     onStart = onStartSession,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * In-flight sync-pass progress card.
+ *
+ * Two layers of progress, headline first:
+ *   - Overall byte-progress bar (`bytesDone / bytesTotal`) — the
+ *     denominator includes every file's full size, the numerator is
+ *     completed files + the in-flight file's `bytesDone`. So the bar
+ *     tracks data actually pulled, not file-count.
+ *   - Current file row underneath: name + per-file byte progress bar.
+ *     Disappears between files (brief idle gap between two queued READs).
+ */
+@Composable
+private fun SyncProgressRow(state: FileSyncUiState) {
+    val total = state.syncPassTotal
+    val inFlight = state.syncInFlight
+    // Same formula as the iOS card: total - queueRemaining - (inFlight?1:0)
+    // is the number of fully-completed files; +1 while one is mid-READ
+    // gives the running "current of N" position. Simplifies to
+    // `total - queueRemaining`.
+    val completed = (total - state.syncQueueRemaining).coerceIn(0, total)
+    androidx.compose.material3.Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        if (total > 0) "Syncing — $completed of $total files"
+                        else "Syncing…",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                    )
+                    Text(
+                        "${humanBytes(state.syncCumulativeBytes)} / " +
+                            humanBytes(state.syncPassTotalBytes),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text(
+                    "${(state.syncCumulativeFraction * 100).toInt()}%",
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        fontFamily = FontFamily.Monospace,
+                    ),
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            LinearProgressIndicator(
+                progress = { state.syncCumulativeFraction },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            val perFile = inFlight?.let { state.downloads[it] }
+            if (inFlight != null && perFile != null) {
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider()
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        inFlight,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "${humanBytes(perFile.bytesDone)} / ${humanBytes(perFile.total)}",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                        ),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                LinearProgressIndicator(
+                    progress = { perFile.fraction },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
@@ -520,9 +624,10 @@ private fun FileRow(
     val savedPath = state.savedPaths[f.name]
     val deleteReason = deleteUnsupported(f.name)
     // Fully downloaded = local mirror has at least the box's reported
-    // size. Then the Download button is replaced by a "✓ Downloaded"
-    // marker instead of inviting a redundant re-download.
+    // size. Then the Download button is replaced by a "View" button
+    // that opens the file in an inline preview (iOS parity, a86fd6d).
     val downloaded = f.size > 0L && (state.localBytes[f.name] ?: 0L) >= f.size
+    var viewing by remember { mutableStateOf(false) }
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         colors = CardDefaults.cardColors(
@@ -549,12 +654,10 @@ private fun FileRow(
                     }
                 }
                 if (downloaded && progress == null) {
-                    Text(
-                        "✓ Downloaded",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
+                    // Opens an inline preview sheet with a Share button —
+                    // same pattern as the global Log viewer, now per-file
+                    // (iOS parity, a86fd6d).
+                    OutlinedButton(onClick = { viewing = true }) { Text("View") }
                 } else {
                     OutlinedButton(
                         onClick = { onDownload(f) },
@@ -587,6 +690,13 @@ private fun FileRow(
                 )
             }
         }
+    }
+    if (viewing) {
+        DownloadedFileViewer(
+            name = f.name,
+            path = savedPath,
+            onDismiss = { viewing = false },
+        )
     }
 }
 
@@ -781,6 +891,169 @@ private fun shareLogFile(context: android.content.Context, path: String?) {
     }
     context.startActivity(
         Intent.createChooser(send, "Share log")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+    )
+}
+
+/**
+ * Per-file viewer for a downloaded recording. Reads up to
+ * [PREVIEW_CAP_BYTES] of the file on `Dispatchers.IO`, decodes as UTF-8
+ * if there are no embedded NULs (so CSV/log files preview inline) and
+ * falls back to a size summary for binary files (WAV/MOV). A Share
+ * button always exports the *full* file via the FileProvider — the
+ * 48 KB cap is only for the inline `Text` (Compose lays out the whole
+ * string at once and stutters past ~50 KB of monospaced content, so a
+ * 2 MB CSV would freeze the dialog for seconds). iOS parity (a86fd6d).
+ */
+@Composable
+private fun DownloadedFileViewer(
+    name: String,
+    path: String?,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var loading by remember(path) { mutableStateOf(true) }
+    var fileSize by remember(path) { mutableStateOf(0L) }
+    var isText by remember(path) { mutableStateOf(false) }
+    var truncated by remember(path) { mutableStateOf(false) }
+    var preview by remember(path) { mutableStateOf("") }
+
+    LaunchedEffect(path) {
+        if (path == null) { loading = false; return@LaunchedEffect }
+        val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                val f = java.io.File(path)
+                val size = f.length()
+                val cap = PREVIEW_CAP_BYTES
+                val toRead = minOf(size, cap.toLong()).toInt()
+                val buf = ByteArray(toRead)
+                f.inputStream().use { ins ->
+                    var off = 0
+                    while (off < toRead) {
+                        val n = ins.read(buf, off, toRead - off)
+                        if (n <= 0) break
+                        off += n
+                    }
+                }
+                val hasNul = buf.any { it == 0.toByte() }
+                val text = if (hasNul) null else runCatching {
+                    buf.toString(Charsets.UTF_8)
+                }.getOrNull()
+                Quad(size, text != null, size > cap, text ?: "")
+            }.getOrElse { Quad(0L, false, false, "") }
+        }
+        fileSize = result.a
+        isText = result.b
+        truncated = result.c
+        preview = result.d
+        loading = false
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        name,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = { shareDownloadedFile(context, name, path) },
+                        enabled = path != null,
+                    ) { Text("Share") }
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+                HorizontalDivider()
+                Box(modifier = Modifier.fillMaxSize()) {
+                    when {
+                        loading -> Row(
+                            modifier = Modifier.fillMaxWidth().padding(32.dp),
+                            horizontalArrangement = Arrangement.Center,
+                        ) {
+                            CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                        }
+                        path == null -> Text(
+                            "(file not on disk)",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(12.dp),
+                        )
+                        !isText -> Text(
+                            "(binary file — ${humanBytes(fileSize)}. " +
+                                "Use Share to export the full file.)",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(12.dp),
+                        )
+                        else -> Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                                .padding(12.dp),
+                        ) {
+                            if (truncated) {
+                                Text(
+                                    "Showing first ${humanBytes(PREVIEW_CAP_BYTES.toLong())} " +
+                                        "of ${humanBytes(fileSize)} — use Share for the " +
+                                        "full file.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(Modifier.height(8.dp))
+                            }
+                            Text(
+                                preview.ifEmpty { "(empty file)" },
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private data class Quad<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
+
+/** SwiftUI/Compose `Text` lays out the whole string at once and gets
+ *  noticeably laggy past ~50 KB of monospaced content; a 2 MB CSV
+ *  would stutter for seconds. The Share button handles "I want the
+ *  whole thing" cleanly. */
+private const val PREVIEW_CAP_BYTES: Int = 48 * 1024
+
+private fun shareDownloadedFile(
+    context: android.content.Context,
+    name: String,
+    path: String?,
+) {
+    if (path == null) return
+    val file = java.io.File(path)
+    if (!file.exists()) return
+    val uri = androidx.core.content.FileProvider.getUriForFile(
+        context, "${context.packageName}.fileprovider", file,
+    )
+    val mime = when (name.substringAfterLast('.', "").lowercase()) {
+        "csv", "log", "txt" -> "text/plain"
+        "wav" -> "audio/wav"
+        "mp4", "mov", "m4v" -> "video/mp4"
+        else -> "application/octet-stream"
+    }
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = mime
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(
+        Intent.createChooser(send, "Share $name")
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
     )
 }

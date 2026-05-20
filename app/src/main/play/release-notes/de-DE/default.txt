@@ -1,1 +1,1 @@
-Hintergrund-Sync: Wenn die Box im AUTO-Modus ist und "Keep synced" an, mirrort die App jetzt alle ~15 Minuten neue Aufzeichnungen automatisch — auch wenn die App geschlossen oder das Telefon neu gestartet wurde. Pendant zum Desktop-Login-Agent.
+Sync-Fortschrittsanzeige (kumulativ: X / Y MB, N von M Dateien) während "Sync now" und Keep-Synced. View-Button auf heruntergeladenen Dateien: Inhalt direkt in der App ansehen + Teilen. Stabilere Auto-Verbindung beim Sperrbildschirm und im Keep-Synced-Modus.

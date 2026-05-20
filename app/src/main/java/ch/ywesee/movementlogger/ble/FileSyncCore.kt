@@ -69,9 +69,15 @@ object FileSyncCore {
     /** Files this sync still has to pull, oldest-first; drained serially
      *  because the BLE worker is single-op (one READ at a time). */
     private val syncQueue = ArrayDeque<RemoteFile>()
-    /** Name of the file the *sync* is currently pulling (null for a manual
-     *  download), so [BleEvent.ReadDone] knows whether to advance. */
-    private var syncInFlight: String? = null
+    /**
+     * Name of the file the *sync* is currently pulling (null for a manual
+     * download). Mirrored into [FileSyncUiState.syncInFlight] so the
+     * progress card can show the in-flight file's per-file row; also
+     * consulted in [BleEvent.ReadDone] to advance the queue.
+     */
+    private var syncInFlight: String?
+        get() = _state.value.syncInFlight
+        set(value) { _state.update { it.copy(syncInFlight = value) } }
     /** "Keep synced" 30 s poll loop (desktop v0.0.14). The pass only
      *  fetches each file's new tail; survives disconnect (its tick
      *  guards on Connected so it resumes after a reconnect). */
@@ -175,9 +181,18 @@ object FileSyncCore {
             while (true) {
                 kotlinx.coroutines.delay(SYNC_POLL_INTERVAL_MS)
                 val s = _state.value
+                // `transferInterrupted` is true between a mid-READ drop
+                // and the auto-reconnect succeeding. During that window
+                // [BleClient.armReconnect] has silently torn the link
+                // down (emitEvent=false), so the UI still sees
+                // `Connected` but `cmdChar` is nil — any LIST/READ here
+                // would fail with "FileCmd characteristic missing".
+                // Skip until reconnect clears the flag; the Connected
+                // handler re-runs `startSyncPass` with reason "Resume"
+                // when the link returns, so nothing is lost.
                 if (s.keepSynced && s.connection == Connection.Connected &&
                     !s.listing && !s.syncing && s.downloads.isEmpty() &&
-                    syncInFlight == null
+                    syncInFlight == null && !s.transferInterrupted
                 ) {
                     startSyncPass("Keep synced")
                 }
@@ -199,10 +214,18 @@ object FileSyncCore {
         }
         syncPending = true
         syncQueue.clear()
-        syncInFlight = null
         _state.update {
-            it.copy(syncing = true, listing = true, files = emptyList(),
-                    syncStatus = "Sync: listing SD card…")
+            it.copy(
+                syncing = true, listing = true, files = emptyList(),
+                syncStatus = "Sync: listing SD card…",
+                syncInFlight = null,
+                // The pass totals are filled in once LIST resolves and
+                // the diff knows what to fetch — bar is empty until then.
+                syncPassTotal = 0,
+                syncQueueRemaining = 0,
+                syncPassTotalBytes = 0,
+                syncPassCompletedBytes = 0,
+            )
         }
         log("$reason — LIST")
         ble?.send(BleCmd.List)
@@ -242,16 +265,35 @@ object FileSyncCore {
         }
         if (fetch.isEmpty()) {
             _state.update {
-                it.copy(syncing = false,
-                        syncStatus = "Sync: up to date ($upToDate files)")
+                it.copy(
+                    syncing = false,
+                    syncStatus = "Sync: up to date ($upToDate files)",
+                    syncPassTotal = 0,
+                    syncQueueRemaining = 0,
+                    syncPassTotalBytes = 0,
+                    syncPassCompletedBytes = 0,
+                )
             }
             log("Sync: up to date — $upToDate files")
             return
         }
         syncQueue.clear()
         syncQueue.addAll(fetch)
+        val totalBytes = fetch.sumOf { it.size }
         _state.update {
-            it.copy(syncStatus = "Sync: fetching ${fetch.size} ($upToDate up to date)…")
+            it.copy(
+                syncStatus = "Sync: fetching ${fetch.size} ($upToDate up to date)…",
+                syncPassTotal = fetch.size,
+                syncQueueRemaining = fetch.size,
+                syncPassTotalBytes = totalBytes,
+                // Accounting: `syncPassCompletedBytes` only counts files
+                // whose READ has fully completed in THIS pass. The in-
+                // flight file's contribution comes from
+                // `downloads[name].bytesDone` (which starts at the
+                // mirror baseline = resume offset, so already-on-disk
+                // bytes count as soon as the file becomes in-flight).
+                syncPassCompletedBytes = 0,
+            )
         }
         log("Sync: fetching ${fetch.size}, $upToDate up to date")
         pumpSyncQueue()
@@ -266,11 +308,21 @@ object FileSyncCore {
         val next = syncQueue.removeFirstOrNull()
         if (next == null) {
             if (_state.value.syncing) {
-                _state.update { it.copy(syncing = false, syncStatus = "Sync: complete") }
+                _state.update {
+                    it.copy(
+                        syncing = false,
+                        syncStatus = "Sync: complete",
+                        syncPassTotal = 0,
+                        syncQueueRemaining = 0,
+                        syncPassTotalBytes = 0,
+                        syncPassCompletedBytes = 0,
+                    )
+                }
                 log("Sync: complete")
             }
             return
         }
+        _state.update { it.copy(syncQueueRemaining = syncQueue.size) }
         syncInFlight = next.name
         download(next)
     }
@@ -339,22 +391,52 @@ object FileSyncCore {
                 if (e.msg.startsWith("DELETE ")) {
                     _state.update { it.copy(deleteError = e.msg) }
                 }
-                // A BLE error mid-sync would otherwise strand the queue
-                // (syncInFlight never clears). Abort cleanly so the next
-                // "Sync now" starts fresh; the size key means a partial
-                // file is just re-pulled next time (desktop-equivalent).
-                if (_state.value.syncing) {
+                // "another op is in flight" means the BLE worker rejected
+                // the command BEFORE dispatching — the in-flight op (a
+                // keep-synced READ or LIST) is still going. Clear the
+                // optimistic UI flags but DON'T treat this as a real
+                // sync abort below: the in-flight op will complete
+                // normally and the next keep-synced tick re-evaluates.
+                val isCollision = e.msg.startsWith("another op is in flight")
+                if (isCollision) {
+                    _state.update { it.copy(listing = false) }
+                    // If a sync was JUST starting (queue not built yet,
+                    // no in-flight READ) and its LIST got rejected,
+                    // reset so the next tick retries. Common path on
+                    // Connected: GetLogMode races with startSyncPass.
+                    val st = _state.value
+                    if (st.syncing && syncQueue.isEmpty() && st.syncInFlight == null) {
+                        syncPending = false
+                        _state.update {
+                            it.copy(
+                                syncing = false,
+                                syncStatus = "Sync: deferred (box busy) — retrying",
+                            )
+                        }
+                    }
+                }
+                // A *real* BLE error mid-sync would otherwise strand the
+                // queue (syncInFlight never clears). Abort cleanly so the
+                // next "Sync now" starts fresh; the size key means a
+                // partial file is just re-pulled next time.
+                if (!isCollision && _state.value.syncing) {
                     syncPending = false
                     syncQueue.clear()
-                    syncInFlight = null
                     // A resumable interruption (ReadAborted already
                     // fired) keeps its own resume message + banner —
                     // don't stomp it with "try again".
                     val resumable = _state.value.transferInterrupted
                     _state.update {
-                        it.copy(syncing = false,
-                                syncStatus = if (resumable) it.syncStatus
-                                    else "Sync aborted (BLE error) — try again")
+                        it.copy(
+                            syncing = false,
+                            syncInFlight = null,
+                            syncPassTotal = 0,
+                            syncQueueRemaining = 0,
+                            syncPassTotalBytes = 0,
+                            syncPassCompletedBytes = 0,
+                            syncStatus = if (resumable) it.syncStatus
+                                else "Sync aborted (BLE error) — try again",
+                        )
                     }
                 }
             }
@@ -379,11 +461,22 @@ object FileSyncCore {
                 // only the unfinished one from its mirror offset. Also
                 // resume if "Keep synced" is on. A plain first connect
                 // does neither.
+                //
+                // Defer the kick by 500 ms so the in-flight GetLogMode
+                // `ModeReq` finishes first — otherwise the LIST inside
+                // startSyncPass collides with it and is rejected as
+                // "another op is in flight". (iOS v0.0.x equivalent.)
                 val st = _state.value
                 if (st.transferInterrupted || st.keepSynced) {
                     val why = if (st.transferInterrupted) "Resume" else "Keep synced"
                     _state.update { it.copy(transferInterrupted = false) }
-                    startSyncPass(why)
+                    scope.launch {
+                        kotlinx.coroutines.delay(500)
+                        val now = _state.value
+                        if (now.connection == Connection.Connected && !now.syncing) {
+                            startSyncPass(why)
+                        }
+                    }
                 }
             }
             BleEvent.Disconnected -> {
@@ -393,7 +486,6 @@ object FileSyncCore {
                 connectedBoxId = null
                 syncPending = false
                 syncQueue.clear()
-                syncInFlight = null
                 // Keep the "Keep synced" toggle + poll job alive across a
                 // disconnect — its tick guards on Connected, so it simply
                 // resumes after a reconnect (sets up Stage 3 auto-resume).
@@ -403,6 +495,11 @@ object FileSyncCore {
                         files = emptyList(),
                         listing = false,
                         syncing = false,
+                        syncInFlight = null,
+                        syncPassTotal = 0,
+                        syncQueueRemaining = 0,
+                        syncPassTotalBytes = 0,
+                        syncPassCompletedBytes = 0,
                         downloads = emptyMap(),
                         live = LiveState(),
                         deleteError = null,
@@ -454,7 +551,15 @@ object FileSyncCore {
                     syncDb?.markSynced(box, e.name, localSize, path)
                 }
                 if (syncInFlight == e.name) {
-                    syncInFlight = null
+                    // Fold this file's final size into the cumulative-
+                    // byte counter so the overall progress bar snaps
+                    // forward as each file completes, then advance.
+                    _state.update {
+                        it.copy(
+                            syncInFlight = null,
+                            syncPassCompletedBytes = it.syncPassCompletedBytes + localSize,
+                        )
+                    }
                     pumpSyncQueue()
                 }
             }

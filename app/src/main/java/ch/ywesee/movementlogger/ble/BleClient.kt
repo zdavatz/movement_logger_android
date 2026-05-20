@@ -798,7 +798,11 @@ class BleClient(private val context: Context) {
         disconnectInner(emitEvent = false)
         reconnect = ReconnectState(addr, 1, ReconnectState.Phase.WAITING,
             now() + RECONNECT_WAIT_MS)
-        emit(BleEvent.Status("link lost — auto-reconnecting (attempt 1/$RECONNECT_ATTEMPTS)…"))
+        val msg = if (keepSyncedActive())
+            "link lost — auto-reconnecting (attempt 1, keep-synced)…"
+        else
+            "link lost — auto-reconnecting (attempt 1/$RECONNECT_ATTEMPTS)…"
+        emit(BleEvent.Status(msg))
     }
 
     /** One step of the reconnect state machine, from the 200 ms tick.
@@ -832,7 +836,12 @@ class BleClient(private val context: Context) {
 
     private fun failReconnectAttempt(rc: ReconnectState, n: Long) {
         rc.attempt++
-        if (rc.attempt > RECONNECT_ATTEMPTS) {
+        // Bounded only when Keep-synced is OFF. With Keep-synced on the
+        // user has opted into "mirror whenever possible" so we never
+        // surrender — same regime as desktop's Auto Mode (v0.0.19). The
+        // bounded budget still applies to a one-shot manual sync.
+        val keepSynced = keepSyncedActive()
+        if (!keepSynced && rc.attempt > RECONNECT_ATTEMPTS) {
             reconnect = null
             emit(BleEvent.Status("auto-reconnect exhausted — reconnect manually"))
             emit(BleEvent.Disconnected)
@@ -840,7 +849,22 @@ class BleClient(private val context: Context) {
         }
         rc.phase = ReconnectState.Phase.WAITING
         rc.nextAtMs = n + RECONNECT_WAIT_MS
-        emit(BleEvent.Status("auto-reconnecting (attempt ${rc.attempt}/$RECONNECT_ATTEMPTS)…"))
+        if (keepSynced) {
+            emit(BleEvent.Status("auto-reconnecting (attempt ${rc.attempt}, keep-synced)…"))
+        } else {
+            emit(BleEvent.Status("auto-reconnecting (attempt ${rc.attempt}/$RECONNECT_ATTEMPTS)…"))
+        }
+    }
+
+    /**
+     * `true` when the user has opted into Keep-synced **and** the box
+     * isn't in MANUAL log mode. Mirrors iOS `keepSyncedActive`. Read
+     * from [failReconnectAttempt] so a mid-loop toggle of the switch is
+     * honoured on the next failed attempt.
+     */
+    private fun keepSyncedActive(): Boolean {
+        val cfg = ch.ywesee.movementlogger.sync.AgentConfig.load(context)
+        return cfg.keepSynced && cfg.logModeManual != true
     }
 
     private suspend fun tickWatchdog() {
@@ -1004,10 +1028,28 @@ class BleClient(private val context: Context) {
         private const val WATCHDOG_TICK_MS = 200L
         private const val OP_IDLE_TIMEOUT_MS = 20_000L
         private const val LIST_INACTIVITY_DONE_MS = 500L
-        // Bounded auto-reconnect (desktop RECONNECT_ATTEMPTS / INTERVAL).
-        private const val RECONNECT_ATTEMPTS = 10
+        // Auto-reconnect tunables.
+        //
+        // Two regimes (mirrors desktop v0.0.19 / iOS): **bounded** when
+        // Keep-synced is OFF — manual sync, give up after
+        // [RECONNECT_ATTEMPTS] so we don't ratchet forever. **Unbounded**
+        // when Keep-synced is ON — the user explicitly opted into
+        // "mirror whenever possible" and the box's firmware self-heals
+        // across 20+ recovery cycles. Decided in [failReconnectAttempt]
+        // via [keepSyncedActive].
+        //
+        // [RECONNECT_CONNECT_MS] is 60 s on purpose: Android holds the
+        // pending `connectGatt(autoConnect=false)` even while the worker
+        // coroutine is descheduled (doze, lock screen) and only invokes
+        // `onConnectionStateChange` when the peripheral re-advertises.
+        // The previous 10 s budget false-timed-out every wake — the
+        // worker's watchdog `delay()` freezes while suspended but
+        // `SystemClock.uptimeMillis()` keeps ticking, so by resume the
+        // "deadline" had elapsed and we cancelled a perfectly good
+        // pending connect.
+        private const val RECONNECT_ATTEMPTS = 30
         private const val RECONNECT_WAIT_MS = 2_000L
-        private const val RECONNECT_CONNECT_MS = 10_000L
+        private const val RECONNECT_CONNECT_MS = 60_000L
         private const val PROGRESS_CHUNK_BYTES = 4L * 1024
         private const val MAX_BUFFER_HINT = 16 * 1024 * 1024
         /**
