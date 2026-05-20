@@ -63,6 +63,15 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
+        <!-- WorkManager's internal SystemForegroundService is what carries
+             SyncWorker's setForeground(...) notification. Lint flags
+             SyncWorker.kt's FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE unless
+             the type is also declared on this merged service entry. -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="connectedDevice"
+            tools:node="merge" />
+
         <!-- BOOT_COMPLETED → BackgroundSync.refresh(context). Re-arms the
              WorkManager periodic job after a reboot (the schedule survives
              app process death but not a device reboot). -->
