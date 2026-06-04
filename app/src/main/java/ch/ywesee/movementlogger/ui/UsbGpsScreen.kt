@@ -11,6 +11,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -24,6 +28,9 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -34,6 +41,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ch.ywesee.movementlogger.usb.UbloxGpsCore
+import kotlinx.coroutines.delay
+import java.io.File
 import java.util.Locale
 
 /**
@@ -199,6 +208,17 @@ private fun FixCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
 
 @Composable
 private fun LogCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
+    val context = LocalContext.current
+    // "Copy" → "Copied" / "Copy failed" → "Copy" feedback loop. Mirrors the
+    // iOS `copyButtonLabel` state in `GpsScreen.swift`. Driven by a
+    // LaunchedEffect that resets the label 1.5 s after a tap.
+    var copyLabel by remember { mutableStateOf("Copy") }
+    LaunchedEffect(copyLabel) {
+        if (copyLabel != "Copy") {
+            delay(1500)
+            copyLabel = "Copy"
+        }
+    }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("CSV log", fontWeight = FontWeight.SemiBold)
@@ -207,6 +227,14 @@ private fun LogCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
                     Button(onClick = { UbloxGpsCore.startLogging() }) { Text("Start recording") }
                 } else {
                     Button(onClick = { UbloxGpsCore.stopLogging() }) { Text("Stop recording") }
+                }
+                // Share + Copy work mid-recording too — the file's already
+                // on disk and write-flushed on every CSV row.
+                state.logPath?.let { path ->
+                    OutlinedButton(onClick = { shareGpsCsv(context, path) }) { Text("Share") }
+                    OutlinedButton(onClick = {
+                        copyLabel = copyGpsCsvToClipboard(context, path)
+                    }) { Text(copyLabel) }
                 }
             }
             if (state.isLogging) {
@@ -258,5 +286,47 @@ private fun ReadoutRow(label: String, a: String, b: String, c: String) {
         Text(a, modifier = Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 13.sp)
         Text(b, modifier = Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 13.sp)
         Text(c, modifier = Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+    }
+}
+
+/**
+ * Fires the system share sheet for the active/most-recent GPS CSV. Same
+ * MIME + FileProvider pattern as [shareDownloadedFile] in
+ * [FileSyncScreen] — CSVs are `text/plain`. Safe to call mid-recording:
+ * the file already exists on disk and gets flushed per row.
+ */
+private fun shareGpsCsv(context: Context, path: String) {
+    val file = File(path)
+    if (!file.exists()) return
+    val uri = androidx.core.content.FileProvider.getUriForFile(
+        context, "${context.packageName}.fileprovider", file,
+    )
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(
+        Intent.createChooser(send, "Share ${file.name}")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+    )
+}
+
+/**
+ * Copies the CSV contents to the system clipboard. Returns the next
+ * label the button should display ("Copied" on success, "Copy failed"
+ * on IO error) — the caller's [LaunchedEffect] reverts to "Copy" after
+ * 1.5 s.
+ */
+private fun copyGpsCsvToClipboard(context: Context, path: String): String {
+    val file = File(path)
+    if (!file.exists()) return "Copy failed"
+    return try {
+        val text = file.readText(Charsets.UTF_8)
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText(file.name, text))
+        "Copied"
+    } catch (_: Exception) {
+        "Copy failed"
     }
 }
