@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    USB device filter for the u-blox GNSS receiver. Decimal values per
+    Android docs (UsbManager treats <usb-device> attributes as base-10).
+
+    vendor-id  5446  → 0x1546 (u-blox AG - www.u-blox.com)
+    product-id 424   → 0x01a8 (u-blox GNSS receiver, CDC-ACM serial)
+-->
+<resources>
+    <usb-device vendor-id="5446" product-id="424" />
+</resources>

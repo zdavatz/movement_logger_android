@@ -3,6 +3,7 @@ package ch.ywesee.movementlogger.ui
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material3.Icon
@@ -22,12 +23,14 @@ import androidx.navigation.compose.rememberNavController
 
 private sealed class Dest(val route: String, val label: String, val icon: ImageVector) {
     data object Live : Dest("live", "Live", Icons.Filled.Sensors)
+    data object Gps : Dest("gps", "GPS", Icons.Filled.LocationOn)
     data object Sync : Dest("sync", "Sync", Icons.Filled.CloudDownload)
     data object Replay : Dest("replay", "Replay", Icons.Filled.PlayCircle)
 }
 
-/** Matches the desktop tab order (Live → Sync → Replay) introduced in v0.0.3. */
-private val destinations = listOf(Dest.Live, Dest.Sync, Dest.Replay)
+/** Live → GPS → Sync → Replay. GPS sits next to Live because both are
+ *  realtime-display tabs (BLE SensorStream vs USB GNSS). */
+private val destinations = listOf(Dest.Live, Dest.Gps, Dest.Sync, Dest.Replay)
 
 @Composable
 fun MainNav() {
@@ -71,6 +74,7 @@ fun MainNav() {
                     }
                 })
             }
+            composable(Dest.Gps.route) { UsbGpsScreen() }
             composable(Dest.Sync.route) { FileSyncScreen() }
             composable(Dest.Replay.route) { ReplayScreen() }
         }

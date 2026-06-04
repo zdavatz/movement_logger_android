@@ -106,6 +106,7 @@ dependencies {
     implementation(libs.androidx.media3.effect)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.usb.serial)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
 

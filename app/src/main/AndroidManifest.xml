@@ -36,6 +36,11 @@
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
+    <!-- USB host mode for the u-blox GNSS receiver plugged into the phone's
+         USB-C port (CDC-ACM serial; VID 0x1546 / PID 0x01a8). Not required:
+         the app still does BLE-only sync if no USB-OTG-capable port exists. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -56,6 +61,17 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Auto-launch the app when the u-blox GNSS receiver is plugged
+                 in (matches @xml/usb_device_filter on VID/PID). User can
+                 tick "Use by default" in the system prompt so future plugs
+                 land straight in the GPS tab. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
         </activity>
 
         <service
