@@ -1,1 +1,1 @@
-GPS-Tab: Teilen- und Kopieren-Buttons für die CSV-Aufzeichnung. Funktionieren auch während der Aufnahme — CSV per System-Share an Mail/Drive/Messenger senden oder als Text in die Zwischenablage kopieren. Mirror der gleichen Buttons in der iOS-App.
+GPS-Tab: externer u-blox-Empfänger läuft jetzt mit 10 Hz statt 5 Hz. Beim Verbinden wird per UBX-CFG-RATE die Messrate auf 100 ms gesetzt — gleiche Cadence wie die SensorTile.box und sauberer 10:1-Faktor zum 100 Hz IMU. Damit sind auch Pump-Frequenzen ~1–2 Hz sauber über Nyquist abgetastet.
