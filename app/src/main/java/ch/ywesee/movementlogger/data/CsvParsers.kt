@@ -12,7 +12,10 @@ import java.io.InputStreamReader
  * Three file kinds the firmware writes per logging session:
  *
  * - `Sens*.csv`  ~100 Hz IMU + baro samples (12 columns)
- * - `Gps*.csv`   ~1 Hz GPS fixes (10 columns)
+ * - `Gps*.csv`   ~10 Hz GPS fixes (10 columns) — firmware ≥ Apr 2026.
+ *                Older sessions logged at ~1 Hz; parsers handle both
+ *                cadences transparently (Replay/export use whatever
+ *                density the file has).
  * - `Bat*.csv`   battery voltage / SOC / current (4 columns)
  *
  * All three start with a `Time [10ms]` column — ThreadX ticks where one

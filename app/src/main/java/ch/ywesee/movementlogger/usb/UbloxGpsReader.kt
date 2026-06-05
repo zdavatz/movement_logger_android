@@ -24,10 +24,13 @@ import kotlinx.coroutines.launch
  * test the NMEA path without an Android USB device.
  *
  * Wire format: u-blox emits ASCII NMEA sentences terminated by CR LF on
- * the CDC-ACM bulk-in pipe. Default rate is 1 Hz (`UBX-CFG-RATE` can
- * push it higher; we don't reconfigure here). The reader buffers bytes
- * into lines on `\n`, validates the `*HH` checksum, and routes RMC/GGA
- * to the sink in arrival order.
+ * the CDC-ACM bulk-in pipe. Default factory rate is 1 Hz; we send a
+ * `UBX-CFG-RATE` command at [start] to push the receiver to 10 Hz so
+ * the live signal matches the SensorTile.box GPS log cadence (1:10
+ * ratio against the 100 Hz IMU/quaternion grid — clean integer factor
+ * for replay interpolation and above the ~4 Hz Nyquist floor for pump
+ * detection). The reader buffers bytes into lines on `\n`, validates
+ * the `*HH` checksum, and routes RMC/GGA to the sink in arrival order.
  */
 class UbloxGpsReader(
     private val usbManager: UsbManager,
@@ -89,6 +92,20 @@ class UbloxGpsReader(
             p.setParameters(38400, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
             p.dtr = true
             p.rts = true
+            // Bump the receiver from its factory 1 Hz to 10 Hz. Best-
+            // effort: a write failure (or a chip too old to accept the
+            // command, e.g. some MAX-M8 variants when running multi-
+            // GNSS) just leaves the unit at whatever rate it booted at;
+            // the reader stays functional either way.
+            try {
+                val cfgRate = buildUbxCfgRate(measRateMs = TARGET_MEAS_RATE_MS)
+                p.write(cfgRate, UBX_WRITE_TIMEOUT_MS)
+                Log.i(TAG, "sent UBX-CFG-RATE for ${1000 / TARGET_MEAS_RATE_MS} Hz")
+                sink.onLog("reader: requested ${1000 / TARGET_MEAS_RATE_MS} Hz")
+            } catch (e: Exception) {
+                Log.w(TAG, "UBX-CFG-RATE write failed", e)
+                sink.onLog("reader: rate-config write failed — ${e.message}")
+            }
         } catch (e: Exception) {
             try { p.close() } catch (_: Exception) {}
             conn.close()
@@ -174,5 +191,47 @@ class UbloxGpsReader(
         private const val READ_TIMEOUT_MS = 250
         private const val MAX_LINE_LEN = 256
         private const val TAG = "UbloxGpsReader"
+        private const val UBX_WRITE_TIMEOUT_MS = 200
+        /** Target measurement interval in ms. 100 = 10 Hz (matches the box). */
+        private const val TARGET_MEAS_RATE_MS = 100
+
+        /**
+         * Build a UBX-CFG-RATE frame (class 0x06, id 0x08) requesting the
+         * given measurement interval, 1 nav cycle per measurement, and
+         * GPS time reference. Two-byte Fletcher-8 checksum (CK_A/CK_B)
+         * is computed over class+id+length+payload per the u-blox spec.
+         */
+        internal fun buildUbxCfgRate(measRateMs: Int): ByteArray {
+            val payload = byteArrayOf(
+                (measRateMs and 0xFF).toByte(),
+                ((measRateMs ushr 8) and 0xFF).toByte(),
+                0x01, 0x00,  // navRate: 1 nav solution per measurement
+                0x01, 0x00,  // timeRef: 1 = GPS time
+            )
+            return buildUbxFrame(classId = 0x06, msgId = 0x08, payload = payload)
+        }
+
+        private fun buildUbxFrame(classId: Int, msgId: Int, payload: ByteArray): ByteArray {
+            val len = payload.size
+            val body = ByteArray(4 + len)
+            body[0] = (classId and 0xFF).toByte()
+            body[1] = (msgId and 0xFF).toByte()
+            body[2] = (len and 0xFF).toByte()
+            body[3] = ((len ushr 8) and 0xFF).toByte()
+            System.arraycopy(payload, 0, body, 4, len)
+            var ckA = 0
+            var ckB = 0
+            for (b in body) {
+                ckA = (ckA + (b.toInt() and 0xFF)) and 0xFF
+                ckB = (ckB + ckA) and 0xFF
+            }
+            val out = ByteArray(2 + body.size + 2)
+            out[0] = 0xB5.toByte()
+            out[1] = 0x62.toByte()
+            System.arraycopy(body, 0, out, 2, body.size)
+            out[out.size - 2] = ckA.toByte()
+            out[out.size - 1] = ckB.toByte()
+            return out
+        }
     }
 }
