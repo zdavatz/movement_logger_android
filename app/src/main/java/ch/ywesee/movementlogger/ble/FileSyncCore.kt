@@ -461,21 +461,42 @@ object FileSyncCore {
                 // only the unfinished one from its mirror offset. Also
                 // resume if "Keep synced" is on. A plain first connect
                 // does neither.
-                //
-                // Defer the kick by 500 ms so the in-flight GetLogMode
-                // `ModeReq` finishes first — otherwise the LIST inside
-                // startSyncPass collides with it and is rejected as
-                // "another op is in flight". (iOS v0.0.x equivalent.)
                 val st = _state.value
-                if (st.transferInterrupted || st.keepSynced) {
-                    val why = if (st.transferInterrupted) "Resume" else "Keep synced"
+                val resumeWhy: String? = when {
+                    st.transferInterrupted -> "Resume"
+                    st.keepSynced -> "Keep synced"
+                    else -> null
+                }
+                if (st.transferInterrupted) {
                     _state.update { it.copy(transferInterrupted = false) }
-                    scope.launch {
-                        kotlinx.coroutines.delay(500)
-                        val now = _state.value
-                        if (now.connection == Connection.Connected && !now.syncing) {
-                            startSyncPass(why)
-                        }
+                }
+                // Stamp the box's open Sens/Gps CSVs with the phone's wall
+                // clock (SET_TIME 0x08) on EVERY connect — "first time and
+                // every time the box connects". The box has no RTC; it pairs
+                // this epoch with its free-running ms counter (the CSV `ms`
+                // column) and writes a `# SYNC` anchor, so Replay can
+                // time-align without a GPS fix.
+                //
+                // GetLogMode → SET_TIME → startSyncPass are serialised with
+                // 500 ms gaps: the firmware holds only ONE pending command at
+                // a time (a second write clobbers the first) and the BLE
+                // worker is single-op. The epoch is sampled right before the
+                // send so it matches the box-tick the firmware stamps (skew =
+                // one BLE interval, not the ~500 ms it would be if sampled at
+                // connect time). The first 500 ms also lets the in-flight
+                // GetLogMode `ModeReq` finish so SET_TIME isn't rejected as
+                // "another op is in flight". (iOS v0.0.x equivalent.)
+                scope.launch {
+                    kotlinx.coroutines.delay(500)
+                    if (_state.value.connection != Connection.Connected) return@launch
+                    ble?.send(BleCmd.SetTime(System.currentTimeMillis()))
+                    val why = resumeWhy ?: return@launch
+                    // Another 500 ms so the LIST inside startSyncPass doesn't
+                    // clobber the SET_TIME write.
+                    kotlinx.coroutines.delay(500)
+                    val now = _state.value
+                    if (now.connection == Connection.Connected && !now.syncing) {
+                        startSyncPass(why)
                     }
                 }
             }

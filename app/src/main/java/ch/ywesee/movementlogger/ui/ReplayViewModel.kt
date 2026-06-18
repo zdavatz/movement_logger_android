@@ -13,6 +13,7 @@ import ch.ywesee.movementlogger.data.GpsRow
 import ch.ywesee.movementlogger.data.GpsTime
 import ch.ywesee.movementlogger.data.ReplayTrim
 import ch.ywesee.movementlogger.data.SensorRow
+import ch.ywesee.movementlogger.data.SyncAnchor
 import ch.ywesee.movementlogger.data.VideoExporter
 import ch.ywesee.movementlogger.data.VideoMetadata
 import ch.ywesee.movementlogger.data.VideoMetadataReader
@@ -47,6 +48,21 @@ data class ReplayUiState(
     val sensorAbsTimesMs: LongArray = LongArray(0),
     /** Sampling rate of the sensor stream, Hz (auto-detected from median tick delta). */
     val sampleHz: Double = 0.0,
+    /**
+     * Host-clock time-sync anchors (`# SYNC` markers) from the loaded
+     * sensor / GPS CSVs. When non-empty they drive a drift-free,
+     * GPS-independent tick→wall-clock mapping (preferred over the GPS
+     * hhmmss.ss path) that shares the video's clock domain.
+     */
+    val sensorSyncAnchors: List<SyncAnchor> = emptyList(),
+    val gpsSyncAnchors: List<SyncAnchor> = emptyList(),
+    /**
+     * How the panels are time-aligned, surfaced in the Alignment block:
+     * "Phone-clock sync" (firmware `# SYNC` markers — the new drift-free
+     * path) or "GPS-derived time" (hhmmss.ss fallback). null until a
+     * stream with timestamps is loaded.
+     */
+    val alignmentSource: String? = null,
     val loading: Boolean = false,
     val computing: Boolean = false,
     val error: String? = null,
@@ -115,19 +131,19 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
     private fun reanchorGpsTimes() {
         viewModelScope.launch(Dispatchers.Default) {
             val s = _state.value
-            val (y, mo, d) = sessionDate()
-            val rows = s.gpsRows
-            val times = LongArray(rows.size) { i -> GpsTime.toUtcMillis(rows[i].utc, y, mo, d) ?: -1L }
+            val times = gpsAbsTimes(s.gpsRows, s.gpsSyncAnchors)
             val anchor = times.firstOrNull { it >= 0L }
-            _state.update { it.copy(gpsAbsTimesMs = times, gpsAnchorUtcMillis = anchor) }
-            // Sensor abs times are derived from the GPS anchor + tick offset,
-            // so they need a refresh too.
-            if (s.sensorRows.isNotEmpty() && anchor != null) {
-                val firstGpsTicks = s.gpsRows.first().ticks
-                val sensorTimes = LongArray(s.sensorRows.size) { i ->
-                    val deltaTicks = s.sensorRows[i].ticks - firstGpsTicks
-                    anchor + (deltaTicks * 10.0).toLong()
-                }
+            _state.update {
+                it.copy(
+                    gpsAbsTimesMs = times,
+                    gpsAnchorUtcMillis = anchor,
+                    alignmentSource = alignmentLabel(s.sensorSyncAnchors, s.gpsSyncAnchors),
+                )
+            }
+            // Sensor abs times follow the same anchor preference — refresh
+            // them too when sensors are loaded.
+            if (s.sensorRows.isNotEmpty()) {
+                val sensorTimes = sensorAbsTimes(s.sensorRows, s.sensorSyncAnchors, s.gpsRows, times)
                 _state.update { it.copy(sensorAbsTimesMs = sensorTimes) }
             }
         }
@@ -137,8 +153,16 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null) }
             try {
-                val rows = withContext(Dispatchers.IO) { CsvParsers.parseSensorFile(file) }
-                _state.update { it.copy(sensorFile = file, sensorRows = rows, loading = false) }
+                val (rows, anchors) = withContext(Dispatchers.IO) {
+                    CsvParsers.parseSensorFile(file) to CsvParsers.parseSyncAnchorsFile(file)
+                }
+                _state.update {
+                    it.copy(
+                        sensorFile = file, sensorRows = rows,
+                        sensorSyncAnchors = anchors, loading = false,
+                        alignmentSource = alignmentLabel(anchors, it.gpsSyncAnchors),
+                    )
+                }
                 maybeComputeFusion()
             } catch (e: Exception) {
                 _state.update { it.copy(loading = false, error = "Sensor: ${e.message}") }
@@ -150,28 +174,34 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null) }
             try {
-                val rows = withContext(Dispatchers.IO) { CsvParsers.parseGpsFile(file) }
+                val syncAnchors = _state.value.sensorSyncAnchors
                 // Precompute the speed series + per-row absolute UTC. Done on
                 // IO since smoothing a 1800-row session is fine but isn't
-                // something to block the main thread on.
-                val (y, mo, d) = sessionDate()
-                val (smoothed, absTimes, anchor) = withContext(Dispatchers.IO) {
+                // something to block the main thread on. Per-row abs time
+                // PREFERS the GPS file's own `# SYNC` markers (drift-free,
+                // shares the video's clock domain) over the hhmmss.ss path.
+                val loaded = withContext(Dispatchers.IO) {
+                    val rows = CsvParsers.parseGpsFile(file)
+                    val gpsAnchors = CsvParsers.parseSyncAnchorsFile(file)
                     val raw = GpsMath.positionDerivedSpeedKmh(rows)
                     val cleaned = GpsMath.rejectAccOutliers(rows, raw)
                     val smooth = GpsMath.smoothSpeedKmh(cleaned)
-                    val times = LongArray(rows.size) { i ->
-                        GpsTime.toUtcMillis(rows[i].utc, y, mo, d) ?: -1L
-                    }
-                    val firstAnchor = times.firstOrNull { it >= 0L }
-                    Triple(smooth, times, firstAnchor)
+                    GpsLoad(rows, gpsAnchors, smooth, gpsAbsTimes(rows, gpsAnchors))
                 }
+                val rows = loaded.rows
+                val gpsAnchors = loaded.anchors
+                val smoothed = loaded.speed
+                val absTimes = loaded.absTimes
+                val anchor = absTimes.firstOrNull { it >= 0L }
                 _state.update {
                     it.copy(
                         gpsFile = file,
                         gpsRows = rows,
+                        gpsSyncAnchors = gpsAnchors,
                         gpsAnchorUtcMillis = anchor,
                         speedSmoothedKmh = smoothed,
                         gpsAbsTimesMs = absTimes,
+                        alignmentSource = alignmentLabel(syncAnchors, gpsAnchors),
                         loading = false,
                     )
                 }
@@ -205,14 +235,12 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
                     )
                     val fusedH = FusionHeight.fusedHeightM(s.sensorRows, quats, baroH, sampleHz)
 
-                    // Per-sensor-row absolute UTC: anchor onto the first GPS fix
-                    // by tick offset (1 tick = 10 ms).
-                    val anchor = s.gpsAnchorUtcMillis ?: 0L
-                    val firstGpsTicks = s.gpsRows.first().ticks
-                    val sensorTimes = LongArray(s.sensorRows.size) { i ->
-                        val deltaTicks = s.sensorRows[i].ticks - firstGpsTicks
-                        anchor + (deltaTicks * 10.0).toLong()
-                    }
+                    // Per-sensor-row absolute UTC: PREFER the sensor file's
+                    // own `# SYNC` markers (phone clock, drift-free) over the
+                    // legacy single-GPS-anchor + tick-offset extrapolation.
+                    val sensorTimes = sensorAbsTimes(
+                        s.sensorRows, s.sensorSyncAnchors, s.gpsRows, s.gpsAbsTimesMs
+                    )
                     FusionResults(pitch, baroH, fusedH, sensorTimes, sampleHz)
                 }
                 _state.update {
@@ -238,6 +266,95 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
         val sensorTimes: LongArray,
         val sampleHz: Double,
     )
+
+    /** Parsed GPS file + derived series, ferried out of the IO block. */
+    private data class GpsLoad(
+        val rows: List<GpsRow>,
+        val anchors: List<SyncAnchor>,
+        val speed: DoubleArray,
+        val absTimes: LongArray,
+    )
+
+    // -------------------------------------------------------------------------
+    //  Time alignment — `# SYNC`-anchor-preferred (drift-free) with the
+    //  legacy GPS hhmmss.ss path as the fallback.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Per-GPS-row absolute UTC ms. PREFERS the file's `# SYNC` markers (phone
+     * wall clock, drift-free, GPS-independent, same clock domain as the
+     * video) when present; otherwise falls back to parsing each row's
+     * hhmmss.ss against the session date. -1 marks an unparseable hhmmss.ss
+     * row on the fallback path.
+     */
+    private fun gpsAbsTimes(rows: List<GpsRow>, anchors: List<SyncAnchor>): LongArray {
+        if (anchors.isNotEmpty()) {
+            return absTimesFromSyncAnchors(DoubleArray(rows.size) { rows[it].ticks }, anchors)
+        }
+        val (y, mo, d) = sessionDate()
+        return LongArray(rows.size) { i -> GpsTime.toUtcMillis(rows[i].utc, y, mo, d) ?: -1L }
+    }
+
+    /**
+     * Per-sensor-row absolute UTC ms. PREFERS the sensor file's `# SYNC`
+     * markers; otherwise falls back to the crude single-GPS-anchor + constant
+     * 10 ms/tick extrapolation (`anchor + (tick - firstGpsTick) * 10`) the app
+     * used before SYNC markers existed.
+     */
+    private fun sensorAbsTimes(
+        sensorRows: List<SensorRow>,
+        sensorAnchors: List<SyncAnchor>,
+        gpsRows: List<GpsRow>,
+        gpsAbsTimesMs: LongArray,
+    ): LongArray {
+        if (sensorAnchors.isNotEmpty()) {
+            return absTimesFromSyncAnchors(DoubleArray(sensorRows.size) { sensorRows[it].ticks }, sensorAnchors)
+        }
+        val anchor = gpsAbsTimesMs.firstOrNull { it >= 0L } ?: 0L
+        val firstGpsTicks = gpsRows.firstOrNull()?.ticks ?: 0.0
+        return LongArray(sensorRows.size) { i ->
+            anchor + ((sensorRows[i].ticks - firstGpsTicks) * 10.0).toLong()
+        }
+    }
+
+    /**
+     * Map row ticks → absolute epoch ms through the firmware's host-clock
+     * `# SYNC` anchors. Piecewise-linear between anchors (drift-free when
+     * several connects produced markers across the session); constant
+     * 10 ms/tick extrapolation before the first / after the last anchor.
+     * A single anchor degenerates to a fixed 10 ms/tick offset from that one
+     * connect. `anchors` must be tick-sorted + deduped (as
+     * [CsvParsers.parseSyncAnchors] returns). Mirrors the iOS
+     * `ReplayViewModel.absTimesFromSyncAnchors`.
+     */
+    private fun absTimesFromSyncAnchors(ticks: DoubleArray, anchors: List<SyncAnchor>): LongArray {
+        val n = ticks.size
+        if (n == 0 || anchors.isEmpty()) return LongArray(0)
+        val first = anchors.first()
+        val last = anchors.last()
+        val out = LongArray(n)
+        var j = 0
+        for (i in 0 until n) {
+            val t = ticks[i]
+            out[i] = when {
+                t <= first.ticks -> first.epochMs + ((t - first.ticks) * 10.0).toLong()
+                t >= last.ticks -> last.epochMs + ((t - last.ticks) * 10.0).toLong()
+                else -> {
+                    while (j + 1 < anchors.size && anchors[j + 1].ticks <= t) j++
+                    val a = anchors[j]
+                    val b = anchors[j + 1]
+                    val frac = (t - a.ticks) / (b.ticks - a.ticks)
+                    (a.epochMs + (b.epochMs - a.epochMs) * frac).toLong()
+                }
+            }
+        }
+        return out
+    }
+
+    /** Human-readable alignment-source label for the Alignment block. */
+    private fun alignmentLabel(sensorAnchors: List<SyncAnchor>, gpsAnchors: List<SyncAnchor>): String =
+        if (sensorAnchors.isNotEmpty() || gpsAnchors.isNotEmpty()) "Phone-clock sync"
+        else "GPS-derived time"
 
     fun clearError() {
         _state.update { it.copy(error = null) }

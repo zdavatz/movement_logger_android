@@ -684,6 +684,12 @@ private fun AlignmentSummary(state: ReplayUiState) {
             if (n == 0) "gps rows:        —" else "gps rows:        $n"
         }
         Text("Alignment", fontWeight = FontWeight.SemiBold)
+        state.alignmentSource?.let { src ->
+            // "Phone-clock sync" = firmware `# SYNC` markers (drift-free,
+            // GPS-independent); "GPS-derived time" = hhmmss.ss fallback.
+            Text("source:         $src", fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
         Text(videoLine, fontFamily = FontFamily.Monospace, fontSize = 12.sp,
             maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(gpsLine, fontFamily = FontFamily.Monospace, fontSize = 12.sp,

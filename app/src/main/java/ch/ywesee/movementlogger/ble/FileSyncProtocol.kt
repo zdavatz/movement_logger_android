@@ -36,6 +36,15 @@ object FileSyncProtocol {
     const val OP_SET_MODE: Byte = 0x06
     /** GET_MODE: box replies one byte 0 = auto, 1 = manual. */
     const val OP_GET_MODE: Byte = 0x07
+    /**
+     * SET_TIME `<epoch_ms:u64-LE>`: push the phone's wall-clock millis so the
+     * box (which has no RTC) stamps a `# SYNC epoch_ms=… tick_ms=…` anchor
+     * into the open Sens/Gps CSVs, pairing the phone epoch with its
+     * free-running ms counter. Sent on every connect; lets replay resolve
+     * absolute wall-clock without a GPS fix. Box replies one status byte we
+     * don't track (legacy firmware without 0x08 just ignores the write).
+     */
+    const val OP_SET_TIME: Byte = 0x08
 
     // Status bytes returned in single-byte FileData notifies.
     const val STATUS_OK: Byte = 0x00
@@ -77,6 +86,12 @@ sealed class BleCmd {
     data class SetLogMode(val manual: Boolean) : BleCmd()
     /** Query the box's current log-mode; reply arrives as [BleEvent.LogMode]. */
     data object GetLogMode : BleCmd()
+    /**
+     * Push the phone's current wall-clock millis to the box so it stamps a
+     * time-sync anchor into the open Sens/Gps CSVs. Fire-and-forget — no
+     * tracked reply (so legacy firmware that ignores 0x08 never stalls us).
+     */
+    data class SetTime(val epochMs: Long) : BleCmd()
 }
 
 sealed class BleEvent {

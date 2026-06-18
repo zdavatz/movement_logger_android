@@ -61,6 +61,25 @@ data class BatteryRow(
     val currentHundredUa: Int,
 )
 
+/**
+ * A host-clock time-sync anchor the firmware stamps into Sens/Gps CSVs on
+ * each BLE connect (`SET_TIME` 0x08): a `# SYNC epoch_ms=… tick_ms=…`
+ * comment line pairing the phone's absolute wall-clock millis with the
+ * box's free-running ms counter. Because the box has no RTC, these anchors
+ * are the *only* drift-free, GPS-independent way to map a logged row's tick
+ * to absolute time — and they share the phone's clock domain with the
+ * replay video's `creation_time`, eliminating cross-clock skew.
+ */
+data class SyncAnchor(
+    /**
+     * Box tick in the SAME unit as `SensorRow.ticks` / `GpsRow.ticks`
+     * (10 ms units), so it slots straight into the abs-time interpolation.
+     */
+    val ticks: Double,
+    /** Phone wall-clock epoch milliseconds the host pushed at this tick. */
+    val epochMs: Long,
+)
+
 object CsvParsers {
 
     @Throws(IOException::class)
@@ -71,6 +90,63 @@ object CsvParsers {
 
     @Throws(IOException::class)
     fun parseBatteryFile(file: File): List<BatteryRow> = file.inputStream().use(::parseBatteryStream)
+
+    /** Best-effort anchor scan of a file; [] on any IO error or legacy file. */
+    fun parseSyncAnchorsFile(file: File): List<SyncAnchor> = try {
+        file.inputStream().use(::parseSyncAnchors)
+    } catch (_: IOException) {
+        emptyList()
+    }
+
+    /**
+     * Pull every `# SYNC epoch_ms=<u64> tick_ms=<u32>` marker out of a Sens
+     * or Gps CSV (written by the firmware's SET_TIME handler). `tick_ms` is
+     * the box's raw `HAL_GetTick()` ms — the same clock as the `ms`/`Time`
+     * column — so we divide by the file's tick divisor to land in the
+     * row-tick (10 ms) unit. The data-row parsers naturally skip these
+     * comment lines (the `#` field fails the float parse), so this is a
+     * cheap separate pass that never disturbs row parsing. Returns [] for
+     * files from firmware that predates the marker (legacy / never-connected).
+     */
+    fun parseSyncAnchors(input: InputStream): List<SyncAnchor> {
+        val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
+        // Markers only appear in the compact `ms,…` schema (raw ms → ÷10 →
+        // 10 ms ticks). The legacy spaced header ("Time [10ms]", …) is
+        // already in 10 ms units, so its divisor is 1 (it never carries
+        // markers in practice, but detect it to stay correct regardless).
+        var tickDiv = 10.0
+        var sawHeader = false
+        val out = ArrayList<SyncAnchor>()
+        while (true) {
+            val raw = reader.readLine() ?: break
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            if (!sawHeader) {
+                sawHeader = true
+                if (line.lowercase().contains("time [")) tickDiv = 1.0
+                continue
+            }
+            if (!line.startsWith("#") || !line.contains("SYNC")) continue
+            var epochMs: Long? = null
+            var tickMs: Double? = null
+            for (tok in line.split(' ', '\t').filter { it.isNotEmpty() }) {
+                when {
+                    tok.startsWith("epoch_ms=") -> epochMs = tok.removePrefix("epoch_ms=").toLongOrNull()
+                    tok.startsWith("tick_ms=") -> tickMs = tok.removePrefix("tick_ms=").toDoubleOrNull()
+                }
+            }
+            val e = epochMs
+            val t = tickMs
+            if (e != null && t != null && e > 0L) out.add(SyncAnchor(t / tickDiv, e))
+        }
+        // Sort + dedupe by tick so the abs-time interpolation gets a clean,
+        // monotone anchor curve even if connects produced out-of-order or
+        // duplicate markers.
+        out.sortBy { it.ticks }
+        val deduped = ArrayList<SyncAnchor>(out.size)
+        for (a in out) if (deduped.lastOrNull()?.ticks != a.ticks) deduped.add(a)
+        return deduped
+    }
 
     @Throws(IOException::class)
     fun parseSensorStream(input: InputStream): List<SensorRow> {

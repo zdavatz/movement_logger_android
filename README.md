@@ -48,7 +48,7 @@ Scans for the box over BLE (advertise name `PumpTsueri` *or* `STBoxFs`), connect
 
 Pick any video from your phone plus a `Sens*.csv` / `Gps*.csv` pair that the Sync tab downloaded, and the app:
 
-1. Pulls the video's `creation_time` from its metadata to anchor wall-clock alignment. The GPS CSV's `hhmmss.ss` timestamps carry no date, so the video's UTC date is also used as the session date — replaying a clip from last week stays correctly aligned.
+1. Pulls the video's `creation_time` from its metadata to anchor wall-clock alignment. The box has no RTC, so on every connect the app stamps the phone's wall clock into the box's open logs (`SET_TIME` `0x08`, firmware v0.0.10+); when those `# SYNC` anchors are present the panels align to absolute time straight from them — **drift-free and with no GPS fix required**, in the same clock domain as the video — instead of leaning on the GPS `hhmmss.ss` strings (which stay as the fallback for older recordings, combined with the video's UTC date so a clip from last week still aligns).
 2. Parses the CSVs.
 3. Runs the full numerics pipeline (Madgwick 6DOF fusion, GPS-anchored baro height, complementary baro + IMU fused height, drift-corrected nose angle, GPS-derived speed with outlier rejection + rolling median).
 4. Renders four data panels stacked below the video player:

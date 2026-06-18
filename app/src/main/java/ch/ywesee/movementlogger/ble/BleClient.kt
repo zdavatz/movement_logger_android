@@ -173,6 +173,7 @@ class BleClient(private val context: Context) {
             is BleCmd.Delete -> sendDelete(cmd.name)
             is BleCmd.SetLogMode -> sendSetMode(cmd.manual)
             BleCmd.GetLogMode -> sendGetMode()
+            is BleCmd.SetTime -> sendSetTime(cmd.epochMs)
         }
     }
 
@@ -404,6 +405,27 @@ class BleClient(private val context: Context) {
         }
         if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_GET_MODE))) return
         op = CurrentOp.ModeReq(isSet = false, manual = false, lastProgress = now())
+    }
+
+    /**
+     * SET_TIME `0x08 + epoch_ms(u64-LE)`: hand the box the phone's wall
+     * clock so it stamps a `# SYNC` anchor into the open Sens/Gps CSVs.
+     * Deliberately *fire-and-forget* — it does NOT occupy a [CurrentOp]
+     * slot: the host never needs the reply, and legacy firmware that
+     * doesn't implement 0x08 never answers (so tracking it would stall the
+     * op for the full 20 s watchdog window). The box's OK byte, if any,
+     * lands while `op == Idle` and is harmlessly ignored. Skipped if an op
+     * is mid-flight so a stray marker can't interleave with a READ.
+     */
+    private fun sendSetTime(epochMs: Long) {
+        if (op !is CurrentOp.Idle) return
+        val payload = ByteArray(1 + 8)
+        payload[0] = FileSyncProtocol.OP_SET_TIME
+        for (i in 0 until 8) {
+            payload[1 + i] = ((epochMs ushr (8 * i)) and 0xFF).toByte()
+        }
+        if (!writeCmdBytes(payload)) return
+        emit(BleEvent.Status("SET_TIME sent — box clock anchored to phone"))
     }
 
     // -------------------------------------------------------------------------
