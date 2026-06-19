@@ -117,6 +117,14 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
         ActivityResultContracts.StartActivityForResult()
     ) { /* user came back from settings — let next Scan retry */ }
 
+    // Firmware `.bin` picker (SAF). Most file managers report a .bin as
+    // application/octet-stream; some return application/* or nothing, so we
+    // also allow */* and filter by extension is unnecessary — the box
+    // verifies the SHA-256 anyway. Picking → uploadFirmware reads the bytes.
+    val fwPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) vm.uploadFirmware(uri) }
+
     LaunchedEffect(Unit) {
         val missing = requiredPerms.filter {
             ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
@@ -170,7 +178,18 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                     onSetDuration = vm::setSessionDuration,
                     onStartSession = vm::startSession,
                     onSetLogMode = vm::setLogMode,
+                    onPickFirmware = {
+                        // application/octet-stream is the canonical .bin MIME;
+                        // */* is the catch-all for managers that report none.
+                        fwPickerLauncher.launch(arrayOf("application/octet-stream", "*/*"))
+                    },
+                    onCancelFirmware = vm::abortFirmwareUpload,
                 )
+
+                state.fwUploadResult?.let { res ->
+                    Spacer(Modifier.height(8.dp))
+                    FwUploadResultBanner(res) { vm.dismissFwUploadResult() }
+                }
 
                 if (state.transferInterrupted && state.connection != Connection.Connected) {
                     Spacer(Modifier.height(8.dp))
@@ -216,6 +235,8 @@ private fun ConnectionBar(
     onSetDuration: (Int) -> Unit,
     onStartSession: () -> Unit,
     onSetLogMode: (Boolean) -> Unit,
+    onPickFirmware: () -> Unit,
+    onCancelFirmware: () -> Unit,
 ) {
     Column {
         // FlowRow so the action buttons wrap onto the next line on narrow
@@ -245,14 +266,22 @@ private fun ConnectionBar(
                     // keep-synced READ holds the BLE worker busy for
                     // minutes, and tap-while-busy used to collide with
                     // the "another op is in flight" rejection and leave
-                    // the UI confused (port of iOS Sync UX fix).
+                    // the UI confused (port of iOS Sync UX fix). A
+                    // firmware upload likewise occupies the single op.
+                    val uploading = state.fwUpload != null
                     val workerBusy = state.listing || state.syncing ||
-                            state.downloads.isNotEmpty()
+                            state.downloads.isNotEmpty() || uploading
                     Button(onClick = onList, enabled = !workerBusy) {
                         Text(if (state.listing) "Listing…" else "List files")
                     }
                     OutlinedButton(onClick = onSyncNow, enabled = !workerBusy) {
                         Text(if (state.syncing) "Syncing…" else "Sync now")
+                    }
+                    // Stage a new firmware image onto the box's inactive
+                    // flash bank, then verify + swap + reset (OTA). Single
+                    // op, so disabled while anything else is in flight.
+                    OutlinedButton(onClick = onPickFirmware, enabled = !workerBusy) {
+                        Text(if (uploading) "Uploading…" else "Firmware update")
                     }
                     // Disconnect is back so one person can sync, drop the
                     // link, and hand the box to the next person to sync.
@@ -288,6 +317,12 @@ private fun ConnectionBar(
             if (state.syncing) {
                 Spacer(Modifier.height(8.dp))
                 SyncProgressRow(state)
+            }
+            // Firmware-upload progress card — mirrors the sync card. Shown
+            // whenever a `.bin` is streaming to the box's flash bank.
+            state.fwUpload?.let { up ->
+                Spacer(Modifier.height(8.dp))
+                FwUploadProgressRow(up, onCancelFirmware)
             }
             Spacer(Modifier.height(8.dp))
             LogModeSelector(state.logModeManual, onSetLogMode)
@@ -388,6 +423,87 @@ private fun SyncProgressRow(state: FileSyncUiState) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+        }
+    }
+}
+
+/**
+ * In-flight firmware-upload progress card. Mirrors [SyncProgressRow]: a
+ * headline with filename + byte progress + percent, a bar, and a Cancel
+ * button (best-effort FW_ABORT). The byte counter advances as FW_DATA ACKs
+ * land over BLE (~2 KB/s+).
+ */
+@Composable
+private fun FwUploadProgressRow(state: FwUploadState, onCancel: () -> Unit) {
+    androidx.compose.material3.Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "Firmware update — ${state.name}",
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontWeight = FontWeight.SemiBold,
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${humanBytes(state.bytesDone)} / ${humanBytes(state.total)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text(
+                    "${(state.fraction * 100).toInt()}%",
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        fontFamily = FontFamily.Monospace,
+                    ),
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Spacer(Modifier.width(8.dp))
+                TextButton(onClick = onCancel) { Text("Cancel") }
+            }
+            Spacer(Modifier.height(6.dp))
+            LinearProgressIndicator(
+                progress = { state.fraction },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+/**
+ * Result banner for the most recent firmware upload. Green on success
+ * ("box rebooting into new firmware — reconnect…"), red on a mapped
+ * failure. Dismissable.
+ */
+@Composable
+private fun FwUploadResultBanner(result: FwUploadResult, onDismiss: () -> Unit) {
+    val (bg, border, fg) = if (result.success)
+        Triple(Color(0xFFE6F4EA), Color(0xFF4CAF50), Color(0xFF1B5E20))
+    else
+        Triple(Color(0xFFFFE5E5), Color(0xFFC75050), Color(0xFFAA1E1E))
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = bg),
+        border = BorderStroke(1.dp, border),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                (if (result.success) "✓ " else "⚠ ") + result.message,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+                color = fg,
+            )
+            TextButton(onClick = onDismiss) { Text("Dismiss") }
         }
     }
 }

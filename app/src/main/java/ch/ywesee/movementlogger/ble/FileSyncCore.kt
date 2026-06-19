@@ -370,6 +370,72 @@ object FileSyncCore {
         ble?.send(BleCmd.SetLogMode(manual))
     }
 
+    /**
+     * Read a firmware `.bin` from the SAF content Uri, compute its SHA-256,
+     * and kick off the FW_BEGIN → FW_DATA… → FW_COMMIT upload (desktop/iOS
+     * OTA peer). The read + digest run on a background coroutine so a big
+     * image doesn't block the caller; the actual BLE streaming is driven by
+     * the single-op [BleClient] state machine.
+     */
+    fun uploadFirmware(context: Context, uri: android.net.Uri) {
+        val ctx = context.applicationContext
+        scope.launch {
+            val name = displayName(ctx, uri) ?: "firmware.bin"
+            val image = try {
+                ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            } catch (ex: Exception) {
+                log("ERROR: read $name: ${ex.message}")
+                null
+            }
+            if (image == null || image.isEmpty()) {
+                _state.update {
+                    it.copy(fwUploadResult = ch.ywesee.movementlogger.ui.FwUploadResult(
+                        false, "couldn't read $name (empty or unreadable)"))
+                }
+                return@launch
+            }
+            val sha = try {
+                java.security.MessageDigest.getInstance("SHA-256").digest(image)
+            } catch (ex: Exception) {
+                log("ERROR: SHA-256 $name: ${ex.message}")
+                _state.update {
+                    it.copy(fwUploadResult = ch.ywesee.movementlogger.ui.FwUploadResult(
+                        false, "SHA-256 failed: ${ex.message}"))
+                }
+                return@launch
+            }
+            // Optimistically show the card; FwUploadStarted confirms total.
+            _state.update {
+                it.copy(
+                    fwUpload = ch.ywesee.movementlogger.ui.FwUploadState(name, 0, image.size.toLong()),
+                    fwUploadResult = null,
+                )
+            }
+            log("FW upload $name (${image.size} B, sha256=${sha.joinToString("") { b -> "%02x".format(b) }.take(16)}…)")
+            ble?.send(BleCmd.UploadFirmware(image, sha))
+        }
+    }
+
+    /** Cancel an in-flight firmware upload (best-effort FW_ABORT). */
+    fun abortFirmwareUpload() {
+        log("FW upload cancel")
+        ble?.send(BleCmd.AbortFirmware)
+    }
+
+    fun dismissFwUploadResult() {
+        _state.update { it.copy(fwUploadResult = null) }
+    }
+
+    /** SAF display name for a content Uri, or null. */
+    private fun displayName(ctx: Context, uri: android.net.Uri): String? = try {
+        ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+        } ?: uri.lastPathSegment
+    } catch (_: Exception) {
+        uri.lastPathSegment
+    }
+
     fun clearSession() {
         if (_state.value.sessionRunning != null) {
             log("LOG session duration reached — box is idle again (manual mode)")
@@ -621,6 +687,30 @@ object FileSyncCore {
                 log("box log mode: ${if (e.manual) "manual" else "auto"}")
             }
             is BleEvent.Sample -> onSample(e.sample)
+            is BleEvent.FwUploadStarted -> {
+                _state.update { s ->
+                    val cur = s.fwUpload
+                    s.copy(
+                        fwUpload = (cur ?: ch.ywesee.movementlogger.ui.FwUploadState(
+                            "firmware.bin", 0, e.total)).copy(bytesDone = 0, total = e.total),
+                    )
+                }
+                log("FW upload started (${e.total} B)")
+            }
+            is BleEvent.FwUploadProgress -> _state.update { s ->
+                val cur = s.fwUpload ?: return@update s
+                s.copy(fwUpload = cur.copy(bytesDone = e.bytesDone, total = e.total))
+            }
+            is BleEvent.FwUploadDone -> {
+                _state.update {
+                    it.copy(
+                        fwUpload = null,
+                        fwUploadResult = ch.ywesee.movementlogger.ui.FwUploadResult(
+                            e.success, e.message),
+                    )
+                }
+                log("FW upload ${if (e.success) "OK" else "FAILED"}: ${e.message}")
+            }
         }
         listener?.onStateChanged(_state.value)
     }
@@ -759,7 +849,8 @@ object FileSyncCore {
             s.scanning ||
             s.listing ||
             s.syncing ||
-            s.downloads.isNotEmpty()
+            s.downloads.isNotEmpty() ||
+            s.fwUpload != null
     }
 
     /** "Keep synced" idle poll interval (desktop SYNC_POLL_INTERVAL). */

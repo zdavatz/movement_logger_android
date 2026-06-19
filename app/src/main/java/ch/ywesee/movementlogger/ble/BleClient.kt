@@ -66,6 +66,10 @@ class BleClient(private val context: Context) {
     private var streamChar: BluetoothGattCharacteristic? = null
     private var op: CurrentOp = CurrentOp.Idle
     private var scanning: Boolean = false
+    /** ATT MTU negotiated on connect (updated in [onMtuChanged]). Defaults
+     *  to the BLE minimum until the box answers. Used to size FW_DATA
+     *  chunks: payload = min(244, mtu-3) - 5 (offset header). */
+    private var negotiatedMtu: Int = DEFAULT_ATT_MTU
     /** MAC of the box we last successfully subscribed to — the
      *  reconnect target after an unexpected mid-transfer drop. */
     private var lastConnectedAddress: String? = null
@@ -174,6 +178,8 @@ class BleClient(private val context: Context) {
             is BleCmd.SetLogMode -> sendSetMode(cmd.manual)
             BleCmd.GetLogMode -> sendGetMode()
             is BleCmd.SetTime -> sendSetTime(cmd.epochMs)
+            is BleCmd.UploadFirmware -> startFirmwareUpload(cmd.image, cmd.sha256)
+            BleCmd.AbortFirmware -> abortFirmwareUpload()
         }
     }
 
@@ -266,6 +272,21 @@ class BleClient(private val context: Context) {
             is CurrentOp.ModeReq -> emitErr(
                 "${if (o.isSet) "SET_MODE" else "GET_MODE"} aborted by disconnect"
             )
+            is CurrentOp.Uploading -> {
+                // A disconnect right after COMMIT is the SUCCESS path: the
+                // box swapped banks and reset. Otherwise it's a real failure.
+                if (o.phase == CurrentOp.Uploading.Phase.COMMITTING) {
+                    emit(BleEvent.FwUploadDone(
+                        success = true,
+                        message = "sent — box rebooting into new firmware, reconnect in a few seconds",
+                    ))
+                } else {
+                    emit(BleEvent.FwUploadDone(
+                        success = false,
+                        message = "firmware upload aborted by disconnect at ${o.offset}/${o.image.size} B",
+                    ))
+                }
+            }
             CurrentOp.Idle -> Unit
         }
         op = CurrentOp.Idle
@@ -281,6 +302,7 @@ class BleClient(private val context: Context) {
         streamChar = null
         streamAsm.clear()
         streamAsmNext = 0
+        negotiatedMtu = DEFAULT_ATT_MTU
         if (emitEvent) emit(BleEvent.Disconnected)
     }
 
@@ -574,6 +596,9 @@ class BleClient(private val context: Context) {
     /** MTU upgrade callback — proceed with CCCD subscription chain. */
     private suspend fun onMtuChanged(mtu: Int, status: Int) {
         Log.i(tag, "onMtuChanged mtu=$mtu status=$status")
+        // Remember the negotiated MTU regardless of `status` — some MTU is
+        // in effect either way, and FW_DATA chunk sizing keys off it.
+        negotiatedMtu = mtu
         // We continue regardless of `status` — even if Android reports
         // failure, *some* MTU is in effect. If it's still 23 we'll get
         // truncated 20-byte notifies (Live tab stays empty), but FileSync
@@ -643,6 +668,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Reading -> handleReadNotify(current, value)
             is CurrentOp.Deleting -> handleDeleteNotify(current, value)
             is CurrentOp.ModeReq -> handleModeNotify(current, value)
+            is CurrentOp.Uploading -> handleUploadNotify(current, value)
         }
     }
 
@@ -794,6 +820,164 @@ class BleClient(private val context: Context) {
         op = CurrentOp.Idle
     }
 
+    // -------------------------------------------------------------------------
+    //  Firmware OTA upload (FW_BEGIN → FW_DATA… → FW_COMMIT)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Kick off a firmware upload. Sends FW_BEGIN `[len:u32][sha256:32]` and
+     * parks in the BEGINNING phase awaiting the box's 1-byte ready/err. The
+     * FW_DATA stream is ACK-gated from [handleUploadNotify]: one chunk in
+     * flight at a time, advance on the 4-byte next-offset ACK.
+     */
+    private fun startFirmwareUpload(image: ByteArray, sha256: ByteArray) {
+        if (op !is CurrentOp.Idle) {
+            emit(BleEvent.FwUploadDone(false, "another op is in flight — wait or Disconnect"))
+            return
+        }
+        if (image.isEmpty()) {
+            emit(BleEvent.FwUploadDone(false, "firmware image is empty"))
+            return
+        }
+        if (sha256.size != 32) {
+            emit(BleEvent.FwUploadDone(false, "internal: SHA-256 digest must be 32 bytes"))
+            return
+        }
+        // FW_DATA payload per chunk: min(244, mtu-3) - 5 (the 4-byte offset
+        // header + opcode share the ATT write). Clamp to ≥1 so a tiny MTU
+        // still makes (slow) progress.
+        val maxData = (minOf(244, negotiatedMtu - 3) - 5).coerceAtLeast(1)
+        // FW_BEGIN: opcode + image_len(u32-LE) + sha256(32) = 37 bytes.
+        val begin = ByteArray(1 + 4 + 32)
+        begin[0] = FileSyncProtocol.OP_FW_BEGIN
+        val len = image.size
+        begin[1] = (len and 0xFF).toByte()
+        begin[2] = ((len ushr 8) and 0xFF).toByte()
+        begin[3] = ((len ushr 16) and 0xFF).toByte()
+        begin[4] = ((len ushr 24) and 0xFF).toByte()
+        System.arraycopy(sha256, 0, begin, 5, 32)
+        if (!writeCmdBytes(begin)) {
+            emit(BleEvent.FwUploadDone(false, "not connected — couldn't send FW_BEGIN"))
+            return
+        }
+        op = CurrentOp.Uploading(
+            image = image,
+            sha256 = sha256,
+            maxData = maxData,
+            phase = CurrentOp.Uploading.Phase.BEGINNING,
+            offset = 0,
+            retries = 0,
+            lastEmit = 0,
+            lastProgress = now(),
+        )
+        emit(BleEvent.FwUploadStarted(image.size.toLong()))
+        emit(BleEvent.Status("FW_BEGIN sent (${image.size} B, chunk ${maxData} B) — erasing bank…"))
+    }
+
+    /**
+     * Best-effort FW_ABORT then drop the op locally. Sent regardless of the
+     * phase so a user cancel mid-stream tells the box to discard the staged
+     * image; we don't wait for its 0x00 reply (the op is gone either way).
+     */
+    private fun abortFirmwareUpload() {
+        if (op !is CurrentOp.Uploading) return
+        writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_FW_ABORT))
+        op = CurrentOp.Idle
+        emit(BleEvent.FwUploadDone(false, "firmware upload cancelled"))
+    }
+
+    /**
+     * Send the FW_DATA chunk that starts at `state.offset` (does NOT advance
+     * the offset — that happens when the ACK lands, so a resend after a
+     * timeout re-sends the same chunk; the box is idempotent for offset below
+     * its cursor). When the whole image is staged, transitions to COMMIT.
+     */
+    private fun sendCurrentFwChunk(state: CurrentOp.Uploading) {
+        val off = state.offset
+        if (off >= state.image.size) {
+            // Whole image staged — verify + swap + reset.
+            state.phase = CurrentOp.Uploading.Phase.COMMITTING
+            state.lastProgress = now()
+            if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_FW_COMMIT))) {
+                finishUpload(false, "not connected — couldn't send FW_COMMIT")
+                return
+            }
+            emit(BleEvent.Status("FW_COMMIT sent — verifying image…"))
+            return
+        }
+        val n = minOf(state.maxData, state.image.size - off)
+        // FW_DATA: opcode + offset(u32-LE) + n image bytes.
+        val payload = ByteArray(1 + 4 + n)
+        payload[0] = FileSyncProtocol.OP_FW_DATA
+        payload[1] = (off and 0xFF).toByte()
+        payload[2] = ((off ushr 8) and 0xFF).toByte()
+        payload[3] = ((off ushr 16) and 0xFF).toByte()
+        payload[4] = ((off ushr 24) and 0xFF).toByte()
+        System.arraycopy(state.image, off, payload, 5, n)
+        if (!writeCmdBytes(payload)) {
+            finishUpload(false, "not connected — couldn't send FW_DATA @$off")
+        }
+    }
+
+    /**
+     * Drive the upload state machine from a FileData notify.
+     *  - BEGINNING: 1 byte. 0x00 → start streaming FW_DATA; else error.
+     *  - SENDING: 4-byte LE next-offset ACK → advance + send next; a 1-byte
+     *    reply is an error (0xE7 bad-seq / 0xE5 flash-fail).
+     *  - COMMITTING: 0xA0 → success (box reboots); else map the error byte.
+     */
+    private fun handleUploadNotify(state: CurrentOp.Uploading, value: ByteArray) {
+        state.lastProgress = now()
+        state.retries = 0  // any reply clears the resend counter
+        when (state.phase) {
+            CurrentOp.Uploading.Phase.BEGINNING -> {
+                if (value.isEmpty()) return  // tolerate
+                if (value[0] == FileSyncProtocol.STATUS_OK) {
+                    state.phase = CurrentOp.Uploading.Phase.SENDING
+                    state.offset = 0
+                    emit(BleEvent.Status("bank erased — streaming image"))
+                    sendCurrentFwChunk(state)
+                } else {
+                    finishUpload(false, "FW_BEGIN: ${FileSyncProtocol.fwErrorMessage(value[0])}")
+                }
+            }
+            CurrentOp.Uploading.Phase.SENDING -> {
+                if (value.size == 4) {
+                    // 4-byte LE next-expected-offset ACK.
+                    val ack = (value[0].toInt() and 0xFF) or
+                        ((value[1].toInt() and 0xFF) shl 8) or
+                        ((value[2].toInt() and 0xFF) shl 16) or
+                        ((value[3].toInt() and 0xFF) shl 24)
+                    state.offset = ack
+                    val done = ack.toLong().coerceAtMost(state.image.size.toLong())
+                    if (done - state.lastEmit >= PROGRESS_CHUNK_BYTES || ack >= state.image.size) {
+                        state.lastEmit = done
+                        emit(BleEvent.FwUploadProgress(done, state.image.size.toLong()))
+                    }
+                    sendCurrentFwChunk(state)
+                } else if (value.isNotEmpty()) {
+                    // 1-byte error (0xE7 bad-seq / 0xE5 flash-fail).
+                    finishUpload(false, "FW_DATA @${state.offset}: ${FileSyncProtocol.fwErrorMessage(value[0])}")
+                }
+            }
+            CurrentOp.Uploading.Phase.COMMITTING -> {
+                if (value.isEmpty()) return
+                if (value[0] == FileSyncProtocol.FW_READY) {
+                    finishUpload(true,
+                        "sent — box rebooting into new firmware, reconnect in a few seconds")
+                } else {
+                    finishUpload(false, "FW_COMMIT: ${FileSyncProtocol.fwErrorMessage(value[0])}")
+                }
+            }
+        }
+    }
+
+    /** Terminate the upload op and emit the final result. */
+    private fun finishUpload(success: Boolean, message: String) {
+        op = CurrentOp.Idle
+        emit(BleEvent.FwUploadDone(success, message))
+    }
+
     private fun parseListRow(line: String): Pair<String, Long>? {
         val comma = line.lastIndexOf(',')
         if (comma < 0) return null
@@ -902,11 +1086,24 @@ class BleClient(private val context: Context) {
                 return
             }
         }
+        // Firmware upload has its own timeout policy: a missed FW_DATA ACK
+        // resends the SAME chunk (the box is idempotent for offset < its
+        // cursor), retrying a few times before giving up — not the
+        // hand-back-partial-and-reconnect dance a READ does. COMMIT gets a
+        // longer grace because the box's verify+swap can take several
+        // seconds (and the link may simply drop = success).
+        (op as? CurrentOp.Uploading)?.let { st ->
+            tickUploadWatchdog(st, now)
+            return
+        }
         val stale = when (val o = op) {
             is CurrentOp.Listing -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.Reading -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.Deleting -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.ModeReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
+            // Uploading is handled by tickUploadWatchdog above (early return),
+            // so it never reaches here — branch present only for exhaustiveness.
+            is CurrentOp.Uploading -> false
             CurrentOp.Idle -> false
         }
         if (!stale) return
@@ -927,6 +1124,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.ModeReq -> emitErr(
                 "${if (o.isSet) "SET_MODE" else "GET_MODE"} timed out — no reply for 20 s"
             )
+            is CurrentOp.Uploading -> Unit  // handled in tickUploadWatchdog; unreachable here
             CurrentOp.Idle -> Unit
         }
         op = CurrentOp.Idle
@@ -936,6 +1134,47 @@ class BleClient(private val context: Context) {
         // v0.0.12). Partial already handed back above.
         if (stalledRead && lastConnectedAddress != null && reconnect == null) {
             armReconnect()
+        }
+    }
+
+    /**
+     * Per-tick timeout policy for the firmware-upload op.
+     *  - SENDING: a missed ACK for [FW_CHUNK_TIMEOUT_MS] resends the SAME
+     *    chunk (idempotent) up to [FW_MAX_RETRIES] times, then fails.
+     *  - BEGINNING: bank erase can take ~1 s; allow [FW_BEGIN_TIMEOUT_MS].
+     *  - COMMITTING: verify+swap can take several seconds and the link may
+     *    just drop (= success, handled in disconnectInner); allow
+     *    [FW_COMMIT_TIMEOUT_MS] before declaring it stuck.
+     */
+    private fun tickUploadWatchdog(st: CurrentOp.Uploading, now: Long) {
+        val elapsed = now - st.lastProgress
+        when (st.phase) {
+            CurrentOp.Uploading.Phase.BEGINNING -> {
+                if (elapsed > FW_BEGIN_TIMEOUT_MS) {
+                    finishUpload(false, "FW_BEGIN timed out — no reply (bank erase failed?)")
+                }
+            }
+            CurrentOp.Uploading.Phase.SENDING -> {
+                if (elapsed <= FW_CHUNK_TIMEOUT_MS) return
+                if (st.retries >= FW_MAX_RETRIES) {
+                    finishUpload(false,
+                        "FW_DATA @${st.offset} timed out — no ACK after ${FW_MAX_RETRIES} retries")
+                    return
+                }
+                st.retries++
+                st.lastProgress = now
+                emit(BleEvent.Status(
+                    "FW_DATA @${st.offset} no ACK — resending (retry ${st.retries}/${FW_MAX_RETRIES})"))
+                sendCurrentFwChunk(st)
+            }
+            CurrentOp.Uploading.Phase.COMMITTING -> {
+                if (elapsed > FW_COMMIT_TIMEOUT_MS) {
+                    // No 0xA0 and no disconnect within the grace window —
+                    // treat as failure (the disconnect-as-success path is
+                    // handled in disconnectInner, not here).
+                    finishUpload(false, "FW_COMMIT timed out — no FW_READY and link stayed up")
+                }
+            }
         }
     }
 
@@ -1029,6 +1268,31 @@ class BleClient(private val context: Context) {
             val manual: Boolean,
             var lastProgress: Long,
         ) : CurrentOp()
+        /**
+         * Firmware OTA upload (FW_BEGIN → FW_DATA… → FW_COMMIT). ACK-gated:
+         * exactly one FW_* write is in flight at a time and we advance only
+         * when its reply lands.
+         *  - BEGINNING: sent FW_BEGIN, awaiting the 1-byte ready/err.
+         *  - SENDING: streaming FW_DATA chunks; `offset` = next byte to send;
+         *    each chunk awaits the 4-byte ACK before the next.
+         *  - COMMITTING: sent FW_COMMIT, awaiting 0xA0 / error / disconnect.
+         * `maxData` is the per-chunk payload byte budget, sized from the MTU
+         * at BEGIN. `retries` counts watchdog resends of the in-flight chunk
+         * (box is idempotent for offset < its cursor). `lastProgress`/`lastEmit`
+         * feed the watchdog + progress throttle, mirroring Reading.
+         */
+        data class Uploading(
+            val image: ByteArray,
+            val sha256: ByteArray,
+            val maxData: Int,
+            var phase: Phase,
+            var offset: Int,
+            var retries: Int,
+            var lastEmit: Long,
+            var lastProgress: Long,
+        ) : CurrentOp() {
+            enum class Phase { BEGINNING, SENDING, COMMITTING }
+        }
     }
 
     private sealed class RawEvent {
@@ -1082,5 +1346,14 @@ class BleClient(private val context: Context) {
          * just means we get whatever it advertises.
          */
         private const val MTU_REQUEST = 247
+        /** ATT MTU before negotiation completes (BLE spec minimum). */
+        private const val DEFAULT_ATT_MTU = 23
+        // Firmware-upload timeouts. Chunk ACKs come fast (~ms) over BLE, so a
+        // 4 s gap means a lost packet → resend. Bank erase (~1 s) and the
+        // verify+swap commit get longer grace windows.
+        private const val FW_CHUNK_TIMEOUT_MS = 4_000L
+        private const val FW_BEGIN_TIMEOUT_MS = 8_000L
+        private const val FW_COMMIT_TIMEOUT_MS = 10_000L
+        private const val FW_MAX_RETRIES = 5
     }
 }
