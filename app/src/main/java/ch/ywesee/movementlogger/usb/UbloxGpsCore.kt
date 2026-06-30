@@ -10,6 +10,7 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
+import ch.ywesee.movementlogger.data.PublicMirror
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -106,6 +107,13 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
     private var csvWriter: BufferedWriter? = null
     private var csvFile: File? = null
     private var csvStartMonoMs: Long = 0L
+    /** Lazily created on first [init]; mirrors every CSV byte into
+     *  `Download/MovementLogger/` so Google Files / file managers can see
+     *  the GPS log without poking at app-private storage. */
+    private var publicMirror: PublicMirror? = null
+    /** Running byte count of the active CSV so [PublicMirror.appendAt]
+     *  gets the correct resume offset (header + every row written so far). */
+    private var csvPublicOffset: Long = 0L
 
     private val dateFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
@@ -114,6 +122,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         appContext = ctx.applicationContext
         usbManager = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
         reader = UbloxGpsReader(usbManager!!, this)
+        publicMirror = PublicMirror(ctx.applicationContext)
         registerPermissionReceiver()
         refreshDevice()
     }
@@ -196,11 +205,20 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
             // overlap, so the existing CsvParsers.parseGpsStream parses
             // it without changes. Ticks = ms-since-log-start / 10 (the
             // box uses ThreadX 10 ms ticks; we synthesise one).
-            w.write("Time [10ms],UTC,Lat [deg],Lon [deg],Alt [m],SpeedKMh,Course [deg],Fix,NumSat,HDOP\n")
+            val header = "Time [10ms],UTC,Lat [deg],Lon [deg],Alt [m],SpeedKMh,Course [deg],Fix,NumSat,HDOP\n"
+            w.write(header)
             w.flush()
             csvWriter = w
             csvFile = file
             csvStartMonoMs = System.nanoTime() / 1_000_000L
+            csvPublicOffset = 0L
+            // Drop any prior session with this exact name (timestamped, so
+            // collisions are vanishingly rare — but a re-start within the
+            // same second would otherwise append onto stale bytes).
+            publicMirror?.delete(name)
+            val headerBytes = header.toByteArray(Charsets.UTF_8)
+            publicMirror?.appendAt(name, csvPublicOffset, headerBytes)
+            csvPublicOffset += headerBytes.size
             _state.update {
                 it.copy(isLogging = true, logPath = file.absolutePath, loggedRows = 0L)
             }
@@ -357,7 +375,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         val hdop = gga?.hdop
         val ticks = (System.nanoTime() / 1_000_000L - csvStartMonoMs) / 10L
         try {
-            w.write(buildString {
+            val row = buildString {
                 append(ticks).append(',')
                 append(utc).append(',')
                 appendDouble(lat).append(',')
@@ -369,7 +387,17 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
                 append(sats).append(',')
                 appendDouble(hdop)
                 append('\n')
-            })
+            }
+            w.write(row)
+            // Mirror the same bytes into Download/MovementLogger/ for
+            // Google Files visibility. Best-effort; never break the
+            // canonical internal log on a publish error.
+            val pubName = csvFile?.name
+            if (pubName != null) {
+                val rowBytes = row.toByteArray(Charsets.UTF_8)
+                publicMirror?.appendAt(pubName, csvPublicOffset, rowBytes)
+                csvPublicOffset += rowBytes.size
+            }
             _state.update { it.copy(loggedRows = it.loggedRows + 1) }
         } catch (e: Exception) {
             _state.update { it.copy(status = "CSV write failed: ${e.message}") }

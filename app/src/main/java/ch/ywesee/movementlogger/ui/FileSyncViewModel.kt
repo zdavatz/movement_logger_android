@@ -79,6 +79,11 @@ data class FileSyncUiState(
     val discovered: List<DiscoveredDevice> = emptyList(),
     val files: List<RemoteFile> = emptyList(),
     val downloads: Map<String, DownloadProgress> = emptyMap(),
+    /** Names of files the user tapped Download on that are waiting behind
+     *  the in-flight one. Downloads run strictly one-at-a-time (the BLE
+     *  worker is single-op); these render a "Queued" label until their
+     *  turn. */
+    val queuedDownloads: List<String> = emptyList(),
     val savedPaths: Map<String, String> = emptyMap(),
     /**
      * Bytes already in the local mirror per file, refreshed on LIST and

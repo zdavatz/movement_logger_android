@@ -73,6 +73,18 @@ class BleClient(private val context: Context) {
     /** MAC of the box we last successfully subscribed to — the
      *  reconnect target after an unexpected mid-transfer drop. */
     private var lastConnectedAddress: String? = null
+    /**
+     * Monotonic deadline (ms, [now] clock) until which file commands must
+     * hold off because the box is still digesting a SET_TIME. The firmware
+     * holds exactly one pending command; right after `0x08` it's busy
+     * appending the `# SYNC` anchor to the open CSV on SD and **silently
+     * drops** the next FileCmd that arrives too soon — so a LIST/READ
+     * tapped a few hundred ms after connect would never get answered and
+     * trip the 20 s watchdog. We confirmed this on the wire: LIST timed
+     * out only when it followed `08` by ~0.5 s, and always succeeded with
+     * a ≥1.8 s gap. [awaitCmdSettle] enforces the gap. 0 = no pending
+     * settle. */
+    private var setTimeSettleUntil: Long = 0L
     /** Bounded auto-reconnect state machine (desktop v0.0.11–13).
      *  Driven by the 200 ms watchdog tick so it composes with the
      *  single-worker model without new concurrency. null = inactive. */
@@ -160,6 +172,15 @@ class BleClient(private val context: Context) {
     // -------------------------------------------------------------------------
 
     private suspend fun handleCommand(cmd: BleCmd) {
+        // Hold file commands until the post-SET_TIME settle elapses (see
+        // [setTimeSettleUntil]). Connection-control + the time write itself
+        // never wait — only the FileCmd ops the box would otherwise drop.
+        when (cmd) {
+            BleCmd.List, BleCmd.GetLogMode,
+            is BleCmd.Read, is BleCmd.Delete, is BleCmd.SetLogMode,
+            -> awaitCmdSettle()
+            else -> Unit
+        }
         when (cmd) {
             BleCmd.Scan -> startScan()
             is BleCmd.Connect -> connect(cmd.address)
@@ -309,6 +330,9 @@ class BleClient(private val context: Context) {
     private fun writeCmdBytes(payload: ByteArray): Boolean {
         val g = gatt ?: run { emitErr("not connected"); return false }
         val c = cmdChar ?: run { emitErr("FileCmd characteristic missing"); return false }
+        if (DEBUG_WIRE) {
+            Log.i(tag, "TX FileCmd len=${payload.size} hex=${payload.toHex()}")
+        }
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val rc = g.writeCharacteristic(
@@ -447,7 +471,24 @@ class BleClient(private val context: Context) {
             payload[1 + i] = ((epochMs ushr (8 * i)) and 0xFF).toByte()
         }
         if (!writeCmdBytes(payload)) return
+        // Box is now busy writing the # SYNC anchor; hold the next FileCmd
+        // for the settle window so the firmware doesn't drop it.
+        setTimeSettleUntil = now() + SETTIME_SETTLE_MS
         emit(BleEvent.Status("SET_TIME sent — box clock anchored to phone"))
+    }
+
+    /**
+     * Block the worker until the post-SET_TIME settle window elapses. The
+     * worker is single-op, so stalling here can't starve a concurrent
+     * transfer — it just spaces the time write from the following command.
+     * Only ever waits once per connect (the deadline isn't re-armed).
+     */
+    private suspend fun awaitCmdSettle() {
+        val wait = setTimeSettleUntil - now()
+        if (wait > 0) {
+            if (DEBUG_WIRE) Log.i(tag, "settle: holding FileCmd ${wait}ms after SET_TIME")
+            delay(wait)
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -660,6 +701,11 @@ class BleClient(private val context: Context) {
         if (charUuid == FileSyncProtocol.STREAM_UUID) {
             handleStreamNotify(value)
             return
+        }
+        // DEBUG: raw FileData notify trace — proves whether the box answers
+        // a LIST/READ at all, and with what bytes. Gated on [DEBUG_WIRE].
+        if (DEBUG_WIRE) {
+            Log.i(tag, "RX FileData len=${value.size} op=${op::class.simpleName} hex=${value.toHex()}")
         }
         // FileData path — drive the in-flight op's state machine.
         when (val current = op) {
@@ -1310,10 +1356,20 @@ class BleClient(private val context: Context) {
     private fun now(): Long = System.nanoTime() / 1_000_000
 
     companion object {
+        /** Verbose wire trace (TX FileCmd / RX FileData hex). Diagnostic
+         *  only — keep off in shipping builds; flip on to debug a box that
+         *  isn't answering LIST/READ. */
+        private const val DEBUG_WIRE = false
+        private fun ByteArray.toHex(): String =
+            joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
         private const val SCAN_DURATION_MS = 5_000L
         private const val WATCHDOG_TICK_MS = 200L
         private const val OP_IDLE_TIMEOUT_MS = 20_000L
         private const val LIST_INACTIVITY_DONE_MS = 500L
+        /** How long the box stays busy after SET_TIME (0x08) before it can
+         *  service the next FileCmd. Measured ≥1.8 s works, ~0.5 s fails;
+         *  2 s gives margin for an SD flush. One-time per connect. */
+        private const val SETTIME_SETTLE_MS = 2_000L
         // Auto-reconnect tunables.
         //
         // Two regimes (mirrors desktop v0.0.19 / iOS): **bounded** when

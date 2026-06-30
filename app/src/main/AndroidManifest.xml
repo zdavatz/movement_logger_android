@@ -34,6 +34,13 @@
          AgentConfig via BootReceiver. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- Pre-scoped-storage (API ≤ 28) write access used by PublicMirror to
+         drop a Google-Files-readable copy of every synced CSV/WAV/log into
+         Download/MovementLogger/. API 29+ uses MediaStore.Downloads which
+         needs no permission for files our app creates. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <!-- USB host mode for the u-blox GNSS receiver plugged into the phone's

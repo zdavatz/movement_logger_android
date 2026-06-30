@@ -2,6 +2,7 @@ package ch.ywesee.movementlogger.ble
 
 import android.annotation.SuppressLint
 import android.content.Context
+import ch.ywesee.movementlogger.data.PublicMirror
 import ch.ywesee.movementlogger.sync.AgentConfig
 import ch.ywesee.movementlogger.sync.BackgroundSync
 import ch.ywesee.movementlogger.ui.Connection
@@ -54,6 +55,11 @@ object FileSyncCore {
     private var collectJob: Job? = null
     private var appContext: Context? = null
     private var listener: Listener? = null
+    /** Side-channel: publishes every appended chunk into
+     *  `Download/MovementLogger/` so Google Files / any file manager can
+     *  see synced data. Best-effort; failures here never break the
+     *  canonical internal mirror under `getExternalFilesDir(null)`. */
+    private var publicMirror: PublicMirror? = null
 
     // ---- Sync-state (port of desktop sync_db.rs + issues #3/#4) ----
     /** BLE MAC of the connected box, captured at Connect time (desktop
@@ -82,6 +88,25 @@ object FileSyncCore {
      *  fetches each file's new tail; survives disconnect (its tick
      *  guards on Connected so it resumes after a reconnect). */
     private var keepSyncedJob: Job? = null
+    /**
+     * Manual (button-tap) download queue. The BLE worker is single-op, so
+     * tapping Download on a second file while the first is still streaming
+     * used to be rejected by the worker ("another op in flight") and the
+     * row stuck forever. Instead we queue taps here and drain them strictly
+     * one-at-a-time — the next READ is issued only when the worker goes
+     * idle (from [pumpManualQueue], called on ReadDone / ListDone). Distinct
+     * from [syncQueue]: that's the auto-sync pass; this is explicit taps.
+     */
+    private val manualQueue = ArrayDeque<RemoteFile>()
+    /**
+     * True while a brief single-op command that isn't reflected in the UI
+     * state (DELETE, GET/SET log mode) is outstanding on the BLE worker.
+     * [pumpManualQueue] consults it so a Delete-then-Download or mode-toggle-
+     * then-Download double-tap doesn't issue a READ the worker would reject.
+     * Set when such a command is sent; cleared on its completion event or
+     * any Error (every op-termination path emits one), and on Disconnect.
+     */
+    private var briefOpInFlight = false
 
     /** Hook for [BleSyncService] to react to state transitions. */
     interface Listener {
@@ -92,6 +117,7 @@ object FileSyncCore {
         if (ble != null) return
         appContext = context.applicationContext
         syncDb = SyncDb.open(context.applicationContext)
+        publicMirror = PublicMirror(context.applicationContext)
         ble = BleClient(context.applicationContext)
         collectJob = scope.launch {
             ble!!.events.collect { onEvent(it) }
@@ -135,7 +161,57 @@ object FileSyncCore {
         ble?.send(BleCmd.List)
     }
 
+    /**
+     * Manual Download tap. Enqueues the file and drains the queue serially
+     * — the BLE worker is single-op, so two files can never be in flight at
+     * once. Tapping a second file while a big one streams now waits its
+     * turn instead of getting wedged.
+     */
     fun download(file: RemoteFile) {
+        // Already mirrored? Nothing to do (skip even queueing).
+        val offset = mirrorOffset(file.name, file.size)
+        if (file.size > 0 && offset >= file.size) {
+            log("${file.name} already mirrored (${file.size} B)")
+            return
+        }
+        // Dedupe: ignore a re-tap of a file that's already downloading or
+        // already queued.
+        if (_state.value.downloads.containsKey(file.name) ||
+            manualQueue.any { it.name == file.name }
+        ) {
+            return
+        }
+        manualQueue.addLast(file)
+        _state.update { it.copy(queuedDownloads = manualQueue.map { f -> f.name }) }
+        log("queued ${file.name} (${manualQueue.size} waiting)")
+        pumpManualQueue()
+    }
+
+    /**
+     * Issue the next queued manual download iff the worker is idle — no
+     * LIST, no READ (manual or sync) in flight, no firmware upload, and
+     * connected. Called after each tap and whenever an op completes
+     * ([BleEvent.ReadDone] / [BleEvent.ListDone]). The idle guard is what
+     * keeps downloads strictly serial and collision-free.
+     */
+    private fun pumpManualQueue() {
+        val s = _state.value
+        if (s.connection != Connection.Connected) return
+        if (s.listing || s.downloads.isNotEmpty() || syncInFlight != null ||
+            s.fwUpload != null || briefOpInFlight
+        ) return
+        val next = manualQueue.removeFirstOrNull() ?: return
+        _state.update { it.copy(queuedDownloads = manualQueue.map { f -> f.name }) }
+        startRead(next)
+    }
+
+    /**
+     * Actually start a READ: record the resume offset, show the progress
+     * row, send the command. Shared by the manual queue ([pumpManualQueue])
+     * and the auto-sync queue ([pumpSyncQueue]); callers guarantee the
+     * worker is idle, so this never collides.
+     */
+    private fun startRead(file: RemoteFile) {
         // Live-mirror: resume/grow from whatever is already on disk. The
         // firmware seeks to `offset`, so an interrupted file continues
         // and a grown log only fetches its new tail (desktop v0.0.14).
@@ -324,11 +400,12 @@ object FileSyncCore {
         }
         _state.update { it.copy(syncQueueRemaining = syncQueue.size) }
         syncInFlight = next.name
-        download(next)
+        startRead(next)
     }
 
     fun delete(file: RemoteFile) {
         _state.update { it.copy(deleteError = null) }  // clear stale rejection
+        briefOpInFlight = true
         log("DELETE ${file.name}")
         ble?.send(BleCmd.Delete(file.name))
     }
@@ -366,6 +443,7 @@ object FileSyncCore {
 
     /** Persist the box log-mode and remember it locally. */
     fun setLogMode(manual: Boolean) {
+        briefOpInFlight = true
         log("SET_MODE ${if (manual) "manual" else "auto"}")
         ble?.send(BleCmd.SetLogMode(manual))
     }
@@ -450,6 +528,9 @@ object FileSyncCore {
             is BleEvent.Status -> log(e.msg)
             is BleEvent.Error -> {
                 log("ERROR: ${e.msg}")
+                // Any op that ended in an error releases the brief-op guard
+                // (DELETE / mode-query aborts all surface here).
+                briefOpInFlight = false
                 // Surface DELETE rejections prominently — the box refuses
                 // some Debug rows (8.3-name miss -> NOT_FOUND, >15 chars
                 // -> BAD_REQUEST, logging active -> BUSY). Without this it
@@ -505,6 +586,9 @@ object FileSyncCore {
                         )
                     }
                 }
+                // A brief op (DELETE / mode) may have just freed the worker
+                // — let any queued manual download proceed.
+                pumpManualQueue()
             }
             is BleEvent.Discovered -> _state.update { s ->
                 if (s.discovered.any { it.address == e.address }) s
@@ -520,6 +604,7 @@ object FileSyncCore {
                 // Ask the box which log-mode it's in so the UI toggle
                 // reflects reality. Legacy PumpTsueri ignores 0x07 (no
                 // reply) — the toggle just stays at its last/unknown state.
+                briefOpInFlight = true
                 ble?.send(BleCmd.GetLogMode)
                 // Resume after an interrupted transfer (desktop v0.0.9):
                 // the aborted partial is already in the mirror, so a
@@ -572,7 +657,9 @@ object FileSyncCore {
                 // sparkline would falsely suggest the stream is still alive.
                 connectedBoxId = null
                 syncPending = false
+                briefOpInFlight = false
                 syncQueue.clear()
+                manualQueue.clear()
                 // Keep the "Keep synced" toggle + poll job alive across a
                 // disconnect — its tick guards on Connected, so it simply
                 // resumes after a reconnect (sets up Stage 3 auto-resume).
@@ -588,6 +675,7 @@ object FileSyncCore {
                         syncPassTotalBytes = 0,
                         syncPassCompletedBytes = 0,
                         downloads = emptyMap(),
+                        queuedDownloads = emptyList(),
                         live = LiveState(),
                         deleteError = null,
                     )
@@ -612,6 +700,8 @@ object FileSyncCore {
                     syncPending = false
                     runSyncDiff()
                 }
+                // Drain any downloads the user queued while the LIST ran.
+                pumpManualQueue()
             }
             is BleEvent.ReadStarted -> Unit
             is BleEvent.ReadProgress -> _state.update { s ->
@@ -649,6 +739,10 @@ object FileSyncCore {
                     }
                     pumpSyncQueue()
                 }
+                // Worker just freed up — start the next queued manual
+                // download (no-op if the sync pass above re-armed a READ,
+                // since the idle guard then fails).
+                pumpManualQueue()
             }
             is BleEvent.ReadAborted -> {
                 // Link dropped / stalled mid-file. Persist the partial
@@ -670,13 +764,16 @@ object FileSyncCore {
                 log("kept $have B of ${e.name} for resume")
             }
             is BleEvent.DeleteDone -> {
+                briefOpInFlight = false
                 _state.update { s ->
                     s.copy(files = s.files.filterNot { it.name == e.name },
                            deleteError = null)
                 }
                 log("deleted ${e.name}")
+                pumpManualQueue()
             }
             is BleEvent.LogMode -> {
+                briefOpInFlight = false
                 _state.update { it.copy(logModeManual = e.manual) }
                 // Mirror desktop's `autostart::sync_with_mode(manual)`:
                 // AUTO arms the schedule, MANUAL cancels it.
@@ -685,6 +782,7 @@ object FileSyncCore {
                     BackgroundSync.refresh(ctx)
                 }
                 log("box log mode: ${if (e.manual) "manual" else "auto"}")
+                pumpManualQueue()
             }
             is BleEvent.Sample -> onSample(e.sample)
             is BleEvent.FwUploadStarted -> {
@@ -774,6 +872,9 @@ object FileSyncCore {
         val len = f.length()
         if (len <= boxSize) return len
         f.delete()  // rotated/stale
+        // Keep the public Downloads mirror in lockstep: a re-pull starts
+        // from offset 0, so the old bytes there are stale too.
+        publicMirror?.delete(name)
         return 0L
     }
 
@@ -782,6 +883,11 @@ object FileSyncCore {
      * file length doesn't match `base` the resume is misaligned —
      * realign to `base` so we never interleave a corrupt prefix.
      * Returns (absolutePath, new local size).
+     *
+     * On success the same chunk is mirrored into the public Downloads
+     * folder via [PublicMirror] so Google Files / any external file
+     * manager can see and share it. That side-effect is best-effort:
+     * it can't fail in a way that breaks the canonical local write.
      */
     private fun appendMirror(name: String, base: Long, bytes: ByteArray): Pair<String, Long> {
         return try {
@@ -791,6 +897,7 @@ object FileSyncCore {
                 if (raf.length() != base) raf.setLength(base.coerceAtMost(raf.length()))
                 raf.seek(raf.length())
                 raf.write(bytes)
+                publicMirror?.appendAt(name, base, bytes)
                 Pair(f.absolutePath, raf.length())
             }
         } catch (ex: Exception) {

@@ -737,6 +737,7 @@ private fun FileRow(
     onDelete: (RemoteFile) -> Unit,
 ) {
     val progress = state.downloads[f.name]
+    val queued = f.name in state.queuedDownloads
     val savedPath = state.savedPaths[f.name]
     val deleteReason = deleteUnsupported(f.name)
     // Fully downloaded = local mirror has at least the box's reported
@@ -777,13 +778,21 @@ private fun FileRow(
                 } else {
                     OutlinedButton(
                         onClick = { onDownload(f) },
-                        enabled = progress == null,
-                    ) { Text(if (progress == null) "Download" else "…") }
+                        enabled = progress == null && !queued,
+                    ) {
+                        Text(
+                            when {
+                                progress != null -> "…"
+                                queued -> "Queued"
+                                else -> "Download"
+                            }
+                        )
+                    }
                 }
                 Spacer(Modifier.width(4.dp))
                 OutlinedButton(
                     onClick = { onDelete(f) },
-                    enabled = progress == null && deleteReason == null,
+                    enabled = progress == null && !queued && deleteReason == null,
                 ) { Text("Delete") }
             }
             if (deleteReason != null) {
