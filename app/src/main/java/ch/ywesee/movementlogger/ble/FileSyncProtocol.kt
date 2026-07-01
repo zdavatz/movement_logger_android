@@ -62,6 +62,19 @@ object FileSyncProtocol {
     /** FW_ABORT (no payload) — discard the staged image. Box replies 0x00. */
     const val OP_FW_ABORT: Byte = 0x0C
 
+    // GPS-bridge opcodes (u-blox UBX survey tunnelled over BLE, firmware
+    // v0.0.17+ `gps.c` GPS_BridgeSet / GPS_BridgeTx). The box relays raw UBX
+    // frames over the same FileCmd/FileData chars so the GPS Debug survey can
+    // poll the receiver without a cable. Legacy firmware silently ignores 0x0D
+    // → the survey simply shows "no NAV-PVT reply".
+    /** GPS_BRIDGE `<u8>` 1 = on / 0 = off. While on, the box forwards raw UBX
+     *  reply frames as FileData notifies; no FileData reply to the command
+     *  itself. Fire-and-forget. */
+    const val OP_GPS_BRIDGE: Byte = 0x0D
+    /** GPS_TX `[raw UBX bytes]` — forward the survey's UBX poll frames straight
+     *  to the u-blox UART. Replies arrive as bridged FileData notifies. */
+    const val OP_GPS_UBX: Byte = 0x0E
+
     // Status bytes returned in single-byte FileData notifies.
     const val STATUS_OK: Byte = 0x00
     const val STATUS_BUSY: Byte = 0xB0.toByte()
@@ -151,6 +164,17 @@ sealed class BleCmd {
      * `Uploading` op locally regardless of the box's reply.
      */
     data object AbortFirmware : BleCmd()
+    /**
+     * Start/stop the u-blox GPS bridge (0x0D). While on, the box relays raw UBX
+     * reply frames as FileData notifies for the GPS Debug survey; sending
+     * `on = false` also clears the local bridge routing flag.
+     */
+    data class GpsBridge(val on: Boolean) : BleCmd()
+    /** Forward one raw UBX poll frame to the u-blox over the bridge (0x0E). */
+    data class UbxPoll(val frame: ByteArray) : BleCmd() {
+        override fun equals(other: Any?): Boolean = other is UbxPoll && frame.contentEquals(other.frame)
+        override fun hashCode(): Int = frame.contentHashCode()
+    }
 }
 
 sealed class BleEvent {
@@ -212,4 +236,13 @@ sealed class BleEvent {
      * carries a human-readable failure reason in `message`.
      */
     data class FwUploadDone(val success: Boolean, val message: String) : BleEvent()
+    /**
+     * One raw u-blox UBX reply frame relayed by the box while the GPS bridge is
+     * active. Consumed by the GPS Debug survey; never touches the FileSync op
+     * state machine.
+     */
+    data class UbxFrame(val data: ByteArray) : BleEvent() {
+        override fun equals(other: Any?): Boolean = other is UbxFrame && data.contentEquals(other.data)
+        override fun hashCode(): Int = data.contentHashCode()
+    }
 }

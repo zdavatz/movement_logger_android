@@ -108,6 +108,11 @@ object FileSyncCore {
      */
     private var briefOpInFlight = false
 
+    /** True while a GPS Debug survey ([BleGpsSurvey]) owns the FileData channel
+     *  — the manual/sync loops back off so they don't collide with the UBX
+     *  bridge. Mirrors `BleGpsSurvey.running`. */
+    private var gpsSurveyActive = false
+
     /** Hook for [BleSyncService] to react to state transitions. */
     interface Listener {
         fun onStateChanged(state: FileSyncUiState)
@@ -119,6 +124,9 @@ object FileSyncCore {
         syncDb = SyncDb.open(context.applicationContext)
         publicMirror = PublicMirror(context.applicationContext)
         ble = BleClient(context.applicationContext)
+        // GPS Debug survey shares the one BleClient: gate the sync loops while
+        // it owns the FileData channel.
+        BleGpsSurvey.onRunningChanged = { running -> gpsSurveyActive = running }
         collectJob = scope.launch {
             ble!!.events.collect { onEvent(it) }
         }
@@ -198,7 +206,7 @@ object FileSyncCore {
         val s = _state.value
         if (s.connection != Connection.Connected) return
         if (s.listing || s.downloads.isNotEmpty() || syncInFlight != null ||
-            s.fwUpload != null || briefOpInFlight
+            s.fwUpload != null || briefOpInFlight || gpsSurveyActive
         ) return
         val next = manualQueue.removeFirstOrNull() ?: return
         _state.update { it.copy(queuedDownloads = manualQueue.map { f -> f.name }) }
@@ -268,7 +276,7 @@ object FileSyncCore {
                 // when the link returns, so nothing is lost.
                 if (s.keepSynced && s.connection == Connection.Connected &&
                     !s.listing && !s.syncing && s.downloads.isEmpty() &&
-                    syncInFlight == null && !s.transferInterrupted
+                    syncInFlight == null && !s.transferInterrupted && !gpsSurveyActive
                 ) {
                     startSyncPass("Keep synced")
                 }
@@ -652,6 +660,9 @@ object FileSyncCore {
                 }
             }
             BleEvent.Disconnected -> {
+                // A GPS Debug survey can't continue without the link — stop it
+                // so its files close cleanly and the poll loop stops firing.
+                if (gpsSurveyActive) BleGpsSurvey.stop()
                 // Drop the live-stream buffers too — the box may resume
                 // with a fresh timestamp axis on reconnect, and a stale
                 // sparkline would falsely suggest the stream is still alive.
@@ -809,8 +820,42 @@ object FileSyncCore {
                 }
                 log("FW upload ${if (e.success) "OK" else "FAILED"}: ${e.message}")
             }
+            is BleEvent.UbxFrame -> BleGpsSurvey.feed(e.data)
         }
         listener?.onStateChanged(_state.value)
+    }
+
+    // ---------------- GPS Debug survey ------------------------------------
+
+    /** Set the antenna/position label used in the CSV filenames + column. */
+    fun setGpsLabel(label: String) = BleGpsSurvey.setLabel(label)
+
+    /**
+     * Start the GPS Debug survey (u-blox UBX poll over the BLE bridge). Needs a
+     * connected, idle box — the survey and a FileSync READ can't share the
+     * FileData channel, so we refuse while anything else is in flight.
+     */
+    fun startGpsDebug(label: String) {
+        val s = _state.value
+        if (s.connection != Connection.Connected) { log("GPS Debug: connect a box first"); return }
+        if (s.listing || s.downloads.isNotEmpty() || syncInFlight != null ||
+            s.fwUpload != null || briefOpInFlight || s.transferInterrupted
+        ) { log("GPS Debug: box busy — wait for sync/downloads to finish"); return }
+        val ctx = appContext ?: run { log("GPS Debug: no context"); return }
+        log("GPS Debug survey started (label $label)")
+        BleGpsSurvey.start(
+            context = ctx,
+            label = label,
+            sendBridge = { on -> ble?.send(BleCmd.GpsBridge(on)) },
+            sendPoll = { frame -> ble?.send(BleCmd.UbxPoll(frame)) },
+        )
+    }
+
+    /** Stop the GPS Debug survey and turn the box bridge off. */
+    fun stopGpsDebug() {
+        if (!gpsSurveyActive) return
+        BleGpsSurvey.stop()
+        log("GPS Debug survey stopped")
     }
 
     /** First-sample box-timestamp; sparkline X axis is `(s.timestampMs - liveT0Ms) / 1000`. */

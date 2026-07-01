@@ -66,6 +66,10 @@ Once the video and both CSVs are picked, **Export combined** renders a single MP
 
 The Alignment card shows the row counts that fall inside the video window, so you can see at a glance how much of the session will be in the export (`trim → gps: 365 / 26914` etc.) before kicking it off.
 
+### GPS Debug
+
+Live u-blox UBX diagnostics tunnelled over the box's BLE link (no cable), for antenna selection + mounting. Connect the box on the Sync tab, then Start: the app bridges the receiver over BLE (firmware opcodes `0x0D`/`0x0E`), polls it once a second (NAV-PVT / NAV-DOP / NAV-SAT / NAV-SIG / MON-RF) and writes two CSVs — `<label>_gnss_epoch.csv` (fix quality: fixType, numSV, hAcc, DOP) and `<label>_gnss_signals.csv` (per-signal C/N0, elevation, azimuth, prRes) — under `Android/data/…/files/gps-debug/` and mirrored to `Download/MovementLogger/`, same schema as the desktop `gps-debug` tool, plus antenna/RF health (antStatus, AGC, jamming). Polling is non-destructive; the receiver is never persistently reconfigured. **Needs box firmware ≥ v0.0.18** (the GPS-bridge opcode + the MAX-M10S UBX-output fix); on older firmware it just shows "no NAV-PVT reply". (This is BLE-only — separate from the USB GNSS tab.)
+
 ## Build from source
 
 Requirements: JDK 17+, Android SDK with build-tools 34.0.0 and platforms 35.

@@ -158,6 +158,34 @@ The Done banner exposes an **Open video** button that fires `Intent.ACTION_VIEW`
 - **START_LOG no longer reboots / disconnects.** Current firmware (v0.0.7+) treats `0x05 START_LOG [<dur:u32-LE>]` as "open a session, auto-stop after dur seconds, stay connected" — only meaningful in **manual** mode (in auto the box already logs from boot). `FileSyncCore.startSession()` no longer queues a Disconnect and the banner text dropped the "rebooting" wording. The ~500 ms post-write settle is kept (write-without-response returns when queued, not transmitted). Legacy PumpTsueri rebooted on START_LOG; we no longer rely on that.
 - STOP_LOG button was removed from the UI (always-on firmware makes it a footgun); `vm.stopLog()` / `OP_STOP_LOG 0x04` plumbing is kept. It gracefully closes the active session; connection stays up.
 
+## GPS Debug tab — u-blox UBX survey over BLE
+
+Live u-blox diagnostics for antenna selection/mounting, bridged over the box's
+BLE link (no cable). BLE-only — separate from the USB GNSS tab (`usb/`), which
+is NMEA. Port of the desktop `gps-debug` survey. Files: `ble/Ubx.kt` (UBX
+parser + NAV/MON decoders + poll-frame builder), `ble/BleGpsSurvey.kt` (survey
+engine, CSV writer, `StateFlow`), `ui/BleGpsDebugScreen.kt` (the tab).
+
+- **Protocol.** Two firmware opcodes on the FileCmd char: `OP_GPS_BRIDGE 0x0D`
+  `<u8 on>` and `OP_GPS_UBX 0x0E` `<raw UBX>`. While the bridge is on the box
+  relays raw UBX reply frames back as **FileData notifies**. `BleClient` holds a
+  `bridgeActive` flag; when set, `onNotification` diverts FileData bytes to a new
+  `BleEvent.UbxFrame` **before** the `when(op)` state machine — the survey and a
+  FileSync READ can't share the FileData channel, so `FileSyncCore.startGpsDebug`
+  refuses while the worker is busy and gates keep-synced / the manual queue on
+  `gpsSurveyActive` (mirrors `BleGpsSurvey.running` via `onRunningChanged`).
+- **Survey loop.** `BleGpsSurvey` runs a 1 Hz coroutine: each tick flushes the
+  epoch collected over the last second (writes CSV rows + a live-summary line)
+  then re-sends the five poll frames. `feed()` (from `onEvent`) and the poll loop
+  share `parser`/`cur` under a `synchronized(lock)`.
+- **Output.** `<label>_gnss_epoch.csv` + `<label>_gnss_signals.csv` under
+  `getExternalFilesDir("gps-debug")`, mirrored to `Download/MovementLogger/` via
+  `PublicMirror`. Byte-identical schema to the desktop tool.
+- **Non-destructive.** Only zero-length polls are sent; the box enables UBX
+  output in the receiver's RAM layer only (reverts on power-cycle). Needs box
+  firmware ≥ v0.0.18 (bridge opcode + MAX-M10S UBX-output fix); older firmware
+  ignores 0x0D and the survey shows "no NAV-PVT reply".
+
 ## Numerics gotchas
 
 - `GpsMath.rollingMedianSimple` allocates a buffer of `w + 1` (not `w`) because a centred window at the array's middle covers `2·half + 1` elements — odd windows fit `w`, even windows need one more slot. Discovered the hard way; tests cover both parities now.

@@ -65,6 +65,14 @@ class BleClient(private val context: Context) {
     private var dataChar: BluetoothGattCharacteristic? = null
     private var streamChar: BluetoothGattCharacteristic? = null
     private var op: CurrentOp = CurrentOp.Idle
+
+    /**
+     * True while the u-blox GPS bridge (opcode 0x0D) is active. FileData
+     * notifies then carry raw UBX frames for the GPS Debug survey instead of
+     * FileSync payloads, so they bypass the [op] state machine. Only touched on
+     * the worker (send + onNotification both run there). Reset on disconnect.
+     */
+    private var bridgeActive: Boolean = false
     private var scanning: Boolean = false
     /** ATT MTU negotiated on connect (updated in [onMtuChanged]). Defaults
      *  to the BLE minimum until the box answers. Used to size FW_DATA
@@ -201,6 +209,8 @@ class BleClient(private val context: Context) {
             is BleCmd.SetTime -> sendSetTime(cmd.epochMs)
             is BleCmd.UploadFirmware -> startFirmwareUpload(cmd.image, cmd.sha256)
             BleCmd.AbortFirmware -> abortFirmwareUpload()
+            is BleCmd.GpsBridge -> sendGpsBridge(cmd.on)
+            is BleCmd.UbxPoll -> sendUbxPoll(cmd.frame)
         }
     }
 
@@ -324,6 +334,7 @@ class BleClient(private val context: Context) {
         streamAsm.clear()
         streamAsmNext = 0
         negotiatedMtu = DEFAULT_ATT_MTU
+        bridgeActive = false
         if (emitEvent) emit(BleEvent.Disconnected)
     }
 
@@ -360,6 +371,37 @@ class BleClient(private val context: Context) {
         if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_LIST))) return
         op = CurrentOp.Listing(StringBuilder(), now(), 0)
         emit(BleEvent.Status("LIST sent"))
+    }
+
+    /**
+     * Turn the u-blox GPS bridge on/off (opcode 0x0D). Fire-and-forget — the
+     * box sends no FileData reply to the command itself; UBX reply frames
+     * arrive later as bridged FileData notifies. Starting requires an idle op
+     * (the survey and a FileSync READ can't share the FileData channel).
+     */
+    private fun sendGpsBridge(on: Boolean) {
+        if (on && op !is CurrentOp.Idle) {
+            emitErr("another op is in flight — stop it before GPS Debug"); return
+        }
+        if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_GPS_BRIDGE, if (on) 1 else 0))) {
+            bridgeActive = false   // link gone → nothing is bridging anymore
+            return
+        }
+        bridgeActive = on
+        emit(BleEvent.Status(if (on) "GPS bridge on" else "GPS bridge off"))
+    }
+
+    /**
+     * Forward one raw UBX poll frame to the u-blox (opcode 0x0E). No-op unless
+     * the bridge is active. Poll frames are tiny (8 B) so a single
+     * write-without-response fits any negotiated MTU.
+     */
+    private fun sendUbxPoll(frame: ByteArray) {
+        if (!bridgeActive || frame.isEmpty()) return
+        val payload = ByteArray(1 + frame.size)
+        payload[0] = FileSyncProtocol.OP_GPS_UBX
+        System.arraycopy(frame, 0, payload, 1, frame.size)
+        writeCmdBytes(payload)
     }
 
     private fun sendRead(name: String, size: Long, offset: Long) {
@@ -706,6 +748,12 @@ class BleClient(private val context: Context) {
         // a LIST/READ at all, and with what bytes. Gated on [DEBUG_WIRE].
         if (DEBUG_WIRE) {
             Log.i(tag, "RX FileData len=${value.size} op=${op::class.simpleName} hex=${value.toHex()}")
+        }
+        // GPS-bridge mode: FileData notifies carry raw u-blox UBX frames, not
+        // FileSync payloads — divert them to the survey and never touch [op].
+        if (bridgeActive) {
+            emit(BleEvent.UbxFrame(value))
+            return
         }
         // FileData path — drive the in-flight op's state machine.
         when (val current = op) {
