@@ -241,6 +241,16 @@ private fun ReadoutGrid(s: LiveSample) {
                     s.gpsCourseCdeg.toDouble() / 100.0,
                 ),
             )
+            ReadoutRow("GPS C/N0",
+                if (s.gpsCn0Max > 0) "${s.gpsCn0Max} dB-Hz max" else "—",
+                when {
+                    s.gpsCn0Max == 0  -> "no GSV / no data"
+                    s.gpsCn0Max >= 40 -> "good antenna"
+                    s.gpsCn0Max >= 30 -> "ok"
+                    else              -> "weak signal"
+                },
+                "",
+            )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 LabelCell("Flags")
                 Row(Modifier.weight(3f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {

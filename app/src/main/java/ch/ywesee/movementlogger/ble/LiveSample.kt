@@ -36,6 +36,8 @@ data class LiveSample(
     val gpsFixQ: Int,
     /** Satellites used in the current fix. */
     val gpsNsat: Int,
+    /** Strongest satellite C/N0 in dB-Hz (from GSV); 0 = no data. Antenna-quality metric. */
+    val gpsCn0Max: Int,
     val gpsValid: Boolean,
     val loggingActive: Boolean,
     val lowBattery: Boolean,
@@ -122,6 +124,7 @@ data class LiveSample(
                 gpsCourseCdeg = bb.getShort(40),
                 gpsFixQ = bytes[42].toInt() and 0xFF,
                 gpsNsat = bytes[43].toInt() and 0xFF,
+                gpsCn0Max = bytes[45].toInt() and 0xFF,
                 gpsValid = flags and 0x01 != 0,
                 lowBattery = flags and 0x02 != 0,
                 loggingActive = flags and 0x04 != 0,
