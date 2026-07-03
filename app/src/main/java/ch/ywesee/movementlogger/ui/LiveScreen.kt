@@ -137,12 +137,46 @@ private fun LiveContent(
         }
 
         val ctx = LocalContext.current
+        // Refresh calibration values on every new sample — the background
+        // auto-calibration (FileSyncCore) updates prefs while we render.
         var magOffset by remember { mutableStateOf(AgentConfig.magOffset(ctx)) }
+        var headingBias by remember { mutableStateOf(AgentConfig.headingBiasDeg(ctx)) }
+        var nosePlusY by remember { mutableStateOf(AgentConfig.nosePlusY(ctx)) }
+        var lateralSign by remember { mutableStateOf(AgentConfig.lateralSign(ctx)) }
+        LaunchedEffect(sample) {
+            magOffset = AgentConfig.magOffset(ctx)
+            headingBias = AgentConfig.headingBiasDeg(ctx)
+        }
 
-        ReadoutGrid(sample, magOffset)
+        ReadoutGrid(sample, magOffset, headingBias)
 
         Spacer(Modifier.height(16.dp))
-        OrientationSection(sample, magOffset, onCalibrated = { magOffset = it })
+        OrientationSection(
+            s = sample,
+            magOffset = magOffset,
+            headingBias = headingBias,
+            nosePlusY = nosePlusY,
+            lateralSign = lateralSign,
+            onSetDirection = { bias ->
+                AgentConfig.setHeadingBias(ctx, bias)
+                headingBias = bias
+            },
+            onNoseConfirm = { v ->
+                AgentConfig.setNosePlusY(ctx, v)
+                nosePlusY = v
+            },
+            onLateralConfirm = { v ->
+                AgentConfig.setLateralSign(ctx, v)
+                lateralSign = v
+            },
+            onReset = {
+                AgentConfig.resetMagCalibration(ctx)
+                magOffset = null
+                headingBias = 0f
+                nosePlusY = null
+                lateralSign = null
+            },
+        )
 
         Spacer(Modifier.height(16.dp))
         Text("Acc magnitude (g)", fontWeight = FontWeight.SemiBold)
@@ -203,7 +237,7 @@ private fun FreshnessStrip(live: LiveState) {
 }
 
 @Composable
-private fun ReadoutGrid(s: LiveSample, magOffset: FloatArray?) {
+private fun ReadoutGrid(s: LiveSample, magOffset: FloatArray?, headingBias: Float) {
     val accG = { i: Int -> s.accMg[i] / 1000f }
     val gyroDps = { i: Int -> s.gyroCdps[i] / 100f }
     val presHpa = s.pressurePa / 100.0
@@ -229,7 +263,7 @@ private fun ReadoutGrid(s: LiveSample, magOffset: FloatArray?) {
             ReadoutRow("Angles (°)",
                 "Roll %+6.1f".format(s.rollDeg()),
                 "Pitch %+6.1f".format(s.pitchDeg()),
-                "Yaw %5.1f".format(s.headingDeg(magOffset)),
+                "Yaw %5.1f".format(normDeg(s.headingDeg(magOffset) - headingBias)),
             )
             ReadoutRow("Baro",
                 "%.2f hPa".format(presHpa),
@@ -304,73 +338,44 @@ private fun FlagChip(label: String, on: Boolean) {
     )
 }
 
+/** Wrap a degree value into [0, 360). */
+private fun normDeg(d: Double): Double {
+    var v = d % 360.0
+    if (v < 0) v += 360.0
+    return v
+}
+
 /**
- * "Box orientation" section — desktop v0.0.47 parity: calibrate button +
- * stored hard-iron offset + how-to text + the 3D wireframe. Calibration
- * collects per-axis mag min/max for 30 s while the user tumbles the box;
- * the midpoints become the offset (persisted via [AgentConfig]).
+ * "Box orientation" section — field-validated iOS design, ported 1:1:
+ * ONE "USB-C points SOUTH — set direction" tap (box flat), plus two
+ * one-time pose confirms (USB-C up / right side) that pin the discrete
+ * render signs, plus Reset. The hard-iron offset is learned silently in
+ * the background (FileSyncCore.autoCalibrate) with bias compensation.
  */
 @Composable
 private fun OrientationSection(
     s: LiveSample,
     magOffset: FloatArray?,
-    onCalibrated: (FloatArray) -> Unit,
+    headingBias: Float,
+    nosePlusY: Boolean?,
+    lateralSign: Float?,
+    onSetDirection: (Float) -> Unit,
+    onNoseConfirm: (Boolean) -> Unit,
+    onLateralConfirm: (Float) -> Unit,
+    onReset: () -> Unit,
 ) {
-    val ctx = LocalContext.current
-    var calUntilMs by remember { mutableStateOf<Long?>(null) }
-    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    val calMin = remember { floatArrayOf(Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE) }
-    val calMax = remember { floatArrayOf(-Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE) }
-
-    // Fold each new sample into the min/max envelope while calibrating.
-    // LiveSample holds arrays (reference equality), so every notify is a
-    // fresh instance and re-triggers this effect.
+    // Render heading is frozen while the box is tilted: vertical poses
+    // have no defined compass heading (the horizontal field projection
+    // collapses) and the preview used to spin on noise.
+    var lastFlatHeading by remember { mutableStateOf(0.0) }
     LaunchedEffect(s) {
-        if (calUntilMs != null) {
-            for (i in 0..2) {
-                val v = s.magMg[i].toFloat()
-                if (v < calMin[i]) calMin[i] = v
-                if (v > calMax[i]) calMax[i] = v
-            }
-        }
-    }
-    // Countdown + completion.
-    LaunchedEffect(calUntilMs) {
-        while (calUntilMs != null) {
-            nowMs = System.currentTimeMillis()
-            val until = calUntilMs ?: break
-            if (nowMs >= until) {
-                val off = FloatArray(3) { (calMin[it] + calMax[it]) / 2f }
-                AgentConfig.setMagOffset(ctx, off)
-                onCalibrated(off)
-                calUntilMs = null
-                break
-            }
-            delay(250)
+        if (kotlin.math.abs(s.accMg[2].toInt()) >= 600) {
+            lastFlatHeading = normDeg(s.headingDeg(magOffset) - headingBias)
         }
     }
 
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("Box orientation", fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.width(12.dp))
-        val until = calUntilMs
-        if (until != null) {
-            Text(
-                "calibrating — tumble the box… ${((until - nowMs).coerceAtLeast(0) + 999) / 1000}s",
-                color = Color(0xFFB58B00),
-                style = MaterialTheme.typography.bodyMedium,
-            )
-        } else {
-            OutlinedButton(onClick = {
-                for (i in 0..2) {
-                    calMin[i] = Float.MAX_VALUE
-                    calMax[i] = -Float.MAX_VALUE
-                }
-                calUntilMs = System.currentTimeMillis() + 30_000
-            }) { Text("Calibrate compass (30 s)") }
-        }
-    }
-    if (calUntilMs == null && magOffset != null) {
+    Text("Box orientation", fontWeight = FontWeight.SemiBold)
+    if (magOffset != null) {
         Text(
             "offset [%+.0f %+.0f %+.0f] mG".format(magOffset[0], magOffset[1], magOffset[2]),
             style = MaterialTheme.typography.bodySmall,
@@ -378,13 +383,48 @@ private fun OrientationSection(
         )
     }
     Spacer(Modifier.height(4.dp))
+
+    val flat = kotlin.math.abs(s.accMg[2].toInt()) >= 900
     Text(
-        "How to calibrate: tap the button, then rotate the box slowly flat on " +
-            "the table through one full circle — pause about 3 s per quarter " +
-            "turn (the box sends one sample every 2 s). Then briefly tip it on " +
-            "its nose and on its side. The offset is stored and survives " +
-            "restarts. Calibrate away from laptops, speakers and steel " +
-            "surfaces; re-calibrate if the arrow stops following the rotation.",
+        "Front of the box = USB-C connector end. Lay the box flat, USB-C " +
+            "end pointing SOUTH, then tap:",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Button(
+        onClick = { onSetDirection(normDeg(s.headingDeg(magOffset) - 180.0).toFloat()) },
+        enabled = flat,
+    ) { Text("USB-C points SOUTH — set direction") }
+
+    val upright = kotlin.math.abs(s.accMg[1].toInt()) >= 900
+    Text(
+        "Once, for tilt: stand the box upright, USB-C end UP, and tap:",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    OutlinedButton(
+        onClick = { onNoseConfirm(s.accMg[1].toInt() > 0) },
+        enabled = upright,
+    ) { Text("USB-C end is UP — confirm") }
+
+    val onSide = kotlin.math.abs(s.accMg[0].toInt()) >= 900
+    Text(
+        "Once, for side-tips: tip the box 90° onto its RIGHT side and tap:",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    OutlinedButton(
+        onClick = { onLateralConfirm(if (s.accMg[0].toInt() > 0) -1f else 1f) },
+        enabled = onSide,
+    ) { Text("Box is on its RIGHT side — confirm") }
+
+    OutlinedButton(onClick = onReset) { Text("Reset calibration") }
+
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "The magnetic offset is learned silently while the box moves. " +
+            "Preview is a fixed map, top = SOUTH. Keep away from laptops, " +
+            "speakers and steel surfaces; Reset wipes everything.",
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -392,23 +432,34 @@ private fun OrientationSection(
     OrientationBoxCanvas(
         pitchDeg = s.pitchDeg(),
         rollDeg = s.rollDeg(),
-        headingDeg = s.headingDeg(magOffset),
+        headingDeg = lastFlatHeading,
+        nosePlusY = nosePlusY ?: false,
+        lateralSign = lateralSign,
     )
 }
 
 /**
- * Wireframe cuboid rotated by the live eCompass angles — desktop
- * `draw_orientation_box` parity. Body frame is NED (x forward, y right,
- * z down) with the box's LONG side on body Y; rotation body->world is
- * Rz(yaw)·Ry(pitch)·Rx(roll), viewed from the south at ~28° elevation
- * (orthographic). Blue lid, green nose arrow, fixed N/E ground cross.
+ * Wireframe cuboid rotated by the live eCompass angles — final
+ * field-validated iOS design, ported 1:1. Fixed map view with screen-up
+ * = SOUTH (matches the calibration protocol), all four compass labels
+ * (N red), semi-transparent filled lid, nose arrow on the -y end, and
+ * the discrete render signs from the pose-confirm taps.
  */
 @Composable
-private fun OrientationBoxCanvas(pitchDeg: Double, rollDeg: Double, headingDeg: Double) {
+private fun OrientationBoxCanvas(
+    pitchDeg: Double,
+    rollDeg: Double,
+    headingDeg: Double,
+    nosePlusY: Boolean,
+    lateralSign: Float?,
+) {
     val textMeasurer = rememberTextMeasurer()
     val axisColor = MaterialTheme.colorScheme.outline
     val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
     val labelStyle = MaterialTheme.typography.bodyMedium.copy(color = labelColor)
+    val northStyle = MaterialTheme.typography.bodyMedium.copy(
+        color = Color(0xFFD32F2F), fontWeight = FontWeight.Bold,
+    )
     val sideColor = MaterialTheme.colorScheme.onSurfaceVariant
     val lidColor = Color(0xFF50B4FA)
     val noseColor = Color(0xFF43A047)
@@ -421,34 +472,51 @@ private fun OrientationBoxCanvas(pitchDeg: Double, rollDeg: Double, headingDeg: 
         val cy = size.height / 2f
         val scale = size.height / 3.2f
 
-        val sr = sin(Math.toRadians(rollDeg)).toFloat()
-        val cr = cos(Math.toRadians(rollDeg)).toFloat()
-        val sp = sin(Math.toRadians(pitchDeg)).toFloat()
-        val cp = cos(Math.toRadians(pitchDeg)).toFloat()
-        val sy = sin(Math.toRadians(headingDeg)).toFloat()
-        val cyw = cos(Math.toRadians(headingDeg)).toFloat()
+        // Front-end frame change (iOS parity): USB-C on body +Y renders in
+        // the 180-degree-rotated frame — roll negates; the lateral sign
+        // comes from the right-side confirm tap when present.
+        val pitchSign = lateralSign ?: (if (nosePlusY) -1f else 1f)
+        val pDeg = pitchSign * pitchDeg
+        val rDeg = if (nosePlusY) -rollDeg else rollDeg
+
+        // Baseline drawing sign flip (z-up sensor vs z-down NED math).
+        val sr = -sin(Math.toRadians(rDeg)).toFloat()
+        val cr = cos(Math.toRadians(rDeg)).toFloat()
+        val sp = -sin(Math.toRadians(pDeg)).toFloat()
+        val cp = cos(Math.toRadians(pDeg)).toFloat()
+        // +90: the eCompass yaw references the SHORT body axis; the shift
+        // makes the nose end's drawn azimuth equal the displayed heading.
+        val sy = sin(Math.toRadians(headingDeg + 90.0)).toFloat()
+        val cyw = cos(Math.toRadians(headingDeg + 90.0)).toFloat()
 
         // body -> world (NED): Rz(yaw) * Ry(pitch) * Rx(roll)
         fun rot(v: FloatArray): FloatArray {
-            var x = v[0]; var y = v[1]; var z = v[2]
+            val x = v[0]; val y = v[1]; val z = v[2]
             val y1 = y * cr - z * sr; val z1 = y * sr + z * cr   // Rx
             val x2 = x * cp + z1 * sp; val z2 = -x * sp + z1 * cp // Ry
             return floatArrayOf(x2 * cyw - y1 * sy, x2 * sy + y1 * cyw, z2) // Rz
         }
-        // Orthographic camera looking north from the south, 28° elevation.
+        // Fixed scene, screen-up = SOUTH: world rotated 180 degrees before
+        // the orthographic 28-degree-elevation projection.
         val el = Math.toRadians(28.0)
         val sel = sin(el).toFloat(); val cel = cos(el).toFloat()
-        fun project(w: FloatArray): Offset =
-            Offset(cx + w[1] * scale, cy - (w[0] * sel - w[2] * cel) * scale)
+        fun project(w: FloatArray): Offset {
+            val n = -w[0]; val e = -w[1]   // Rz(-180) view rotation
+            return Offset(cx + e * scale, cy - (n * sel - w[2] * cel) * scale)
+        }
         fun p3(v: FloatArray): Offset = project(rot(v))
 
-        // Fixed ground-plane compass cross (world frame).
+        // Ground-plane compass cross, all four labels (N red).
         drawLine(axisColor, project(floatArrayOf(1.35f, 0f, 0f)), project(floatArrayOf(-1.35f, 0f, 0f)), 2f)
         drawLine(axisColor, project(floatArrayOf(0f, 1.35f, 0f)), project(floatArrayOf(0f, -1.35f, 0f)), 2f)
         val n = project(floatArrayOf(1.5f, 0f, 0f))
         val e = project(floatArrayOf(0f, 1.5f, 0f))
-        drawText(textMeasurer, "N", topLeft = Offset(n.x - 6f, n.y - 20f), style = labelStyle)
-        drawText(textMeasurer, "E", topLeft = Offset(e.x + 4f, e.y - 10f), style = labelStyle)
+        val sPt = project(floatArrayOf(-1.5f, 0f, 0f))
+        val w = project(floatArrayOf(0f, -1.5f, 0f))
+        drawText(textMeasurer, "N", topLeft = Offset(n.x - 6f, n.y - 10f), style = northStyle)
+        drawText(textMeasurer, "E", topLeft = Offset(e.x - 6f, e.y - 10f), style = labelStyle)
+        drawText(textMeasurer, "S", topLeft = Offset(sPt.x - 6f, sPt.y - 10f), style = labelStyle)
+        drawText(textMeasurer, "W", topLeft = Offset(w.x - 6f, w.y - 10f), style = labelStyle)
 
         // Cuboid — long side is body Y. z down in NED: lid has z = -hz.
         val hx = 0.62f; val hy = 1.0f; val hz = 0.28f
@@ -462,12 +530,22 @@ private fun OrientationBoxCanvas(pitchDeg: Double, rollDeg: Double, headingDeg: 
         for ((a, b) in listOf(4 to 5, 5 to 6, 6 to 7, 7 to 4, 0 to 4, 1 to 5, 2 to 6, 3 to 7)) {
             drawLine(sideColor, pts[a], pts[b], 2.5f)
         }
+        // Semi-transparent lid fill — a bare wireframe is a Necker cube.
+        val lidPath = androidx.compose.ui.graphics.Path().apply {
+            moveTo(pts[0].x, pts[0].y)
+            lineTo(pts[1].x, pts[1].y)
+            lineTo(pts[2].x, pts[2].y)
+            lineTo(pts[3].x, pts[3].y)
+            close()
+        }
+        drawPath(lidPath, lidColor.copy(alpha = 0.25f))
         for ((a, b) in listOf(0 to 1, 1 to 2, 2 to 3, 3 to 0)) {
             drawLine(lidColor, pts[a], pts[b], 4f)
         }
-        // Nose arrow along the long (+y) end of the lid.
+        // Nose arrow: always the -y end — in the (possibly rotated) render
+        // frame that IS the user-confirmed front end.
         val lidC = p3(floatArrayOf(0f, 0f, -hz))
-        val nose = p3(floatArrayOf(0f, hy * 1.25f, -hz))
+        val nose = p3(floatArrayOf(0f, -hy * 1.25f, -hz))
         drawLine(noseColor, lidC, nose, 4f)
         val ang = atan2(nose.y - lidC.y, nose.x - lidC.x)
         val ah = 14f

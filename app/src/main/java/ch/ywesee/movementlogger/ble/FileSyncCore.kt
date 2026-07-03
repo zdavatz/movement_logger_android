@@ -861,7 +861,50 @@ object FileSyncCore {
     /** First-sample box-timestamp; sparkline X axis is `(s.timestampMs - liveT0Ms) / 1000`. */
     private var liveT0Ms: Long? = null
 
+    /**
+     * Sliding window of recent FLAT mag samples (x, y) for the silent
+     * background compass calibration — iOS FileSyncViewModel.autoCalibrate
+     * parity. A window, not a session envelope, so one motion spike cannot
+     * poison the spans forever. 64 samples @ 0.5 Hz = ~2 min = one rotation.
+     */
+    private val autoBuf = ArrayDeque<Pair<Float, Float>>()
+
+    private fun autoCalibrate(s: ch.ywesee.movementlogger.ble.LiveSample) {
+        val ctx = appContext ?: return
+        val ax = s.accMg[0].toInt(); val ay = s.accMg[1].toInt(); val az = s.accMg[2].toInt()
+        // Flat + still only: tilted samples expand the envelope
+        // asymmetrically and would drag the midpoint.
+        if (kotlin.math.abs(az) < 900 ||
+            kotlin.math.abs(ax) > 300 || kotlin.math.abs(ay) > 300) return
+        val mx = s.magMg[0].toFloat(); val my = s.magMg[1].toFloat()
+        if (kotlin.math.sqrt((mx * mx + my * my).toDouble()) >= 1500) return
+        autoBuf.addLast(mx to my)
+        while (autoBuf.size > 64) autoBuf.removeFirst()
+        if (autoBuf.size < 8) return
+        val xs = autoBuf.map { it.first }; val ys = autoBuf.map { it.second }
+        val minX = xs.min(); val maxX = xs.max()
+        val minY = ys.min(); val maxY = ys.max()
+        val spanX = maxX - minX; val spanY = maxY - minY
+        // Both spans must look like a full circle AND be similar.
+        if (spanX < 180 || spanY < 180) return
+        if (maxOf(spanX, spanY) / minOf(spanX, spanY) > 2.0f) return
+        val old = AgentConfig.magOffset(ctx)
+        val off = old?.copyOf() ?: FloatArray(3)
+        val nx = (maxX + minX) / 2f; val ny = (maxY + minY) / 2f
+        if (kotlin.math.abs(nx - off[0]) <= 10 && kotlin.math.abs(ny - off[1]) <= 10) return
+        // Fold the heading shift the new offset causes into the stored
+        // direction bias so a set direction stays valid (iOS parity).
+        val hOld = s.headingDeg(old)
+        off[0] = nx; off[1] = ny
+        val hNew = s.headingDeg(off)
+        var bias = (AgentConfig.headingBiasDeg(ctx) + (hNew - hOld)) % 360.0
+        if (bias < 0) bias += 360.0
+        AgentConfig.setHeadingBias(ctx, bias.toFloat())
+        AgentConfig.setMagOffset(ctx, off)
+    }
+
     private fun onSample(s: ch.ywesee.movementlogger.ble.LiveSample) {
+        autoCalibrate(s)
         val t0 = liveT0Ms ?: run { liveT0Ms = s.timestampMs; s.timestampMs }
         val dt = (s.timestampMs - t0) / 1000.0
         val accG = s.accMagnitudeG()

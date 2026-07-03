@@ -47,6 +47,15 @@ data class AgentConfig(
         private const val KEY_MAG_OFF_Y = "mag_off_y"
         private const val KEY_MAG_OFF_Z = "mag_off_z"
         private const val KEY_MAG_CALIBRATED = "mag_calibrated"
+        /** One-tap direction calibration (iOS parity): bias subtracted
+         *  from the heading; set via "USB-C points SOUTH". */
+        private const val KEY_HEADING_BIAS = "heading_bias_deg"
+        /** Which body-axis end is the FRONT (USB-C end): +Y or -Y. */
+        private const val KEY_NOSE_PLUS_Y = "nose_plus_y"
+        private const val KEY_NOSE_PLUS_Y_KNOWN = "nose_plus_y_known"
+        /** Lateral render sign from the right-side confirm tap (+1/-1). */
+        private const val KEY_LATERAL_SIGN = "lateral_sign"
+        private const val KEY_LATERAL_SIGN_KNOWN = "lateral_sign_known"
 
         fun prefs(context: Context): SharedPreferences =
             context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -90,6 +99,60 @@ data class AgentConfig(
                 .putFloat(KEY_MAG_OFF_X, off[0])
                 .putFloat(KEY_MAG_OFF_Y, off[1])
                 .putFloat(KEY_MAG_OFF_Z, off[2])
+                .apply()
+        }
+
+        fun headingBiasDeg(context: Context): Float =
+            prefs(context).getFloat(KEY_HEADING_BIAS, 0f)
+
+        fun setHeadingBias(context: Context, deg: Float) {
+            prefs(context).edit().putFloat(KEY_HEADING_BIAS, deg).apply()
+        }
+
+        fun nosePlusY(context: Context): Boolean? {
+            val p = prefs(context)
+            if (!p.getBoolean(KEY_NOSE_PLUS_Y_KNOWN, false)) return null
+            return p.getBoolean(KEY_NOSE_PLUS_Y, false)
+        }
+
+        fun setNosePlusY(context: Context, v: Boolean?) {
+            prefs(context).edit().apply {
+                if (v == null) {
+                    putBoolean(KEY_NOSE_PLUS_Y_KNOWN, false)
+                    remove(KEY_NOSE_PLUS_Y)
+                } else {
+                    putBoolean(KEY_NOSE_PLUS_Y_KNOWN, true)
+                    putBoolean(KEY_NOSE_PLUS_Y, v)
+                }
+            }.apply()
+        }
+
+        fun lateralSign(context: Context): Float? {
+            val p = prefs(context)
+            if (!p.getBoolean(KEY_LATERAL_SIGN_KNOWN, false)) return null
+            return p.getFloat(KEY_LATERAL_SIGN, 1f)
+        }
+
+        fun setLateralSign(context: Context, v: Float?) {
+            prefs(context).edit().apply {
+                if (v == null) {
+                    putBoolean(KEY_LATERAL_SIGN_KNOWN, false)
+                    remove(KEY_LATERAL_SIGN)
+                } else {
+                    putBoolean(KEY_LATERAL_SIGN_KNOWN, true)
+                    putFloat(KEY_LATERAL_SIGN, v)
+                }
+            }.apply()
+        }
+
+        /** Wipe the whole compass calibration (offset, direction, ends). */
+        fun resetMagCalibration(context: Context) {
+            prefs(context).edit()
+                .remove(KEY_MAG_CALIBRATED)
+                .remove(KEY_MAG_OFF_X).remove(KEY_MAG_OFF_Y).remove(KEY_MAG_OFF_Z)
+                .remove(KEY_HEADING_BIAS)
+                .remove(KEY_NOSE_PLUS_Y).remove(KEY_NOSE_PLUS_Y_KNOWN)
+                .remove(KEY_LATERAL_SIGN).remove(KEY_LATERAL_SIGN_KNOWN)
                 .apply()
         }
 
