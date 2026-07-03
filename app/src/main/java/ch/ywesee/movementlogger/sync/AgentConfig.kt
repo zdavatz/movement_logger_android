@@ -40,6 +40,13 @@ data class AgentConfig(
         /** Used to encode null logModeManual via a sentinel — SharedPrefs
          *  has no native tri-state Boolean. */
         private const val KEY_LOG_MODE_MANUAL_KNOWN = "log_mode_manual_known"
+        /** Magnetometer hard-iron offset (mG) from the Live tab's
+         *  "Calibrate compass" flow — desktop `mag_offset_mg` parity.
+         *  Subtracted from the raw mag before the eCompass heading. */
+        private const val KEY_MAG_OFF_X = "mag_off_x"
+        private const val KEY_MAG_OFF_Y = "mag_off_y"
+        private const val KEY_MAG_OFF_Z = "mag_off_z"
+        private const val KEY_MAG_CALIBRATED = "mag_calibrated"
 
         fun prefs(context: Context): SharedPreferences =
             context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -64,6 +71,26 @@ data class AgentConfig(
 
         fun setKeepSynced(context: Context, on: Boolean) {
             prefs(context).edit().putBoolean(KEY_KEEP_SYNCED, on).apply()
+        }
+
+        /** Stored hard-iron offset [x, y, z] in mG, or null if never calibrated. */
+        fun magOffset(context: Context): FloatArray? {
+            val p = prefs(context)
+            if (!p.getBoolean(KEY_MAG_CALIBRATED, false)) return null
+            return floatArrayOf(
+                p.getFloat(KEY_MAG_OFF_X, 0f),
+                p.getFloat(KEY_MAG_OFF_Y, 0f),
+                p.getFloat(KEY_MAG_OFF_Z, 0f),
+            )
+        }
+
+        fun setMagOffset(context: Context, off: FloatArray) {
+            prefs(context).edit()
+                .putBoolean(KEY_MAG_CALIBRATED, true)
+                .putFloat(KEY_MAG_OFF_X, off[0])
+                .putFloat(KEY_MAG_OFF_Y, off[1])
+                .putFloat(KEY_MAG_OFF_Z, off[2])
+                .apply()
         }
 
         fun setLogModeManual(context: Context, manual: Boolean?) {

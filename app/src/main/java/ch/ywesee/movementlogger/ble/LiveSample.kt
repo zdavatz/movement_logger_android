@@ -82,13 +82,16 @@ data class LiveSample(
      * onto the horizontal plane before taking atan2. Standard formula —
      * see e.g. ST AN4248.
      */
-    fun headingDeg(): Double {
+    fun headingDeg(magOffMg: FloatArray? = null): Double {
         val ax = accMg[0].toDouble()
         val ay = accMg[1].toDouble()
         val az = accMg[2].toDouble()
-        val mx = magMg[0].toDouble()
-        val my = magMg[1].toDouble()
-        val mz = magMg[2].toDouble()
+        // Hard-iron correction (Live tab "Calibrate compass"): a box-fixed
+        // magnetic bias bigger than the ~200 mG horizontal earth field
+        // otherwise pins the heading regardless of rotation.
+        val mx = magMg[0].toDouble() - (magOffMg?.get(0)?.toDouble() ?: 0.0)
+        val my = magMg[1].toDouble() - (magOffMg?.get(1)?.toDouble() ?: 0.0)
+        val mz = magMg[2].toDouble() - (magOffMg?.get(2)?.toDouble() ?: 0.0)
         val roll = kotlin.math.atan2(ay, az)
         val pitch = kotlin.math.atan2(-ax, kotlin.math.sqrt(ay * ay + az * az))
         val sR = kotlin.math.sin(roll); val cR = kotlin.math.cos(roll)
