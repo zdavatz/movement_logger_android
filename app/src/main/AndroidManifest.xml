@@ -41,6 +41,10 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
+    <!-- Reach GitHub Releases to check for / download a newer box firmware
+         image (FirmwareRelease → the "New box firmware" banner + FOTA flow). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <!-- USB host mode for the u-blox GNSS receiver plugged into the phone's

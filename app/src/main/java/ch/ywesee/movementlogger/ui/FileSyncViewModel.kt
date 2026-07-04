@@ -149,6 +149,14 @@ data class FileSyncUiState(
      *  rebooting…") or a mapped failure reason. Dismissable; cleared on a
      *  fresh upload or disconnect. */
     val fwUploadResult: FwUploadResult? = null,
+    /**
+     * A newer box firmware is available: `(version, downloadUrl)`. Set on
+     * connect once the GitHub latest release is compared against the box's
+     * GET_VERSION reply and found newer (or the box is legacy / unknown).
+     * Drives the "New box firmware vX.Y.Z available" banner + "Update box"
+     * button; null hides it. Cleared on tap, dismiss, and disconnect.
+     */
+    val firmwareUpdateAvailable: Pair<String, String>? = null,
 ) {
     /** Live cumulative bytes pulled in the current sync pass: completed
      *  files' final sizes + the in-flight file's `bytesDone`. Use this
@@ -217,6 +225,19 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
 
     fun abortFirmwareUpload() = FileSyncCore.abortFirmwareUpload()
     fun dismissFwUploadResult() = FileSyncCore.dismissFwUploadResult()
+
+    /**
+     * "Update box" tap on the firmware-update banner: download the newer
+     * `.bin` and run the existing FOTA upload with those bytes. Keeps the
+     * foreground service alive for the long upload, like every other BLE op.
+     */
+    fun applyFirmwareUpdate() {
+        BleSyncService.start(getApplication())
+        FileSyncCore.applyFirmwareUpdate()
+    }
+
+    /** ✕ on the firmware-update banner — dismiss without updating. */
+    fun dismissFirmwareUpdate() = FileSyncCore.dismissFirmwareUpdate()
 
     /** Re-seed the gyro+accel orientation filter (iOS `orientationFilter.reset()`
      *  in `resetMagCalibration`). Called from the Live tab's "Reset calibration". */

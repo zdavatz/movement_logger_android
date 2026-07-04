@@ -184,7 +184,7 @@ class BleClient(private val context: Context) {
         // [setTimeSettleUntil]). Connection-control + the time write itself
         // never wait — only the FileCmd ops the box would otherwise drop.
         when (cmd) {
-            BleCmd.List, BleCmd.GetLogMode,
+            BleCmd.List, BleCmd.GetLogMode, BleCmd.GetFirmwareVersion,
             is BleCmd.Read, is BleCmd.Delete, is BleCmd.SetLogMode,
             -> awaitCmdSettle()
             else -> Unit
@@ -206,6 +206,7 @@ class BleClient(private val context: Context) {
             is BleCmd.Delete -> sendDelete(cmd.name)
             is BleCmd.SetLogMode -> sendSetMode(cmd.manual)
             BleCmd.GetLogMode -> sendGetMode()
+            BleCmd.GetFirmwareVersion -> sendGetVersion()
             is BleCmd.SetTime -> sendSetTime(cmd.epochMs)
             is BleCmd.UploadFirmware -> startFirmwareUpload(cmd.image, cmd.sha256)
             BleCmd.AbortFirmware -> abortFirmwareUpload()
@@ -303,6 +304,12 @@ class BleClient(private val context: Context) {
             is CurrentOp.ModeReq -> emitErr(
                 "${if (o.isSet) "SET_MODE" else "GET_MODE"} aborted by disconnect"
             )
+            is CurrentOp.VersionReq -> {
+                // Link dropped mid-query — report "unknown" so the firmware
+                // check resolves (→ treated as "older than latest") instead
+                // of hanging for a reply that will never come.
+                emit(BleEvent.FirmwareVersion(null))
+            }
             is CurrentOp.Uploading -> {
                 // A disconnect right after COMMIT is the SUCCESS path: the
                 // box swapped banks and reset. Otherwise it's a real failure.
@@ -493,6 +500,24 @@ class BleClient(private val context: Context) {
         }
         if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_GET_MODE))) return
         op = CurrentOp.ModeReq(isSet = false, manual = false, lastProgress = now())
+    }
+
+    /**
+     * GET_VERSION `0x10`: query the box's firmware version. Exact twin of
+     * [sendGetMode] — self-guards on `op == Idle` (so it can't trample an
+     * in-flight LIST/READ; the reply is demuxed by [op]), writes the single
+     * opcode byte and parks a [CurrentOp.VersionReq]. The box answers with one
+     * FileData notify carrying the ASCII version (handled in
+     * [handleVersionNotify]). Legacy firmware (≤ v0.0.28) never replies →
+     * the watchdog emits `FirmwareVersion(null)`.
+     */
+    private fun sendGetVersion() {
+        if (op !is CurrentOp.Idle) {
+            emitErr("GET_VERSION rejected — another op in flight")
+            return
+        }
+        if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_GET_VERSION))) return
+        op = CurrentOp.VersionReq(lastProgress = now())
     }
 
     /**
@@ -762,6 +787,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Reading -> handleReadNotify(current, value)
             is CurrentOp.Deleting -> handleDeleteNotify(current, value)
             is CurrentOp.ModeReq -> handleModeNotify(current, value)
+            is CurrentOp.VersionReq -> handleVersionNotify(value)
             is CurrentOp.Uploading -> handleUploadNotify(current, value)
         }
     }
@@ -911,6 +937,18 @@ class BleClient(private val context: Context) {
             // GET_MODE reply: 0 = auto, 1 = manual.
             emit(BleEvent.LogMode(manual = b.toInt() != 0))
         }
+        op = CurrentOp.Idle
+    }
+
+    /**
+     * GET_VERSION reply: the box sends the ASCII firmware version string (no
+     * NUL), e.g. "0.0.29". Parse as UTF-8 and trim; an empty/garbled decode
+     * yields `null` so a bogus reply reads as "unknown" (→ update) rather than
+     * a made-up version. Mirrors the desktop `GettingVersion` demux.
+     */
+    private fun handleVersionNotify(value: ByteArray) {
+        val v = String(value, Charsets.UTF_8).trim()
+        emit(BleEvent.FirmwareVersion(if (v.isEmpty()) null else v))
         op = CurrentOp.Idle
     }
 
@@ -1195,6 +1233,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Reading -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.Deleting -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.ModeReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
+            is CurrentOp.VersionReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             // Uploading is handled by tickUploadWatchdog above (early return),
             // so it never reaches here — branch present only for exhaustiveness.
             is CurrentOp.Uploading -> false
@@ -1218,6 +1257,14 @@ class BleClient(private val context: Context) {
             is CurrentOp.ModeReq -> emitErr(
                 "${if (o.isSet) "SET_MODE" else "GET_MODE"} timed out — no reply for 20 s"
             )
+            is CurrentOp.VersionReq -> {
+                // Legacy firmware (≤ v0.0.28) never replies to GET_VERSION.
+                // Unlike GET_MODE we DO emit a terminal event — null — so the
+                // firmware-update check learns the box is legacy (→ offer
+                // update) instead of waiting forever. Never reconnect (the
+                // link is fine); op drops to Idle below.
+                emit(BleEvent.FirmwareVersion(null))
+            }
             is CurrentOp.Uploading -> Unit  // handled in tickUploadWatchdog; unreachable here
             CurrentOp.Idle -> Unit
         }
@@ -1362,6 +1409,10 @@ class BleClient(private val context: Context) {
             val manual: Boolean,
             var lastProgress: Long,
         ) : CurrentOp()
+        /** GET_VERSION (0x10): awaiting the one ASCII-version FileData reply.
+         *  Legacy firmware never answers → the watchdog resolves it to
+         *  `FirmwareVersion(null)`. */
+        data class VersionReq(var lastProgress: Long) : CurrentOp()
         /**
          * Firmware OTA upload (FW_BEGIN → FW_DATA… → FW_COMMIT). ACK-gated:
          * exactly one FW_* write is in flight at a time and we advance only

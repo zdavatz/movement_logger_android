@@ -5,6 +5,7 @@ import android.content.Context
 import ch.ywesee.movementlogger.data.PublicMirror
 import ch.ywesee.movementlogger.sync.AgentConfig
 import ch.ywesee.movementlogger.sync.BackgroundSync
+import ch.ywesee.movementlogger.sync.FirmwareRelease
 import ch.ywesee.movementlogger.ui.Connection
 import ch.ywesee.movementlogger.ui.DiscoveredDevice
 import ch.ywesee.movementlogger.ui.DownloadProgress
@@ -112,6 +113,20 @@ object FileSyncCore {
      *  — the manual/sync loops back off so they don't collide with the UBX
      *  bridge. Mirrors `BleGpsSurvey.running`. */
     private var gpsSurveyActive = false
+
+    // ---- Box firmware-update check (desktop `start_fw_check` peer) ----
+    // Two async halves land independently; [decideFirmwareUpdate] compares them
+    // once both are known. Kicked off on every connect.
+    /** Newest firmware release from GitHub `(version, downloadUrl)`, or null
+     *  if the fetch failed. Meaningful only once [fwLatestKnown]. */
+    private var fwLatest: FirmwareRelease.Latest? = null
+    /** The GitHub fetch has completed (success or failure). */
+    private var fwLatestKnown = false
+    /** The box's firmware version from GET_VERSION, or null (legacy/no reply/
+     *  link dropped mid-query). Meaningful only once [fwBoxKnown]. */
+    private var fwBoxVersion: String? = null
+    /** The box GET_VERSION query has resolved (reply, timeout, or disconnect). */
+    private var fwBoxKnown = false
 
     /** Hook for [BleSyncService] to react to state transitions. */
     interface Listener {
@@ -480,26 +495,170 @@ object FileSyncCore {
                 }
                 return@launch
             }
-            val sha = try {
-                java.security.MessageDigest.getInstance("SHA-256").digest(image)
-            } catch (ex: Exception) {
-                log("ERROR: SHA-256 $name: ${ex.message}")
+            startFirmwareUploadBytes(image, name)
+        }
+    }
+
+    /**
+     * Compute the SHA-256 of an in-memory firmware image and kick off the
+     * FW_BEGIN → FW_DATA… → FW_COMMIT upload. Shared by the SAF-picker path
+     * ([uploadFirmware]) and the auto-update path ([applyFirmwareUpdate], which
+     * feeds a downloaded `ByteArray` instead of a picked file). The BLE
+     * streaming itself is driven by the single-op [BleClient] state machine.
+     */
+    private fun startFirmwareUploadBytes(image: ByteArray, name: String) {
+        if (image.isEmpty()) {
+            _state.update {
+                it.copy(fwUploadResult = ch.ywesee.movementlogger.ui.FwUploadResult(
+                    false, "firmware image is empty"))
+            }
+            return
+        }
+        val sha = try {
+            java.security.MessageDigest.getInstance("SHA-256").digest(image)
+        } catch (ex: Exception) {
+            log("ERROR: SHA-256 $name: ${ex.message}")
+            _state.update {
+                it.copy(fwUploadResult = ch.ywesee.movementlogger.ui.FwUploadResult(
+                    false, "SHA-256 failed: ${ex.message}"))
+            }
+            return
+        }
+        // Optimistically show the card; FwUploadStarted confirms total.
+        _state.update {
+            it.copy(
+                fwUpload = ch.ywesee.movementlogger.ui.FwUploadState(name, 0, image.size.toLong()),
+                fwUploadResult = null,
+            )
+        }
+        log("FW upload $name (${image.size} B, sha256=${sha.joinToString("") { b -> "%02x".format(b) }.take(16)}…)")
+        ble?.send(BleCmd.UploadFirmware(image, sha))
+    }
+
+    // ---------------- Box firmware-update check ---------------------------
+    //
+    // Port of the desktop `start_fw_check` / `fw_maybe_decide` flow, but the
+    // Android UX shows a *banner* the user taps ("Update box"), never
+    // auto-flashes. Kicked off on every connect: the GitHub half fetches the
+    // latest release, the BLE half queries GET_VERSION, and
+    // [decideFirmwareUpdate] compares them once both land.
+
+    /**
+     * Begin a firmware-update check. Fetches the latest GitHub release (off
+     * thread) and queries the box's GET_VERSION when the BLE worker is idle
+     * (single-op — we wait out the connect-time GetLogMode/SetTime/LIST burst).
+     * Idempotent per connect; both halves feed [decideFirmwareUpdate].
+     */
+    private fun checkFirmwareUpdate() {
+        fwLatest = null
+        fwLatestKnown = false
+        fwBoxVersion = null
+        fwBoxKnown = false
+        _state.update { it.copy(firmwareUpdateAvailable = null) }
+        log("fw-check: querying box version + latest release")
+        // GitHub half — independent of BLE.
+        scope.launch {
+            val res = FirmwareRelease.fetchLatest()
+            fwLatest = res
+            fwLatestKnown = true
+            if (res == null) log("fw-check: couldn't reach GitHub")
+            else log("fw-check: latest release v${res.version}")
+            decideFirmwareUpdate()
+        }
+        // Box half — GET_VERSION over BLE, but only once the worker is idle so
+        // it can't collide with the connect-time queries / initial sync.
+        scope.launch {
+            val deadline = System.currentTimeMillis() + FW_VERSION_QUERY_WINDOW_MS
+            while (System.currentTimeMillis() < deadline) {
+                val s = _state.value
+                if (s.connection != Connection.Connected) {
+                    // Disconnected before we could ask — resolve as unknown so
+                    // the GitHub half doesn't wait forever.
+                    fwBoxVersion = null
+                    fwBoxKnown = true
+                    decideFirmwareUpdate()
+                    return@launch
+                }
+                if (workerIdleForBriefOp(s)) {
+                    briefOpInFlight = true
+                    ble?.send(BleCmd.GetFirmwareVersion)
+                    return@launch
+                }
+                kotlinx.coroutines.delay(500)
+            }
+            // Never went idle in the window (a long sync is running). The
+            // GET_VERSION reply from a later idle moment would still be
+            // demuxed, but resolve now so the banner can appear against the
+            // "unknown → offer update" fallback.
+            if (!fwBoxKnown) {
+                fwBoxVersion = null
+                fwBoxKnown = true
+                decideFirmwareUpdate()
+            }
+        }
+    }
+
+    /** True when the single-op BLE worker is idle enough to accept a brief
+     *  query (GET_VERSION). Mirrors the [pumpManualQueue] idle guard. */
+    private fun workerIdleForBriefOp(s: FileSyncUiState): Boolean =
+        s.connection == Connection.Connected && !s.listing && !s.syncing &&
+            s.downloads.isEmpty() && syncInFlight == null && s.fwUpload == null &&
+            !briefOpInFlight && !s.transferInterrupted && !gpsSurveyActive
+
+    /**
+     * Once BOTH halves are known, compare and set/clear the banner state.
+     * `latest > box`, or the box version is null/unparseable (legacy/unknown)
+     * → offer the update. Mirrors the desktop `fw_maybe_decide` decision, minus
+     * the auto-flash (Android shows the banner and waits for a tap).
+     */
+    private fun decideFirmwareUpdate() {
+        if (!fwLatestKnown || !fwBoxKnown) return  // still waiting for one half
+        val latest = fwLatest ?: return  // GitHub fetch failed → no banner
+        val latestParsed = FirmwareRelease.parseVersion(latest.version) ?: return
+        val boxParsed = fwBoxVersion?.let { FirmwareRelease.parseVersion(it) }
+        val needsUpdate = when {
+            fwBoxVersion == null -> true   // legacy / no reply → offer update
+            boxParsed == null -> true      // unparseable box version → treat as older
+            else -> FirmwareRelease.compareVersions(latestParsed, boxParsed) > 0
+        }
+        if (needsUpdate) {
+            _state.update {
+                it.copy(firmwareUpdateAvailable = latest.version to latest.downloadUrl)
+            }
+            log("fw-check: box=${fwBoxVersion ?: "unknown"} latest=v${latest.version} → update available")
+        } else {
+            _state.update { it.copy(firmwareUpdateAvailable = null) }
+            log("fw-check: box up to date (latest v${latest.version})")
+        }
+    }
+
+    /**
+     * "Update box" banner tap: download the newer `.bin` off-thread and run
+     * the existing FOTA upload with those bytes, then clear the banner.
+     */
+    fun applyFirmwareUpdate() {
+        val avail = _state.value.firmwareUpdateAvailable ?: return
+        val (ver, url) = avail
+        _state.update { it.copy(firmwareUpdateAvailable = null) }
+        log("fw-update: downloading firmware v$ver…")
+        scope.launch {
+            val image = FirmwareRelease.download(url)
+            if (image == null || image.isEmpty()) {
                 _state.update {
                     it.copy(fwUploadResult = ch.ywesee.movementlogger.ui.FwUploadResult(
-                        false, "SHA-256 failed: ${ex.message}"))
+                        false, "couldn't download firmware v$ver"))
                 }
+                log("fw-update: download failed")
                 return@launch
             }
-            // Optimistically show the card; FwUploadStarted confirms total.
-            _state.update {
-                it.copy(
-                    fwUpload = ch.ywesee.movementlogger.ui.FwUploadState(name, 0, image.size.toLong()),
-                    fwUploadResult = null,
-                )
-            }
-            log("FW upload $name (${image.size} B, sha256=${sha.joinToString("") { b -> "%02x".format(b) }.take(16)}…)")
-            ble?.send(BleCmd.UploadFirmware(image, sha))
+            log("fw-update: downloaded ${image.size} B — starting upload")
+            startFirmwareUploadBytes(image, "firmware-v$ver.bin")
         }
+    }
+
+    /** ✕ on the firmware-update banner — dismiss without updating. */
+    fun dismissFirmwareUpdate() {
+        _state.update { it.copy(firmwareUpdateAvailable = null) }
     }
 
     /** Cancel an in-flight firmware upload (best-effort FW_ABORT). */
@@ -614,6 +773,11 @@ object FileSyncCore {
                 // reply) — the toggle just stays at its last/unknown state.
                 briefOpInFlight = true
                 ble?.send(BleCmd.GetLogMode)
+                // Firmware-update check: fetch the latest GitHub release and
+                // query the box's GET_VERSION (once the worker is idle), then
+                // surface the "New box firmware" banner if the box is behind.
+                // Independent of resume/keep-synced — runs on every connect.
+                checkFirmwareUpdate()
                 // Resume after an interrupted transfer (desktop v0.0.9):
                 // the aborted partial is already in the mirror, so a
                 // fresh sync pass skips every complete file and re-pulls
@@ -671,6 +835,13 @@ object FileSyncCore {
                 briefOpInFlight = false
                 syncQueue.clear()
                 manualQueue.clear()
+                // Reset the firmware-update check; it re-runs on the next
+                // connect. A partially-resolved check (one half landed) must
+                // not carry a stale banner across a reconnect.
+                fwLatest = null
+                fwLatestKnown = false
+                fwBoxVersion = null
+                fwBoxKnown = false
                 // Keep the "Keep synced" toggle + poll job alive across a
                 // disconnect — its tick guards on Connected, so it simply
                 // resumes after a reconnect (sets up Stage 3 auto-resume).
@@ -689,6 +860,7 @@ object FileSyncCore {
                         queuedDownloads = emptyList(),
                         live = LiveState(),
                         deleteError = null,
+                        firmwareUpdateAvailable = null,
                     )
                 }
                 liveT0Ms = null
@@ -793,6 +965,17 @@ object FileSyncCore {
                     BackgroundSync.refresh(ctx)
                 }
                 log("box log mode: ${if (e.manual) "manual" else "auto"}")
+                pumpManualQueue()
+            }
+            is BleEvent.FirmwareVersion -> {
+                // GET_VERSION resolved (reply, timeout, or mid-query drop).
+                // Release the brief-op guard like GET_MODE, record the box
+                // side, and re-run the compare-against-latest decision.
+                briefOpInFlight = false
+                fwBoxVersion = e.version
+                fwBoxKnown = true
+                log("box firmware version: ${e.version ?: "unknown (legacy / no reply)"}")
+                decideFirmwareUpdate()
                 pumpManualQueue()
             }
             is BleEvent.Sample -> onSample(e.sample)
@@ -1070,6 +1253,12 @@ object FileSyncCore {
 
     /** "Keep synced" idle poll interval (desktop SYNC_POLL_INTERVAL). */
     private const val SYNC_POLL_INTERVAL_MS = 30_000L
+    /** How long after connect we keep waiting for the BLE worker to go idle
+     *  before firing the GET_VERSION query for the firmware-update check. Long
+     *  enough to clear the connect-time GetLogMode/SetTime/LIST burst; if a big
+     *  sync keeps the worker busy past this, the check resolves the box side as
+     *  "unknown" (→ offer update against the latest release). */
+    private const val FW_VERSION_QUERY_WINDOW_MS = 20_000L
     private const val MAX_LOG_LINES = 200
     /** Rotate the on-disk log past this size (1 MiB ≈ tens of sessions). */
     private const val MAX_LOG_FILE_BYTES = 1L * 1024 * 1024

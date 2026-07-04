@@ -191,6 +191,21 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                     FwUploadResultBanner(res) { vm.dismissFwUploadResult() }
                 }
 
+                // "New box firmware" banner — shown when connected and the box
+                // is behind the latest GitHub release (or legacy/unknown).
+                // "Update box" downloads the .bin and runs the FOTA flow.
+                state.firmwareUpdateAvailable?.let { (version, _) ->
+                    if (state.connection == Connection.Connected) {
+                        Spacer(Modifier.height(8.dp))
+                        FirmwareUpdateBanner(
+                            version = version,
+                            busy = state.fwUpload != null,
+                            onUpdate = vm::applyFirmwareUpdate,
+                            onDismiss = vm::dismissFirmwareUpdate,
+                        )
+                    }
+                }
+
                 if (state.transferInterrupted && state.connection != Connection.Connected) {
                     Spacer(Modifier.height(8.dp))
                     TransferInterruptedBanner()
@@ -896,6 +911,43 @@ private fun TransferInterruptedBanner() {
             style = MaterialTheme.typography.bodySmall,
             color = Color(0xFF8C5A00),
         )
+    }
+}
+
+/**
+ * "New box firmware available" banner. Shown when connected and the box's
+ * firmware is behind the latest GitHub release (or the box is legacy / didn't
+ * report a version). "Update box" downloads the `.bin` and runs the existing
+ * FOTA upload; ✕ dismisses. Info-blue to read as an offer, not an error.
+ */
+@Composable
+private fun FirmwareUpdateBanner(
+    version: String,
+    busy: Boolean,
+    onUpdate: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F0FB)),
+        border = BorderStroke(1.dp, Color(0xFF3B82C4)),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "🔄 New box firmware v$version available",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF14486E),
+            )
+            Button(onClick = onUpdate, enabled = !busy) {
+                Text(if (busy) "Updating…" else "Update box")
+            }
+            Spacer(Modifier.width(4.dp))
+            TextButton(onClick = onDismiss) { Text("✕") }
+        }
     }
 }
 

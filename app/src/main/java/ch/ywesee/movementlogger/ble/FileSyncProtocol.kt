@@ -46,6 +46,18 @@ object FileSyncProtocol {
      */
     const val OP_SET_TIME: Byte = 0x08
 
+    /**
+     * GET_VERSION (firmware v0.0.29+): host writes the single byte `0x10`; the
+     * box replies with ONE FileData notification whose bytes are the ASCII
+     * firmware version, e.g. `"0.0.29"` (no NUL terminator). Parse UTF-8 + trim.
+     * Exactly the send+reply shape of GET_MODE (0x07). Legacy firmware
+     * (≤ v0.0.28) doesn't know 0x10 and sends NO reply → the query times out
+     * (same 20 s [CurrentOp] bound as GET_MODE) and is reported as `null`
+     * (unknown) — the caller treats "unknown" as "older than latest → offer
+     * update".
+     */
+    const val OP_GET_VERSION: Byte = 0x10
+
     // Firmware-update (OTA) opcodes (firmware v0.0.x+). The box stages a new
     // image into the inactive flash bank, then verifies + swaps + resets on
     // COMMIT. Single-in-flight through the same worker state machine as READ
@@ -141,6 +153,12 @@ sealed class BleCmd {
     /** Query the box's current log-mode; reply arrives as [BleEvent.LogMode]. */
     data object GetLogMode : BleCmd()
     /**
+     * Query the box's firmware version (GET_VERSION 0x10). Reply arrives as
+     * [BleEvent.FirmwareVersion]. Legacy firmware that ignores 0x10 sends no
+     * reply → the op times out and emits `FirmwareVersion(null)`.
+     */
+    data object GetFirmwareVersion : BleCmd()
+    /**
      * Push the phone's current wall-clock millis to the box so it stamps a
      * time-sync anchor into the open Sens/Gps CSVs. Fire-and-forget — no
      * tracked reply (so legacy firmware that ignores 0x08 never stalls us).
@@ -219,6 +237,14 @@ sealed class BleEvent {
      * (idle until START_LOG).
      */
     data class LogMode(val manual: Boolean) : BleEvent()
+    /**
+     * The box's firmware version from a GET_VERSION (0x10) reply. `version`
+     * is the ASCII string the box sent (e.g. "0.0.29"), or `null` when the
+     * box never answered (legacy firmware ≤ v0.0.28 → op timed out, or the
+     * link dropped mid-query). The firmware-update check treats `null` as
+     * "older than the latest release → offer an update".
+     */
+    data class FirmwareVersion(val version: String?) : BleEvent()
     data class Error(val msg: String) : BleEvent()
     /**
      * One decoded SensorStream snapshot (0.5 Hz). Only emitted while
