@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import ch.ywesee.movementlogger.ble.BleSyncService
 import ch.ywesee.movementlogger.ble.FileSyncCore
 import ch.ywesee.movementlogger.ble.LiveSample
+import ch.ywesee.movementlogger.ble.OriRows
 import kotlinx.coroutines.flow.StateFlow
 
 data class DiscoveredDevice(val address: String, val name: String, val rssi: Int)
@@ -71,6 +72,10 @@ data class LiveState(
     /** True iff the connected firmware exposed the SensorStream char.
      *  Surfaced in the UI so the user knows whether to expect live data. */
     val streamCapable: Boolean = false,
+    /** Latest body-frame world axes from the gyro+accel [OrientationFilter]
+     *  (iOS parity) — the source for the 3D orientation preview, independent
+     *  of the magnetometer. Null until the filter has seeded. */
+    val oriRows: OriRows? = null,
 )
 
 data class FileSyncUiState(
@@ -212,4 +217,8 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
 
     fun abortFirmwareUpload() = FileSyncCore.abortFirmwareUpload()
     fun dismissFwUploadResult() = FileSyncCore.dismissFwUploadResult()
+
+    /** Re-seed the gyro+accel orientation filter (iOS `orientationFilter.reset()`
+     *  in `resetMagCalibration`). Called from the Live tab's "Reset calibration". */
+    fun resetOrientationFilter() = FileSyncCore.resetOrientationFilter()
 }

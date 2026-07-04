@@ -861,6 +861,11 @@ object FileSyncCore {
     /** First-sample box-timestamp; sparkline X axis is `(s.timestampMs - liveT0Ms) / 1000`. */
     private var liveT0Ms: Long? = null
 
+    /** Gyro+accel attitude filter (iOS parity) — drives the 3D orientation
+     *  preview instead of the magnetometer. Fed every sample in [onSample];
+     *  its latest rows are published into [LiveState.oriRows]. */
+    private val orientationFilter = OrientationFilter()
+
     /**
      * Sliding window of recent FLAT mag samples (x, y) for the silent
      * background compass calibration — iOS FileSyncViewModel.autoCalibrate
@@ -892,19 +897,33 @@ object FileSyncCore {
         val off = old?.copyOf() ?: FloatArray(3)
         val nx = (maxX + minX) / 2f; val ny = (maxY + minY) / 2f
         if (kotlin.math.abs(nx - off[0]) <= 10 && kotlin.math.abs(ny - off[1]) <= 10) return
-        // Fold the heading shift the new offset causes into the stored
-        // direction bias so a set direction stays valid (iOS parity).
-        val hOld = s.headingDeg(old)
         off[0] = nx; off[1] = ny
-        val hNew = s.headingDeg(off)
-        var bias = (AgentConfig.headingBiasDeg(ctx) + (hNew - hOld)) % 360.0
-        if (bias < 0) bias += 360.0
-        AgentConfig.setHeadingBias(ctx, bias.toFloat())
+        // The offset only SEEDS the gyro filter's initial heading now; the
+        // preview no longer depends on the magnetometer, so an offset change
+        // must NOT touch the render bias (owned by set-direction, carried by
+        // the gyro) — iOS FileSyncViewModel.autoCalibrate parity.
         AgentConfig.setMagOffset(ctx, off)
+    }
+
+    /** Re-seed the gyro+accel orientation filter and drop the published rows
+     *  (iOS `orientationFilter.reset(); oriRows = nil` in resetMagCalibration).
+     *  The learned gyro bias is kept; the attitude re-seeds on the next sample. */
+    fun resetOrientationFilter() {
+        orientationFilter.reset()
+        _state.update { it.copy(live = it.live.copy(oriRows = null)) }
     }
 
     private fun onSample(s: ch.ywesee.movementlogger.ble.LiveSample) {
         autoCalibrate(s)
+        // Gyro+accel attitude for the 3D preview (mag-independent). The mag
+        // offset only seeds the filter's initial heading (iOS parity).
+        val magOff = appContext?.let { c ->
+            AgentConfig.magOffset(c)?.let {
+                doubleArrayOf(it[0].toDouble(), it[1].toDouble(), it[2].toDouble())
+            }
+        }
+        orientationFilter.update(s, magOff)
+        val ori = orientationFilter.rows
         val t0 = liveT0Ms ?: run { liveT0Ms = s.timestampMs; s.timestampMs }
         val dt = (s.timestampMs - t0) / 1000.0
         val accG = s.accMagnitudeG()
@@ -920,6 +939,7 @@ object FileSyncCore {
                     accHistory = acc,
                     pressureHistory = pres,
                     streamCapable = true,
+                    oriRows = ori,
                 )
             )
         }
