@@ -979,6 +979,12 @@ object FileSyncCore {
                 pumpManualQueue()
             }
             is BleEvent.Sample -> onSample(e.sample)
+            is BleEvent.Battery -> _state.update {
+                it.copy(live = it.live.copy(
+                    latestBattery = e.sample,
+                    latestBatteryAtMs = System.currentTimeMillis(),
+                ))
+            }
             is BleEvent.FwUploadStarted -> {
                 _state.update { s ->
                     val cur = s.fwUpload

@@ -145,6 +145,46 @@ data class LiveSample(
 }
 
 /**
+ * One decoded BatteryStatus snapshot — the box's dedicated …0200…
+ * characteristic (STC3115 fuel gauge). 8-byte LE packed layout. Its flags
+ * byte is NOT LiveSample's: bit0 = low_batt (SoC < 10 %), bit1 = logging,
+ * byte 7 reserved. Byte-identical to desktop `ble.rs` BatterySample.
+ */
+data class BatterySample(
+    val voltageMv: Int,       // pack voltage, mV
+    val socX10: Int,          // state-of-charge ×10 (÷10 for %)
+    val currentX100uA: Int,   // signed 100 µA steps (+ charging / − draining)
+    val lowBatt: Boolean,     // firmware low-battery warning (SoC < 10 %)
+    val logging: Boolean,     // box actively logging to SD
+) {
+    /** SoC as a 0..1 fraction for a progress bar. */
+    fun socFrac(): Float = (socX10 / 10f / 100f).coerceIn(0f, 1f)
+    /** SoC as whole percent (rounded), matching desktop soc_pct(). */
+    fun socPct(): Int = (socX10 + 5) / 10
+    fun volts(): Float = voltageMv / 1000f
+    /** Current in amps (signed: + charging, − draining). */
+    fun amps(): Float = currentX100uA / 10_000f
+
+    companion object {
+        const val WIRE_SIZE = 8
+        /** Decode the fixed 8-byte LE payload. Single-notify only (8 B is well
+         *  under any MTU) — no chunk reassembly, unlike LiveSample. */
+        fun parse(bytes: ByteArray): BatterySample? {
+            if (bytes.size != WIRE_SIZE) return null
+            val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            val flags = bytes[6].toInt() and 0xFF
+            return BatterySample(
+                voltageMv = bb.getShort(0).toInt() and 0xFFFF,   // u16
+                socX10 = bb.getShort(2).toInt() and 0xFFFF,      // u16
+                currentX100uA = bb.getShort(4).toInt(),          // signed i16 — no mask
+                lowBatt = flags and 0x01 != 0,
+                logging = flags and 0x02 != 0,
+            )
+        }
+    }
+}
+
+/**
  * Body-frame world axes (n, e, d) — the render rows, produced by the
  * gyro+accel [OrientationFilter] below instead of the magnetometer.
  *

@@ -64,6 +64,7 @@ class BleClient(private val context: Context) {
     private var cmdChar: BluetoothGattCharacteristic? = null
     private var dataChar: BluetoothGattCharacteristic? = null
     private var streamChar: BluetoothGattCharacteristic? = null
+    private var batteryChar: BluetoothGattCharacteristic? = null
     private var op: CurrentOp = CurrentOp.Idle
 
     /**
@@ -338,6 +339,7 @@ class BleClient(private val context: Context) {
         cmdChar = null
         dataChar = null
         streamChar = null
+        batteryChar = null
         streamAsm.clear()
         streamAsmNext = 0
         negotiatedMtu = DEFAULT_ATT_MTU
@@ -572,6 +574,7 @@ class BleClient(private val context: Context) {
             is RawEvent.Notification -> onNotification(raw.charUuid, raw.value)
             RawEvent.Tick -> tickWatchdog()
             is RawEvent.DescriptorWritten -> onDescriptorWritten(raw.charUuid, raw.status)
+            is RawEvent.CharacteristicRead -> onCharacteristicRead(raw.charUuid, raw.value, raw.status)
             is RawEvent.MtuChanged -> onMtuChanged(raw.mtu, raw.status)
         }
     }
@@ -598,15 +601,13 @@ class BleClient(private val context: Context) {
                 if (s != null) {
                     Log.i(tag, "FileData CCCD done — chaining SensorStream subscribe")
                     if (!subscribeAndWriteCccd(s)) {
-                        // Soft-fail: log and proceed with Connected.
+                        // Soft-fail: log and chain to the BatteryStatus subscribe.
                         emit(BleEvent.Status("SensorStream subscribe failed — Live tab will be empty"))
-                        op = CurrentOp.Idle
-                        emitConnected()
+                        subscribeBatteryOrConnect()
                     }
                 } else {
-                    Log.i(tag, "no SensorStream char — emitting Connected without it")
-                    op = CurrentOp.Idle
-                    emitConnected()
+                    Log.i(tag, "no SensorStream char — chaining BatteryStatus subscribe")
+                    subscribeBatteryOrConnect()
                 }
             }
             FileSyncProtocol.STREAM_UUID -> {
@@ -615,9 +616,70 @@ class BleClient(private val context: Context) {
                 } else {
                     emit(BleEvent.Status("SensorStream subscribed (live data at 0.5 Hz)"))
                 }
-                op = CurrentOp.Idle
-                emitConnected()
+                subscribeBatteryOrConnect()
             }
+            FileSyncProtocol.BATTERY_UUID -> {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    emit(BleEvent.Status("BatteryStatus CCCD write failed ($status) — no battery meter"))
+                    op = CurrentOp.Idle
+                    emitConnected()
+                    return
+                }
+                emit(BleEvent.Status("BatteryStatus subscribed"))
+                // One-shot read so the meter shows a value immediately instead
+                // of waiting up to a minute for the box's first periodic notify.
+                // A real serialized GATT op — safe to kick here (CCCD chain done,
+                // Connected NOT yet emitted so FileSyncCore hasn't queued
+                // GetLogMode/LIST). emitConnected() is deferred to
+                // onCharacteristicRead so the read finishes before those.
+                val g = gatt
+                val b = batteryChar
+                val kicked = if (g != null && b != null) {
+                    try { g.readCharacteristic(b) } catch (e: SecurityException) {
+                        emitErr("battery read permission denied: ${e.message}"); false
+                    }
+                } else false
+                if (!kicked) {
+                    // Couldn't queue the read — the once/min notify populates it
+                    // shortly; don't stall the connect.
+                    op = CurrentOp.Idle
+                    emitConnected()
+                }
+                // else: emitConnected() fires in onCharacteristicRead().
+            }
+        }
+    }
+
+    /**
+     * Third and final CCCD link (FileData → SensorStream → BatteryStatus).
+     * Chains the BatteryStatus subscribe if the box exposes it; absence or a
+     * synchronous failure is soft (legacy firmware) — fall straight through to
+     * Connected, exactly like the SensorStream soft-fail.
+     */
+    private fun subscribeBatteryOrConnect() {
+        val b = batteryChar
+        if (b != null && subscribeAndWriteCccd(b)) {
+            Log.i(tag, "chaining BatteryStatus subscribe")
+            return   // wait for onDescriptorWritten(BATTERY_UUID)
+        }
+        if (b != null) emit(BleEvent.Status("BatteryStatus subscribe failed — no battery meter"))
+        op = CurrentOp.Idle
+        emitConnected()
+    }
+
+    /**
+     * Result of the on-connect one-shot BatteryStatus read (see the
+     * BATTERY_UUID branch of onDescriptorWritten). Publish the seed if it
+     * parsed, then emit Connected — deferred to here so the read is the only
+     * GATT op outstanding, finishing before FileSyncCore queues GetLogMode/LIST.
+     */
+    private fun onCharacteristicRead(charUuid: UUID, value: ByteArray, status: Int) {
+        if (charUuid == FileSyncProtocol.BATTERY_UUID) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                BatterySample.parse(value)?.let { emit(BleEvent.Battery(it)) }
+            }
+            op = CurrentOp.Idle
+            emitConnected()
         }
     }
 
@@ -658,6 +720,8 @@ class BleClient(private val context: Context) {
         // SensorStream is optional — only PumpLogger firmware exposes it.
         // Legacy SDDataLogFileX (PumpTsueri name) is FileSync-only.
         streamChar = findCharacteristic(g, FileSyncProtocol.STREAM_UUID)
+        // BatteryStatus is optional too — only PumpLogger firmware exposes it.
+        batteryChar = findCharacteristic(g, FileSyncProtocol.BATTERY_UUID)
         // Diagnostic dump — every characteristic on the box, with properties.
         // Helps explain "SensorStream not subscribing" reports from the field.
         for (svc in g.services) {
@@ -769,6 +833,10 @@ class BleClient(private val context: Context) {
             handleStreamNotify(value)
             return
         }
+        if (charUuid == FileSyncProtocol.BATTERY_UUID) {
+            handleBatteryNotify(value)
+            return
+        }
         // DEBUG: raw FileData notify trace — proves whether the box answers
         // a LIST/READ at all, and with what bytes. Gated on [DEBUG_WIRE].
         if (DEBUG_WIRE) {
@@ -848,6 +916,13 @@ class BleClient(private val context: Context) {
                 streamAsm.clear(); streamAsmNext = 0
             }
         }
+    }
+
+    /** BatteryStatus notify — 8-byte LE, always a single notify (well under any
+     *  MTU), so no 3-chunk reassembly unlike handleStreamNotify. Same path used
+     *  for the on-connect one-shot read result (onCharacteristicRead). */
+    private fun handleBatteryNotify(bytes: ByteArray) {
+        BatterySample.parse(bytes)?.let { emit(BleEvent.Battery(it)) }
     }
 
     private fun handleListNotify(state: CurrentOp.Listing, value: ByteArray) {
@@ -1378,6 +1453,26 @@ class BleClient(private val context: Context) {
                 RawEvent.Notification(characteristic.uuid, v.copyOf())
             )
         }
+        // Android 13+ delivers the value directly; older devices use the 3-arg
+        // deprecated overload. Only the on-connect BatteryStatus seed uses this.
+        override fun onCharacteristicRead(
+            g: BluetoothGatt, characteristic: BluetoothGattCharacteristic,
+            value: ByteArray, status: Int,
+        ) {
+            rawChannel.trySend(
+                RawEvent.CharacteristicRead(characteristic.uuid, value.copyOf(), status)
+            )
+        }
+        @Deprecated("Pre-Tiramisu read callback", level = DeprecationLevel.HIDDEN)
+        override fun onCharacteristicRead(
+            g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int,
+        ) {
+            @Suppress("DEPRECATION")
+            val v = characteristic.value ?: ByteArray(0)
+            rawChannel.trySend(
+                RawEvent.CharacteristicRead(characteristic.uuid, v.copyOf(), status)
+            )
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1448,6 +1543,8 @@ class BleClient(private val context: Context) {
         data class Notification(val charUuid: UUID, val value: ByteArray) : RawEvent()
         /** `charUuid` is the parent characteristic — descriptors all share the standard CCCD UUID. */
         data class DescriptorWritten(val charUuid: UUID, val status: Int) : RawEvent()
+        /** One-shot characteristic READ result (BatteryStatus on-connect seed). */
+        data class CharacteristicRead(val charUuid: UUID, val value: ByteArray, val status: Int) : RawEvent()
         data class MtuChanged(val mtu: Int, val status: Int) : RawEvent()
         data object Tick : RawEvent()
     }

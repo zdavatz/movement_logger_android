@@ -24,6 +24,13 @@ object FileSyncProtocol {
      * the stream; the box has no STREAM_START opcode.
      */
     val STREAM_UUID: UUID = UUID.fromString("00000100-0010-11e1-ac36-0002a5d5c51b")
+    /**
+     * BatteryStatus — 8-byte packed pack voltage / SoC% / current from the
+     * STC3115 fuel gauge. Read + notify (once/min + on low-batt transition).
+     * Optional; only PumpLogger firmware exposes it. Superset of the low_batt
+     * flag already in the SensorStream packet.
+     */
+    val BATTERY_UUID: UUID = UUID.fromString("00000200-0010-11e1-ac36-0002a5d5c51b")
     val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     // Opcodes (first byte of FileCmd write).
@@ -252,6 +259,11 @@ sealed class BleEvent {
      * characteristic; legacy PumpTsueri builds never produce this event.
      */
     data class Sample(val sample: LiveSample) : BleEvent()
+    /**
+     * One decoded BatteryStatus snapshot. Emitted from the on-connect one-shot
+     * read and from each once/min notify. Absent on legacy PumpTsueri firmware.
+     */
+    data class Battery(val sample: BatterySample) : BleEvent()
     /** A firmware upload started; `total` is the image byte length. */
     data class FwUploadStarted(val total: Long) : BleEvent()
     /** Firmware-upload progress — `bytesDone` of `total` staged so far. */

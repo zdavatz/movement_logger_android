@@ -19,6 +19,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -45,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import ch.ywesee.movementlogger.ble.BatterySample
 import ch.ywesee.movementlogger.ble.LiveSample
 import ch.ywesee.movementlogger.ble.OriRows
 import ch.ywesee.movementlogger.ble.Triad
@@ -151,6 +153,8 @@ private fun LiveContent(
         }
 
         ReadoutGrid(sample, magOffset, headingBias)
+
+        BatterySection(state.live.latestBattery, state.live.latestBatteryAtMs)
 
         Spacer(Modifier.height(16.dp))
         OrientationSection(
@@ -335,6 +339,50 @@ private fun FlagChip(label: String, on: Boolean) {
         fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
         fontSize = 12.sp,
     )
+}
+
+/**
+ * Battery meter driven by the box's dedicated …0200… BatteryStatus
+ * characteristic (STC3115 fuel gauge — real voltage / SoC% / current), a
+ * superset of the low_batt flag in the readout grid above. Hidden on legacy
+ * firmware that doesn't expose the characteristic (latestBattery == null).
+ * Mirrors the desktop meter in stbox-viz-gui/src/main.rs.
+ */
+@Composable
+private fun BatterySection(b: BatterySample?, atMs: Long?) {
+    if (b == null) return
+    val pct = b.socPct()
+    val fill = when {                       // same ramp as the desktop meter
+        pct < 20 -> Color(0xFFC84646)
+        pct < 40 -> Color(0xFFD2AA3C)
+        else     -> Color(0xFF2E7D32)       // reuse the FlagChip green
+    }
+    val stale = atMs?.let { System.currentTimeMillis() - it > 90_000 } ?: true  // ~once/min
+    Spacer(Modifier.height(16.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Battery", fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(end = 8.dp))
+        Text(
+            "%d%%  ·  %.2f V  ·  %+.2f A%s".format(
+                pct, b.volts(), b.amps(), if (stale) "  · stale" else "",
+            ),
+            style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+            fontSize = 13.sp,
+        )
+    }
+    Spacer(Modifier.height(6.dp))
+    LinearProgressIndicator(
+        progress = { b.socFrac() },
+        modifier = Modifier.fillMaxWidth(),
+        color = fill,
+    )
+    if (b.lowBatt) {
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "⚠ low battery (< 10 %) — charge the box; GPS may lose fix",
+            color = Color(0xFFD32F2F),
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    }
 }
 
 /** Wrap a degree value into [0, 360). */

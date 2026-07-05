@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import ch.ywesee.movementlogger.ble.BleSyncService
 import ch.ywesee.movementlogger.ble.FileSyncCore
+import ch.ywesee.movementlogger.ble.BatterySample
 import ch.ywesee.movementlogger.ble.LiveSample
 import ch.ywesee.movementlogger.ble.OriRows
 import kotlinx.coroutines.flow.StateFlow
@@ -66,6 +67,12 @@ data class LiveState(
     /** `System.currentTimeMillis()` when `latestSample` arrived. Used for
      *  the "x s ago" freshness label so a stalled stream is obvious. */
     val latestSampleAtMs: Long? = null,
+    /** Latest BatteryStatus snapshot from the dedicated …0200… characteristic
+     *  (real voltage / SoC% / current). Null on legacy firmware → meter hidden. */
+    val latestBattery: BatterySample? = null,
+    /** `System.currentTimeMillis()` when latestBattery arrived — drives a
+     *  "stale" hint (box notifies only ~once/min). */
+    val latestBatteryAtMs: Long? = null,
     val sampleCount: Long = 0,
     val accHistory: List<LivePoint> = emptyList(),
     val pressureHistory: List<LivePoint> = emptyList(),
