@@ -10,11 +10,16 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
+import ch.ywesee.movementlogger.data.GpsMath
 import ch.ywesee.movementlogger.data.PublicMirror
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
@@ -61,6 +66,25 @@ data class UbloxUiState(
 )
 
 /**
+ * One finished (or in-progress) `UbloxGps_*.csv` recording plus the
+ * summary stats shown in the GPS tab's overview list. Computed by
+ * [UbloxGpsCore.refreshRecordings] off the main thread.
+ */
+data class GpsRecording(
+    val name: String,
+    val path: String,
+    /** Peak `SpeedKMh` column value across the file. */
+    val maxSpeedKmh: Double,
+    /** Sum of haversine hops between consecutive fixed points, metres. */
+    val distanceMeters: Double,
+    /** Wall-clock span of the log from the `Time [10ms]` tick column, seconds. */
+    val durationSec: Long,
+    val rows: Int,
+    /** True for the file currently being written (no swipe-delete, live-ish stats). */
+    val isRecording: Boolean,
+)
+
+/**
  * Process-wide singleton: BLE has [ch.ywesee.movementlogger.ble.FileSyncCore]
  * for state survival across Activity recreation; we do the same here so
  * unplug-replug + screen-rotation don't drop the running CSV log.
@@ -88,8 +112,22 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      *  1 Hz) but not jittery. */
     private const val WINDOW = 10
 
+    /** Distance accumulation drops any single inter-fix hop longer than
+     *  this (metres) as a GPS glitch — see [computeStats]. */
+    private const val MAX_HOP_M = 60.0
+
     private val _state = MutableStateFlow(UbloxUiState())
     val state: StateFlow<UbloxUiState> = _state.asStateFlow()
+
+    /** Saved recordings (newest first) with their overview stats. Rebuilt
+     *  by [refreshRecordings] on init, on start/stop, and on a UI tick. */
+    private val _recordings = MutableStateFlow<List<GpsRecording>>(emptyList())
+    val recordings: StateFlow<List<GpsRecording>> = _recordings.asStateFlow()
+
+    /** Off-main scope for file scans + stat computation. Reader callbacks
+     *  and CSV writes stay on the USB reader thread; this is only for the
+     *  recordings list so a directory scan can't jank the UI. */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var appContext: Context? = null
     private var usbManager: UsbManager? = null
@@ -125,6 +163,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         publicMirror = PublicMirror(ctx.applicationContext)
         registerPermissionReceiver()
         refreshDevice()
+        refreshRecordings()
     }
 
     /** Re-scan the USB device list and update [UbloxUiState.deviceFound]. */
@@ -222,6 +261,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
             _state.update {
                 it.copy(isLogging = true, logPath = file.absolutePath, loggedRows = 0L)
             }
+            refreshRecordings()
         } catch (e: Exception) {
             _state.update { it.copy(status = "CSV log open failed: ${e.message}") }
         }
@@ -232,6 +272,118 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         try { w.flush(); w.close() } catch (_: Exception) {}
         csvWriter = null
         _state.update { it.copy(isLogging = false) }
+        refreshRecordings()
+    }
+
+    // --- Recordings list + overview stats ---
+
+    /**
+     * Re-scan the app-private external dir for `UbloxGps_*.csv`, compute
+     * each file's overview stats (max speed / distance / duration) on the
+     * IO scope, and publish sorted newest-first. The filename timestamp
+     * (`yyyyMMdd_HHmmss`) is lexically chronological, so a descending name
+     * sort == newest-first without parsing dates.
+     */
+    fun refreshRecordings() {
+        val dir = appContext?.getExternalFilesDir(null) ?: appContext?.filesDir ?: return
+        val activeName = if (_state.value.isLogging) csvFile?.name else null
+        scope.launch {
+            val files = dir.listFiles()
+                ?.filter { it.isFile && it.name.startsWith("UbloxGps_") && it.name.endsWith(".csv") }
+                .orEmpty()
+            val list = files.map { f ->
+                val s = runCatching { computeStats(f) }.getOrDefault(GpsStats.EMPTY)
+                GpsRecording(
+                    name = f.name,
+                    path = f.absolutePath,
+                    maxSpeedKmh = s.maxSpeedKmh,
+                    distanceMeters = s.distanceMeters,
+                    durationSec = s.durationSec,
+                    rows = s.rows,
+                    isRecording = f.name == activeName,
+                )
+            }.sortedByDescending { it.name }
+            _recordings.value = list
+        }
+    }
+
+    /**
+     * Delete a saved recording: the canonical file under the app-private
+     * dir *and* its `Download/MovementLogger/` public mirror. Refuses the
+     * file that's actively being written so a swipe can't corrupt the
+     * open writer.
+     */
+    fun deleteRecording(name: String) {
+        if (_state.value.isLogging && name == csvFile?.name) return
+        scope.launch {
+            val dir = appContext?.getExternalFilesDir(null) ?: appContext?.filesDir
+            runCatching { dir?.let { File(it, name).delete() } }
+            runCatching { publicMirror?.delete(name) }
+            refreshRecordings()
+        }
+    }
+
+    private data class GpsStats(
+        val maxSpeedKmh: Double,
+        val distanceMeters: Double,
+        val durationSec: Long,
+        val rows: Int,
+    ) {
+        companion object { val EMPTY = GpsStats(0.0, 0.0, 0L, 0) }
+    }
+
+    /**
+     * Single-pass stat computation over one `UbloxGps_*.csv`. Columns are
+     * the fixed schema written by [startLogging]:
+     * `Time [10ms],UTC,Lat,Lon,Alt,SpeedKMh,Course,Fix,NumSat,HDOP`.
+     *
+     * - **Max speed** = peak parseable `SpeedKMh`.
+     * - **Distance** = Σ haversine between consecutive rows that both have
+     *   a fix (>0) and valid lat/lon. Hops > [MAX_HOP_M] are dropped as GPS
+     *   glitches (a real hop that large implies >200 km/h at 1 Hz); the
+     *   trade-off is a slight undercount across fix-loss gaps, preferred
+     *   over a glitch spiking the total.
+     * - **Duration** = `(lastTick − firstTick) × 10 ms`, drift-free vs. the
+     *   phone monotonic clock the tick column is stamped from.
+     */
+    private fun computeStats(file: File): GpsStats {
+        var maxSpeed = 0.0
+        var dist = 0.0
+        var firstTick = Double.NaN
+        var lastTick = 0.0
+        var rows = 0
+        var prevLat = Double.NaN
+        var prevLon = Double.NaN
+        var headerSeen = false
+        file.bufferedReader(Charsets.UTF_8).useLines { lines ->
+            for (raw in lines) {
+                val line = raw.trim()
+                if (line.isEmpty() || line.startsWith("#")) continue
+                if (!headerSeen) { headerSeen = true; continue }  // skip CSV header row
+                val c = line.split(',')
+                if (c.size < 8) continue
+                rows++
+                c[0].toDoubleOrNull()?.let { t ->
+                    if (firstTick.isNaN()) firstTick = t
+                    lastTick = t
+                }
+                c.getOrNull(5)?.toDoubleOrNull()?.let { if (it > maxSpeed) maxSpeed = it }
+                val fix = c.getOrNull(7)?.toIntOrNull() ?: 0
+                val lat = c.getOrNull(2)?.toDoubleOrNull()
+                val lon = c.getOrNull(3)?.toDoubleOrNull()
+                if (fix > 0 && lat != null && lon != null) {
+                    if (!prevLat.isNaN()) {
+                        val hop = GpsMath.haversineM(prevLat, prevLon, lat, lon)
+                        if (hop <= MAX_HOP_M) dist += hop
+                    }
+                    prevLat = lat
+                    prevLon = lon
+                }
+            }
+        }
+        val durSec = if (firstTick.isNaN()) 0L
+        else ((lastTick - firstTick) * 10.0 / 1000.0).toLong()
+        return GpsStats(maxSpeed, dist, durSec, rows)
     }
 
     // --- UbloxGpsReader.Sink ---

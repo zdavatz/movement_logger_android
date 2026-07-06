@@ -1,6 +1,8 @@
 package ch.ywesee.movementlogger.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -9,25 +11,39 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -37,11 +53,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import ch.ywesee.movementlogger.usb.GpsRecording
 import ch.ywesee.movementlogger.usb.UbloxGpsCore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
@@ -65,6 +87,7 @@ fun UsbGpsScreen() {
     LaunchedEffect(Unit) {
         UbloxGpsCore.init(ctx)
         UbloxGpsCore.refreshDevice()
+        UbloxGpsCore.refreshRecordings()
     }
     val state by UbloxGpsCore.state.collectAsStateWithLifecycle()
 
@@ -99,19 +122,21 @@ fun UsbGpsScreen() {
             ControlsRow(state)
             HorizontalDivider(Modifier.padding(vertical = 12.dp))
 
-            if (!state.isReading) {
+            if (state.isReading) {
+                RateCard(state)
+                Spacer(Modifier.height(12.dp))
+                FixCard(state)
+                Spacer(Modifier.height(12.dp))
+                LogCard(state)
+            } else {
                 Text(
                     "Waiting — tap Connect once the receiver is plugged in.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                return@Column
             }
 
-            RateCard(state)
             Spacer(Modifier.height(12.dp))
-            FixCard(state)
-            Spacer(Modifier.height(12.dp))
-            LogCard(state)
+            RecordingsCard(state)
         }
     }
 }
@@ -208,59 +233,207 @@ private fun FixCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
 
 @Composable
 private fun LogCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
-    val context = LocalContext.current
-    // "Copy" → "Copied" / "Copy failed" → "Copy" feedback loop. Mirrors the
-    // iOS `copyButtonLabel` state in `GpsScreen.swift`. Driven by a
-    // LaunchedEffect that resets the label 1.5 s after a tap.
-    var copyLabel by remember { mutableStateOf("Copy") }
-    LaunchedEffect(copyLabel) {
-        if (copyLabel != "Copy") {
-            delay(1500)
-            copyLabel = "Copy"
-        }
-    }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("CSV log", fontWeight = FontWeight.SemiBold)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (!state.isLogging) {
-                    Button(onClick = { UbloxGpsCore.startLogging() }) { Text("Start recording") }
-                } else {
-                    Button(onClick = { UbloxGpsCore.stopLogging() }) { Text("Stop recording") }
-                }
-                // Share + Copy work mid-recording too — the file's already
-                // on disk and write-flushed on every CSV row.
-                state.logPath?.let { path ->
-                    OutlinedButton(onClick = { shareGpsCsv(context, path) }) { Text("Share") }
-                    OutlinedButton(onClick = {
-                        copyLabel = copyGpsCsvToClipboard(context, path)
-                    }) { Text(copyLabel) }
-                }
+            if (!state.isLogging) {
+                Button(onClick = { UbloxGpsCore.startLogging() }) { Text("Start recording") }
+            } else {
+                Button(onClick = { UbloxGpsCore.stopLogging() }) { Text("Stop recording") }
             }
             if (state.isLogging) {
                 Text(
-                    "Recording → ${state.logPath ?: "?"}",
+                    "● Recording — ${state.loggedRows} rows written",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFC62828),
+                )
+            } else {
+                Text(
+                    "Each Start → Stop writes a new file below. Schema matches the " +
+                        "box's Gps*.csv, so the Replay tab picks it up.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+        }
+    }
+}
+
+/**
+ * The recordings overview: one swipe-to-delete row per saved
+ * `UbloxGps_*.csv`, each showing max speed / distance / duration and a
+ * Share button that offers **View** or **Share**. Shown regardless of
+ * connection state so past recordings stay reachable when the receiver is
+ * unplugged. While logging, a periodic refresh keeps the active row's
+ * stats moving.
+ */
+@Composable
+private fun RecordingsCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
+    val recordings by UbloxGpsCore.recordings.collectAsStateWithLifecycle()
+    var viewing by remember { mutableStateOf<GpsRecording?>(null) }
+
+    // Re-scan every 3 s while a recording is in progress so the in-flight
+    // row's distance/duration tick up; idle otherwise (no wasted IO).
+    LaunchedEffect(state.isLogging) {
+        while (state.isLogging) {
+            delay(3000)
+            UbloxGpsCore.refreshRecordings()
+        }
+    }
+
+    Card(
+        Modifier.fillMaxWidth(),
+        // Row foregrounds paint this same colour so the red delete layer
+        // only shows through while a row is being swiped.
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "${state.loggedRows} rows written",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    "Recordings (${recordings.size})",
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
                 )
-            } else if (state.logPath != null) {
+                TextButton(onClick = { UbloxGpsCore.refreshRecordings() }) { Text("Refresh") }
+            }
+            if (recordings.isEmpty()) {
                 Text(
-                    "Last log: ${state.logPath} (${state.loggedRows} rows)",
+                    "No recordings yet — tap Start recording to create one.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
                 Text(
-                    "Schema matches the box's Gps*.csv — Replay tab will pick it up.",
-                    style = MaterialTheme.typography.bodySmall,
+                    "Swipe a row left to delete.",
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                recordings.forEach { rec ->
+                    key(rec.name) {
+                        RecordingRow(rec = rec, onView = { viewing = rec })
+                    }
+                }
             }
+        }
+    }
+
+    viewing?.let { rec ->
+        GpsRecordingViewer(name = rec.name, path = rec.path, onDismiss = { viewing = null })
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RecordingRow(rec: GpsRecording, onView: () -> Unit) {
+    val context = LocalContext.current
+    val dismissState = rememberSwipeToDismissBoxState()
+
+    // Fire the delete once the row has been swiped fully to the end-start
+    // (right-to-left) position. `key(rec.name)` in the caller resets this
+    // state per file so a delete can't leak onto the row that slides up.
+    LaunchedEffect(dismissState.currentValue) {
+        if (dismissState.currentValue == SwipeToDismissBoxValue.EndToStart) {
+            UbloxGpsCore.deleteRecording(rec.name)
+        }
+    }
+
+    SwipeToDismissBox(
+        state = dismissState,
+        enableDismissFromStartToEnd = false,
+        // The active recording can't be deleted (its writer is open).
+        enableDismissFromEndToStart = !rec.isRecording,
+        backgroundContent = {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xFFC62828))
+                    .padding(horizontal = 20.dp),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
+                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color.White)
+            }
+        },
+    ) {
+        RecordingRowContent(rec = rec, context = context, onView = onView)
+    }
+}
+
+@Composable
+private fun RecordingRowContent(
+    rec: GpsRecording,
+    context: Context,
+    onView: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1.3f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (rec.isRecording) {
+                    Text("● ", color = Color(0xFFC62828), fontSize = 12.sp)
+                }
+                Text(
+                    recordingTime(rec.name),
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                recordingDate(rec.name),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        StatCell("Max", "%.1f".format(Locale.US, rec.maxSpeedKmh), "km/h")
+        StatCell("Dist", formatDistance(rec.distanceMeters), "")
+        StatCell("Dur", formatMmSs(rec.durationSec), "")
+        Box {
+            IconButton(onClick = { menuOpen = true }) {
+                Icon(Icons.Default.Share, contentDescription = "Share ${rec.name}")
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("View") },
+                    onClick = { menuOpen = false; onView() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Share") },
+                    onClick = { menuOpen = false; shareGpsCsv(context, rec.path) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun androidx.compose.foundation.layout.RowScope.StatCell(
+    label: String,
+    value: String,
+    unit: String,
+) {
+    Column(
+        modifier = Modifier.weight(1f),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(value, fontFamily = FontFamily.Monospace, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        if (unit.isNotEmpty()) {
+            Text(
+                unit,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -312,21 +485,122 @@ private fun shareGpsCsv(context: Context, path: String) {
     )
 }
 
+// --- recording-row formatting helpers ---
+
+private val STAMP_RE = Regex("""UbloxGps_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.csv""")
+
+/** `UbloxGps_20260706_142025.csv` → `14:20:25`; falls back to the name. */
+private fun recordingTime(name: String): String {
+    val m = STAMP_RE.matchEntire(name) ?: return name
+    val (_, _, _, hh, mi, ss) = m.destructured
+    return "$hh:$mi:$ss"
+}
+
+/** `UbloxGps_20260706_142025.csv` → `2026-07-06`; empty if unparseable. */
+private fun recordingDate(name: String): String {
+    val m = STAMP_RE.matchEntire(name) ?: return ""
+    val (y, mo, d) = m.destructured
+    return "$y-$mo-$d"
+}
+
+/** Metres → `"842 m"` under 1 km, else `"1.24 km"`. */
+private fun formatDistance(meters: Double): String =
+    if (meters < 1000.0) "%.0f m".format(Locale.US, meters)
+    else "%.2f km".format(Locale.US, meters / 1000.0)
+
+/** Seconds → `mm:ss` (minutes may exceed 59 for long recordings). */
+private fun formatMmSs(sec: Long): String =
+    "%02d:%02d".format(sec / 60, sec % 60)
+
 /**
- * Copies the CSV contents to the system clipboard. Returns the next
- * label the button should display ("Copied" on success, "Copy failed"
- * on IO error) — the caller's [LaunchedEffect] reverts to "Copy" after
- * 1.5 s.
+ * Full-screen preview of one GPS CSV. Reads up to [PREVIEW_CAP_BYTES] on
+ * IO, shows it monospaced, and exposes a Share action — the "View"
+ * counterpart to the row's Share menu. Mirrors `DownloadedFileViewer` in
+ * [FileSyncScreen].
  */
-private fun copyGpsCsvToClipboard(context: Context, path: String): String {
-    val file = File(path)
-    if (!file.exists()) return "Copy failed"
-    return try {
-        val text = file.readText(Charsets.UTF_8)
-        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText(file.name, text))
-        "Copied"
-    } catch (_: Exception) {
-        "Copy failed"
+@Composable
+private fun GpsRecordingViewer(name: String, path: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    var loading by remember(path) { mutableStateOf(true) }
+    var preview by remember(path) { mutableStateOf("") }
+    var truncated by remember(path) { mutableStateOf(false) }
+
+    LaunchedEffect(path) {
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                val f = File(path)
+                val size = f.length()
+                val toRead = minOf(size, PREVIEW_CAP_BYTES.toLong()).toInt()
+                val buf = ByteArray(toRead)
+                f.inputStream().use { ins ->
+                    var off = 0
+                    while (off < toRead) {
+                        val n = ins.read(buf, off, toRead - off)
+                        if (n <= 0) break
+                        off += n
+                    }
+                }
+                buf.toString(Charsets.UTF_8) to (size > PREVIEW_CAP_BYTES)
+            }.getOrElse { "" to false }
+        }
+        preview = result.first
+        truncated = result.second
+        loading = false
+    }
+
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(modifier = Modifier.fillMaxSize()) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        name,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { shareGpsCsv(context, path) }) { Text("Share") }
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+                HorizontalDivider()
+                Box(modifier = Modifier.fillMaxSize()) {
+                    if (loading) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(32.dp),
+                            horizontalArrangement = Arrangement.Center,
+                        ) {
+                            CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                        }
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState())
+                                .padding(12.dp),
+                        ) {
+                            if (truncated) {
+                                Text(
+                                    "Showing first ${PREVIEW_CAP_BYTES / 1024} KB — use Share for the full file.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(Modifier.height(8.dp))
+                            }
+                            Text(
+                                preview.ifEmpty { "(empty file)" },
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
+
+private const val PREVIEW_CAP_BYTES: Int = 48 * 1024
