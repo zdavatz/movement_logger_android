@@ -187,6 +187,7 @@ class BleClient(private val context: Context) {
         when (cmd) {
             BleCmd.List, BleCmd.GetLogMode, BleCmd.GetFirmwareVersion,
             is BleCmd.Read, is BleCmd.Delete, is BleCmd.SetLogMode,
+            is BleCmd.SetGpsPower, BleCmd.GetGpsPower,
             -> awaitCmdSettle()
             else -> Unit
         }
@@ -213,6 +214,8 @@ class BleClient(private val context: Context) {
             BleCmd.AbortFirmware -> abortFirmwareUpload()
             is BleCmd.GpsBridge -> sendGpsBridge(cmd.on)
             is BleCmd.UbxPoll -> sendUbxPoll(cmd.frame)
+            is BleCmd.SetGpsPower -> sendSetGpsPower(cmd.on)
+            BleCmd.GetGpsPower -> sendGetGpsPower()
         }
     }
 
@@ -304,6 +307,9 @@ class BleClient(private val context: Context) {
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} aborted by disconnect")
             is CurrentOp.ModeReq -> emitErr(
                 "${if (o.isSet) "SET_MODE" else "GET_MODE"} aborted by disconnect"
+            )
+            is CurrentOp.GpsPwrReq -> emitErr(
+                "${if (o.isSet) "GPS_POWER" else "GPS_GET_POWER"} aborted by disconnect"
             )
             is CurrentOp.VersionReq -> {
                 // Link dropped mid-query — report "unknown" so the firmware
@@ -520,6 +526,36 @@ class BleClient(private val context: Context) {
         }
         if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_GET_VERSION))) return
         op = CurrentOp.VersionReq(lastProgress = now())
+    }
+
+    /**
+     * GPS_POWER (0x11) — twin of [sendSetMode]. One status-byte reply demuxed
+     * by the [CurrentOp.GpsPwrReq] op; on OK the box is now in the requested
+     * state. Legacy firmware (< v0.0.35) never answers → the watchdog frees the
+     * op and the toggle stays unknown.
+     */
+    private fun sendSetGpsPower(on: Boolean) {
+        if (op !is CurrentOp.Idle) {
+            emitErr("GPS_POWER rejected — another op in flight")
+            return
+        }
+        val payload = byteArrayOf(
+            FileSyncProtocol.OP_GPS_POWER,
+            if (on) 1 else 0,
+        )
+        if (!writeCmdBytes(payload)) return
+        op = CurrentOp.GpsPwrReq(isSet = true, on = on, lastProgress = now())
+        emit(BleEvent.Status("GPS_POWER ${if (on) "on" else "off"} sent"))
+    }
+
+    /** GPS_GET_POWER (0x12) — twin of [sendGetMode]. Reply is one byte 0/1. */
+    private fun sendGetGpsPower() {
+        if (op !is CurrentOp.Idle) {
+            emitErr("GPS_GET_POWER rejected — another op in flight")
+            return
+        }
+        if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_GPS_GET_POWER))) return
+        op = CurrentOp.GpsPwrReq(isSet = false, on = false, lastProgress = now())
     }
 
     /**
@@ -855,6 +891,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Reading -> handleReadNotify(current, value)
             is CurrentOp.Deleting -> handleDeleteNotify(current, value)
             is CurrentOp.ModeReq -> handleModeNotify(current, value)
+            is CurrentOp.GpsPwrReq -> handleGpsPwrNotify(current, value)
             is CurrentOp.VersionReq -> handleVersionNotify(value)
             is CurrentOp.Uploading -> handleUploadNotify(current, value)
         }
@@ -1011,6 +1048,26 @@ class BleClient(private val context: Context) {
         } else {
             // GET_MODE reply: 0 = auto, 1 = manual.
             emit(BleEvent.LogMode(manual = b.toInt() != 0))
+        }
+        op = CurrentOp.Idle
+    }
+
+    /** GPS_POWER / GPS_GET_POWER reply — twin of [handleModeNotify]. */
+    private fun handleGpsPwrNotify(state: CurrentOp.GpsPwrReq, value: ByteArray) {
+        if (value.isEmpty()) return  // shouldn't happen; tolerate
+        val b = value[0]
+        if (state.isSet) {
+            // Reply is a status byte. OK ⇒ the box is now in the requested state.
+            if (b == FileSyncProtocol.STATUS_OK) {
+                emit(BleEvent.GpsPower(state.on))
+                emit(BleEvent.Status("GPS turned ${if (state.on) "on" else "off"}"))
+            } else {
+                emitErr("GPS_POWER: ${FileSyncProtocol.statusMessage(b)} " +
+                    "(0x${"%02X".format(b.toInt() and 0xFF)})")
+            }
+        } else {
+            // GET reply: 0 = off, 1 = on.
+            emit(BleEvent.GpsPower(on = b.toInt() != 0))
         }
         op = CurrentOp.Idle
     }
@@ -1308,6 +1365,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Reading -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.Deleting -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.ModeReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
+            is CurrentOp.GpsPwrReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.VersionReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             // Uploading is handled by tickUploadWatchdog above (early return),
             // so it never reaches here — branch present only for exhaustiveness.
@@ -1331,6 +1389,10 @@ class BleClient(private val context: Context) {
             is CurrentOp.Deleting -> emitErr("DELETE ${o.name} timed out — no notify for 20 s")
             is CurrentOp.ModeReq -> emitErr(
                 "${if (o.isSet) "SET_MODE" else "GET_MODE"} timed out — no reply for 20 s"
+            )
+            is CurrentOp.GpsPwrReq -> emitErr(
+                "${if (o.isSet) "GPS_POWER" else "GPS_GET_POWER"} timed out — no reply " +
+                    "for 20 s (firmware may not support GPS on/off)"
             )
             is CurrentOp.VersionReq -> {
                 // Legacy firmware (≤ v0.0.28) never replies to GET_VERSION.
@@ -1502,6 +1564,15 @@ class BleClient(private val context: Context) {
         data class ModeReq(
             val isSet: Boolean,
             val manual: Boolean,
+            var lastProgress: Long,
+        ) : CurrentOp()
+        /** GPS_POWER / GPS_GET_POWER: both get one FileData reply byte, exactly
+         *  like [ModeReq]. `isSet` true = SET (reply is a status byte; on OK the
+         *  box is now in the requested state), false = GET (reply is 0/1 = the
+         *  GPS power state). */
+        data class GpsPwrReq(
+            val isSet: Boolean,
+            val on: Boolean,
             var lastProgress: Long,
         ) : CurrentOp()
         /** GET_VERSION (0x10): awaiting the one ASCII-version FileData reply.

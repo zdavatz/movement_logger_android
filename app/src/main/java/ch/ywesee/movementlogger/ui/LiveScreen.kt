@@ -47,9 +47,11 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import ch.ywesee.movementlogger.ble.BatterySample
+import ch.ywesee.movementlogger.ble.BoardAngles
 import ch.ywesee.movementlogger.ble.LiveSample
 import ch.ywesee.movementlogger.ble.OriRows
 import ch.ywesee.movementlogger.ble.Triad
+import ch.ywesee.movementlogger.ble.normDeltaDeg
 import ch.ywesee.movementlogger.sync.AgentConfig
 import kotlinx.coroutines.delay
 import kotlin.math.atan2
@@ -147,12 +149,42 @@ private fun LiveContent(
         var magOffset by remember { mutableStateOf(AgentConfig.magOffset(ctx)) }
         var headingBias by remember { mutableStateOf(AgentConfig.headingBiasDeg(ctx)) }
         var nosePlusY by remember { mutableStateOf(AgentConfig.nosePlusY(ctx)) }
+        var angleZeroRef by remember { mutableStateOf(AgentConfig.angleZeroRef(ctx)) }
+        var angleZeroAtMs by remember { mutableStateOf(AgentConfig.angleZeroAtMs(ctx)) }
         LaunchedEffect(sample) {
             magOffset = AgentConfig.magOffset(ctx)
             headingBias = AgentConfig.headingBiasDeg(ctx)
         }
 
-        ReadoutGrid(sample, magOffset, headingBias)
+        // Board angles (pitch/roll/yaw about the box's PHYSICAL axes) — the
+        // prominent, correct readout. Replaces the old swapped "Angles (°)" row.
+        BoardAnglesCard(
+            oriRows = state.live.oriRows,
+            nosePlusY = nosePlusY,
+            headingBias = headingBias,
+            angleZeroRef = angleZeroRef,
+            angleZeroAtMs = angleZeroAtMs,
+            onZero = {
+                state.live.oriRows?.let { rows ->
+                    val a = BoardAngles.from(rows, nosePlusY ?: false, 0.0)
+                    val ref = doubleArrayOf(a.pitchDeg, a.rollDeg, a.yawDeg)
+                    val now = System.currentTimeMillis()
+                    AgentConfig.setAngleZeroRef(ctx, ref)
+                    AgentConfig.setAngleZeroAtMs(ctx, now)
+                    angleZeroRef = ref
+                    angleZeroAtMs = now
+                }
+            },
+            onClear = {
+                AgentConfig.setAngleZeroRef(ctx, null)
+                AgentConfig.setAngleZeroAtMs(ctx, null)
+                angleZeroRef = null
+                angleZeroAtMs = null
+            },
+        )
+        Spacer(Modifier.height(12.dp))
+
+        ReadoutGrid(sample)
 
         BatterySection(state.live.latestBattery, state.live.latestBatteryAtMs)
 
@@ -239,7 +271,7 @@ private fun FreshnessStrip(live: LiveState) {
 }
 
 @Composable
-private fun ReadoutGrid(s: LiveSample, magOffset: FloatArray?, headingBias: Float) {
+private fun ReadoutGrid(s: LiveSample) {
     val accG = { i: Int -> s.accMg[i] / 1000f }
     // Firmware v0.0.27+ streams DECI-dps — divide by 10 for °/s (was ÷100).
     val gyroDps = { i: Int -> s.gyroCdps[i] / 10f }
@@ -263,11 +295,9 @@ private fun ReadoutGrid(s: LiveSample, magOffset: FloatArray?, headingBias: Floa
                 "Y %+d".format(s.magMg[1].toInt()),
                 "Z %+d".format(s.magMg[2].toInt()),
             )
-            ReadoutRow("Angles (°)",
-                "Roll %+6.1f".format(s.rollDeg()),
-                "Pitch %+6.1f".format(s.pitchDeg()),
-                "Yaw %5.1f".format(normDeg(s.headingDeg(magOffset) - headingBias)),
-            )
+            // (Pitch/Roll/Yaw now live in the dedicated BoardAnglesCard above —
+            // computed about the box's physical axes, not the phone-style accel
+            // frame that swapped pitch and roll on this Y-nose box.)
             ReadoutRow("Baro",
                 "%.2f hPa".format(presHpa),
                 "%+.2f °C".format(tempC),
@@ -390,6 +420,141 @@ private fun normDeg(d: Double): Double {
     var v = d % 360.0
     if (v < 0) v += 360.0
     return v
+}
+
+/** "0:SS" / "M:SS" elapsed-time formatting for the "zeroed N ago" note. */
+private fun agoText(ms: Long): String {
+    val t = (ms / 1000).coerceAtLeast(0)
+    return if (t < 60) "0:%02d".format(t) else "%d:%02d".format(t / 60, t % 60)
+}
+
+/**
+ * Prominent board-attitude readout for the Live tab — the correct
+ * pitch/roll/yaw computed about the box's PHYSICAL axes by [BoardAngles] from
+ * the drift-free gyro+accel filter (NOT the old accel-only formulas, which
+ * assume a phone-style frame where the long axis is X and so swap pitch and
+ * roll on this Y-nose box). Two sets:
+ *
+ *   • Absolute — vs level & north (yaw is a compass heading, render bias applied)
+ *   • Calibrated — deviation from a "Zero here" reference pose
+ *
+ * "Zero here" tares all three to the current pose (yaw sampled at bias 0 so the
+ * tared heading measures turn-since-zero independent of the direction cal); the
+ * reference persists across reconnect / app restart via [AgentConfig]. Ported
+ * 1:1 from iOS `BoardAnglesCard` (LiveScreen.swift).
+ */
+@Composable
+private fun BoardAnglesCard(
+    oriRows: OriRows?,
+    nosePlusY: Boolean?,
+    headingBias: Float,
+    angleZeroRef: DoubleArray?,
+    angleZeroAtMs: Long?,
+    onZero: () -> Unit,
+    onClear: () -> Unit,
+) {
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) { nowMs = System.currentTimeMillis(); delay(1000) }
+    }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Board angles", fontWeight = FontWeight.SemiBold)
+
+            if (oriRows == null) {
+                Text(
+                    "Move the box a little to seed the orientation filter…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                val abs = BoardAngles.from(oriRows, nosePlusY ?: false, headingBias.toDouble())
+                val rel = BoardAngles.from(oriRows, nosePlusY ?: false, 0.0)
+
+                // --- Absolute ---
+                Text(
+                    "Absolute — vs level & north",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                AngleRow(
+                    pitch = "%+5.1f°".format(abs.pitchDeg),
+                    roll = "%+5.1f°".format(abs.rollDeg),
+                    yaw = "%5.1f°".format(abs.yawDeg),
+                )
+
+                HorizontalDivider(Modifier.padding(vertical = 2.dp))
+
+                // --- Calibrated (tared) ---
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Calibrated — vs zero pose",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(onClick = onZero) { Text("Zero here") }
+                }
+                if (angleZeroRef != null) {
+                    AngleRow(
+                        pitch = "%+5.1f°".format(rel.pitchDeg - angleZeroRef[0]),
+                        roll = "%+5.1f°".format(rel.rollDeg - angleZeroRef[1]),
+                        yaw = "%+5.1f°".format(normDeltaDeg(rel.yawDeg - angleZeroRef[2])),
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (angleZeroAtMs != null) {
+                            Text(
+                                "zeroed ${agoText(nowMs - angleZeroAtMs)} ago",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f),
+                            )
+                        } else {
+                            Spacer(Modifier.weight(1f))
+                        }
+                        OutlinedButton(onClick = onClear) { Text("Clear") }
+                    }
+                } else {
+                    Text(
+                        "Tap “Zero here” with the board in its reference pose " +
+                            "(e.g. sitting level) to read deviation from it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** One pitch / roll / yaw line with plain-language axis hints underneath. */
+@Composable
+private fun AngleRow(pitch: String, roll: String, yaw: String) {
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        AngleCell("Pitch", pitch, "up / down hill", Modifier.weight(1f))
+        AngleCell("Roll", roll, "lean L / R", Modifier.weight(1f))
+        AngleCell("Yaw", yaw, "heading", Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun AngleCell(name: String, value: String, hint: String, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(
+            name,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            value,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 18.sp,
+            maxLines = 1,
+        )
+        Text(hint, fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
 }
 
 /**

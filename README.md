@@ -30,6 +30,8 @@ Three screens via the bottom navigation bar.
 
 When connected to a PumpLogger-firmware box (advertises as `STBoxFs`), shows the 0.5 Hz SensorStream snapshot live: accel / gyro / mag / baro / GPS readouts plus two sparklines (acceleration magnitude, barometric pressure). Subscription is automatic on Connect — no extra button. On connect, the app requests an ATT MTU of 247 so each 46-byte snapshot lands in a single notify (the firmware doesn't chunk on small MTUs, so the upgrade is required to see data). Legacy PumpTsueri firmware doesn't expose the SensorStream characteristic, so the tab stays empty with a one-shot log line in the Sync log explaining why.
 
+A **Board angles** card sits above the readouts: live **Pitch** (up/down hill), **Roll** (lean left/right) and **Yaw** (heading), computed about the box's *physical* axes from the gyro + accel orientation filter (not the raw accel formulas). The box's nose is its Y axis, so these come out right where the old accel-only roll/pitch — which assumed a phone's long X axis — were swapped. Two readouts: **Absolute** (yaw = compass heading) and **Calibrated** — tap **Zero here** to tare the current pose to 0°, **Clear** to reset; a "zeroed M:SS ago" line shows how long the tare has stood. The tare is remembered across launches.
+
 ### Sync
 
 Scans for the box over BLE (advertise name `PumpTsueri` *or* `STBoxFs`), connects via GATT, and drives the FileSync protocol:
@@ -43,6 +45,7 @@ Scans for the box over BLE (advertise name `PumpTsueri` *or* `STBoxFs`), connect
 - **Delete** — removes a file from the SD card.
 - **Log mode (Auto / Manual)** — persisted *on the box* (requires firmware v0.0.7+). **Auto** (default): the box opens a recording session automatically on every power-on — the data-safe always-on behaviour, nothing can leave it silently not recording. **Manual**: the box boots idle and records nothing until you tap **Start session**; it then logs for the chosen duration and goes idle again. Manual is opt-in and carries a deliberate tradeoff — a forgotten Start session silently loses the run. The app sends `SET_MODE` to change it and `GET_MODE` on connect to reflect the box's current mode (legacy PumpTsueri firmware can't report it, so the toggle stays "unknown").
 - **Start session** (Manual mode only) — sends `START_LOG` with a user-set duration (default 30 min). The box opens a session and auto-closes after the duration; the BLE link stays up (current firmware does **not** reboot). An on-screen countdown banner ticks while the session runs.
+- **GPS power (On / Off)** — a selector next to the log-mode toggle that turns the box's u-blox GPS off to save battery when it's faulty or you don't need a track (**requires box firmware v0.0.35+**). The box persists the setting; the app just reflects and sends it (`GET`/`SET` mirror the log-mode plumbing). With GPS off the IMU + barometer keep logging, so Replay still time-aligns from the phone-clock `# SYNC` anchor — you lose speed + GPS track but keep pitch / roll and height.
 
 ### Replay
 

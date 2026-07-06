@@ -178,6 +178,7 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                     onSetDuration = vm::setSessionDuration,
                     onStartSession = vm::startSession,
                     onSetLogMode = vm::setLogMode,
+                    onSetGpsPower = vm::setGpsPower,
                     onPickFirmware = {
                         // application/octet-stream is the canonical .bin MIME;
                         // */* is the catch-all for managers that report none.
@@ -250,6 +251,7 @@ private fun ConnectionBar(
     onSetDuration: (Int) -> Unit,
     onStartSession: () -> Unit,
     onSetLogMode: (Boolean) -> Unit,
+    onSetGpsPower: (Boolean) -> Unit,
     onPickFirmware: () -> Unit,
     onCancelFirmware: () -> Unit,
 ) {
@@ -349,6 +351,10 @@ private fun ConnectionBar(
                     onStart = onStartSession,
                 )
             }
+            Spacer(Modifier.height(8.dp))
+            val gpsBusy = state.listing || state.syncing ||
+                state.downloads.isNotEmpty() || state.fwUpload != null
+            GpsPowerSelector(state.gpsPowerOn, gpsBusy, onSetGpsPower)
         }
     }
 }
@@ -554,6 +560,45 @@ private fun LogModeSelector(manual: Boolean?, onSet: (Boolean) -> Unit) {
             false -> "Box records automatically on power-on."
             true -> "Box stays idle on power-on — start a session below."
             null -> "Querying box… (legacy firmware can't report this)"
+        },
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+/**
+ * GPS on/off for the box (firmware v0.0.35+). OFF puts the u-blox receiver
+ * into backup mode (~tens of µA vs ~25 mA) to save battery when GPS is
+ * faulty/unused — logging keeps running (IMU + baro) and Replay still
+ * time-aligns via the phone-clock `# SYNC` anchor. Persisted on the box.
+ * `on == null` means not yet known (querying, or legacy firmware that ignores
+ * 0x12); neither chip is selected until the box answers.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GpsPowerSelector(on: Boolean?, busy: Boolean, onSet: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("GPS", style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.width(8.dp))
+        FilterChip(
+            selected = on == true,
+            enabled = !busy,
+            onClick = { onSet(true) },
+            label = { Text("On") },
+        )
+        Spacer(Modifier.width(6.dp))
+        FilterChip(
+            selected = on == false,
+            enabled = !busy,
+            onClick = { onSet(false) },
+            label = { Text("Off") },
+        )
+    }
+    Text(
+        when (on) {
+            true -> "GPS receiver on. Turn off to save battery if GPS is faulty — IMU + baro keep logging."
+            false -> "GPS off (backup mode) — saving battery. Replay still time-aligns; speed + track need GPS on."
+            null -> "Querying box… (firmware older than v0.0.35 can't switch GPS)."
         },
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,

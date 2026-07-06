@@ -135,6 +135,13 @@ data class FileSyncUiState(
      * manual (idle until START_LOG).
      */
     val logModeManual: Boolean? = null,
+    /**
+     * Box GPS power (GPS_POWER 0x11 / GPS_GET_POWER 0x12): null = unknown
+     * (not yet queried / legacy firmware < v0.0.35 that ignores GPS on/off),
+     * true = receiver on, false = off (backup mode, saving battery). Queried on
+     * connect; toggled by the user. Persisted on the box, not in the app.
+     */
+    val gpsPowerOn: Boolean? = null,
     /** A transfer was cut by a link drop / stall; the partial is safe
      *  in the mirror. Drives the reconnect banner and the auto-resume
      *  on the next Connected (desktop v0.0.9). Persists across the
@@ -218,6 +225,7 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
     fun clearSession() = FileSyncCore.clearSession()
     fun logFilePath(): String? = FileSyncCore.logFilePath()
     fun setLogMode(manual: Boolean) = FileSyncCore.setLogMode(manual)
+    fun setGpsPower(on: Boolean) = FileSyncCore.setGpsPower(on)
 
     /**
      * Upload a firmware `.bin` chosen via the SAF picker. Reads the exact

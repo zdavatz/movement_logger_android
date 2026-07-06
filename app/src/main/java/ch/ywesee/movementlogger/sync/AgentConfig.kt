@@ -56,6 +56,17 @@ data class AgentConfig(
         /** Lateral render sign from the right-side confirm tap (+1/-1). */
         private const val KEY_LATERAL_SIGN = "lateral_sign"
         private const val KEY_LATERAL_SIGN_KNOWN = "lateral_sign_known"
+        /** Calibrated board-angle zero reference [pitch, roll, yaw]° captured at
+         *  the Live tab's "Zero here" tap (yaw sampled at bias 0). Persisted so
+         *  a mounted-box tare survives reconnect / app restart. iOS
+         *  `angleZeroRef` parity. */
+        private const val KEY_ANGLE_ZERO_P = "angle_zero_pitch"
+        private const val KEY_ANGLE_ZERO_R = "angle_zero_roll"
+        private const val KEY_ANGLE_ZERO_Y = "angle_zero_yaw"
+        private const val KEY_ANGLE_ZERO_KNOWN = "angle_zero_known"
+        /** Wall-clock (epoch millis) of the last "Zero here" tap — drives the
+         *  "zeroed N ago" note. iOS `angleZeroAtEpoch` parity. */
+        private const val KEY_ANGLE_ZERO_AT = "angle_zero_at_ms"
 
         fun prefs(context: Context): SharedPreferences =
             context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -142,6 +153,48 @@ data class AgentConfig(
                     putBoolean(KEY_LATERAL_SIGN_KNOWN, true)
                     putFloat(KEY_LATERAL_SIGN, v)
                 }
+            }.apply()
+        }
+
+        /**
+         * Stored calibrated-angle zero reference [pitch, roll, yaw] in degrees,
+         * or null if not zeroed. Kept independent of the compass calibration
+         * (only [setAngleZeroRef]/Clear touch it), matching iOS.
+         */
+        fun angleZeroRef(context: Context): DoubleArray? {
+            val p = prefs(context)
+            if (!p.getBoolean(KEY_ANGLE_ZERO_KNOWN, false)) return null
+            return doubleArrayOf(
+                p.getFloat(KEY_ANGLE_ZERO_P, 0f).toDouble(),
+                p.getFloat(KEY_ANGLE_ZERO_R, 0f).toDouble(),
+                p.getFloat(KEY_ANGLE_ZERO_Y, 0f).toDouble(),
+            )
+        }
+
+        fun setAngleZeroRef(context: Context, ref: DoubleArray?) {
+            prefs(context).edit().apply {
+                if (ref == null || ref.size != 3) {
+                    putBoolean(KEY_ANGLE_ZERO_KNOWN, false)
+                    remove(KEY_ANGLE_ZERO_P); remove(KEY_ANGLE_ZERO_R); remove(KEY_ANGLE_ZERO_Y)
+                } else {
+                    putBoolean(KEY_ANGLE_ZERO_KNOWN, true)
+                    putFloat(KEY_ANGLE_ZERO_P, ref[0].toFloat())
+                    putFloat(KEY_ANGLE_ZERO_R, ref[1].toFloat())
+                    putFloat(KEY_ANGLE_ZERO_Y, ref[2].toFloat())
+                }
+            }.apply()
+        }
+
+        /** Epoch millis of the last "Zero here", or null if never/after Clear. */
+        fun angleZeroAtMs(context: Context): Long? {
+            val p = prefs(context)
+            if (!p.contains(KEY_ANGLE_ZERO_AT)) return null
+            return p.getLong(KEY_ANGLE_ZERO_AT, 0L).takeIf { it > 0L }
+        }
+
+        fun setAngleZeroAtMs(context: Context, atMs: Long?) {
+            prefs(context).edit().apply {
+                if (atMs == null) remove(KEY_ANGLE_ZERO_AT) else putLong(KEY_ANGLE_ZERO_AT, atMs)
             }.apply()
         }
 

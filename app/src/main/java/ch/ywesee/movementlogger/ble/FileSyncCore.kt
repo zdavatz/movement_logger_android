@@ -472,6 +472,47 @@ object FileSyncCore {
     }
 
     /**
+     * User toggled the box's GPS on/off (GPS_POWER 0x11). Optimistically
+     * reflect the target so the switch doesn't snap back before the box
+     * confirms; the [BleEvent.GpsPower] reply reconciles it. On legacy firmware
+     * that never answers, the optimistic value stays (harmless — the write was
+     * ignored, but the user sees their intent; a reconnect + GET corrects a
+     * wrong guess). The box persists the setting; we don't.
+     */
+    fun setGpsPower(on: Boolean) {
+        briefOpInFlight = true
+        _state.update { it.copy(gpsPowerOn = on) }
+        log("GPS_POWER ${if (on) "on" else "off"}")
+        ble?.send(BleCmd.SetGpsPower(on))
+    }
+
+    /**
+     * Query the box's GPS power state (GPS_GET_POWER 0x12) once the single-op
+     * BLE worker is idle — the GET takes the op slot, so firing it during the
+     * connect-time GET_MODE / GET_VERSION / initial sync would just be rejected.
+     * Mirrors the box half of [checkFirmwareUpdate]: poll `workerIdleForBriefOp`
+     * for a bounded window and send once idle. If the box stays busy or is
+     * legacy firmware (< v0.0.35) that never answers, the toggle stays unknown.
+     */
+    private fun queryGpsPower() {
+        scope.launch {
+            val deadline = System.currentTimeMillis() + FW_VERSION_QUERY_WINDOW_MS
+            while (System.currentTimeMillis() < deadline) {
+                val s = _state.value
+                if (s.connection != Connection.Connected) return@launch
+                if (workerIdleForBriefOp(s)) {
+                    briefOpInFlight = true
+                    log("GPS_GET_POWER")
+                    ble?.send(BleCmd.GetGpsPower)
+                    return@launch
+                }
+                kotlinx.coroutines.delay(500)
+            }
+            log("GPS power query: box stayed busy — GPS state unknown")
+        }
+    }
+
+    /**
      * Read a firmware `.bin` from the SAF content Uri, compute its SHA-256,
      * and kick off the FW_BEGIN → FW_DATA… → FW_COMMIT upload (desktop/iOS
      * OTA peer). The read + digest run on a background coroutine so a big
@@ -778,6 +819,9 @@ object FileSyncCore {
                 // surface the "New box firmware" banner if the box is behind.
                 // Independent of resume/keep-synced — runs on every connect.
                 checkFirmwareUpdate()
+                // Reflect the box's GPS on/off state in the toggle. Self-defers
+                // until the worker is idle, same as the version query above.
+                queryGpsPower()
                 // Resume after an interrupted transfer (desktop v0.0.9):
                 // the aborted partial is already in the mirror, so a
                 // fresh sync pass skips every complete file and re-pulls
@@ -976,6 +1020,14 @@ object FileSyncCore {
                 fwBoxKnown = true
                 log("box firmware version: ${e.version ?: "unknown (legacy / no reply)"}")
                 decideFirmwareUpdate()
+                pumpManualQueue()
+            }
+            is BleEvent.GpsPower -> {
+                // GET/SET_POWER reply — reflect the box's GPS state in the
+                // toggle. Releases the brief-op guard like GET_MODE does.
+                briefOpInFlight = false
+                _state.update { it.copy(gpsPowerOn = e.on) }
+                log("box GPS: ${if (e.on) "on" else "off (battery-save)"}")
                 pumpManualQueue()
             }
             is BleEvent.Sample -> onSample(e.sample)

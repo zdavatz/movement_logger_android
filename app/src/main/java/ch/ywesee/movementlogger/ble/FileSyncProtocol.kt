@@ -65,6 +65,18 @@ object FileSyncProtocol {
      */
     const val OP_GET_VERSION: Byte = 0x10
 
+    /**
+     * GPS_POWER `<u8>` 1 = on, 0 = off (firmware v0.0.35+). Turns the box's
+     * u-blox receiver on or off to save battery when GPS is faulty/unused —
+     * off drops it into UBX-RXM-PMREQ backup (~tens of µA vs ~25 mA). Persisted
+     * on the box and re-applied at boot. Reply is one status byte, exactly like
+     * SET_MODE (0x06). Legacy firmware (< v0.0.35) ignores 0x11 → the op times
+     * out and the toggle stays at its last-known state.
+     */
+    const val OP_GPS_POWER: Byte = 0x11
+    /** GPS_GET_POWER: box replies one byte 1 = on, 0 = off. Twin of GET_MODE. */
+    const val OP_GPS_GET_POWER: Byte = 0x12
+
     // Firmware-update (OTA) opcodes (firmware v0.0.x+). The box stages a new
     // image into the inactive flash bank, then verifies + swaps + resets on
     // COMMIT. Single-in-flight through the same worker state machine as READ
@@ -200,6 +212,18 @@ sealed class BleCmd {
         override fun equals(other: Any?): Boolean = other is UbxPoll && frame.contentEquals(other.frame)
         override fun hashCode(): Int = frame.contentHashCode()
     }
+    /**
+     * Turn the box's GPS receiver on/off to save battery (GPS_POWER 0x11).
+     * Persisted on the box. Reply arrives as [BleEvent.GpsPower]; a single-byte
+     * op demuxed by the worker like [SetLogMode].
+     */
+    data class SetGpsPower(val on: Boolean) : BleCmd()
+    /**
+     * Query the box's current GPS power state (GPS_GET_POWER 0x12); reply
+     * arrives as [BleEvent.GpsPower]. Legacy firmware never answers → the op
+     * times out and the toggle stays unknown.
+     */
+    data object GetGpsPower : BleCmd()
 }
 
 sealed class BleEvent {
@@ -252,6 +276,12 @@ sealed class BleEvent {
      * "older than the latest release → offer an update".
      */
     data class FirmwareVersion(val version: String?) : BleEvent()
+    /**
+     * The box's GPS power state, from a GET (0x12) reply or a confirmed SET
+     * (0x11). `on = true` → receiver active, `false` → backup mode to save
+     * battery. Legacy firmware that never answers leaves the toggle unknown.
+     */
+    data class GpsPower(val on: Boolean) : BleEvent()
     data class Error(val msg: String) : BleEvent()
     /**
      * One decoded SensorStream snapshot (0.5 Hz). Only emitted while

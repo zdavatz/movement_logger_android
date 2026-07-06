@@ -2,6 +2,7 @@ package ch.ywesee.movementlogger.ble
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.min
@@ -409,4 +410,91 @@ class OrientationFilter {
         val m = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
         return if (m > 1e-9) doubleArrayOf(v[0] / m, v[1] / m, v[2] / m) else v
     }
+}
+
+/**
+ * Intuitive board attitude in degrees, derived from the gyro+accel filter's
+ * [OriRows] (drift-free tilt from the accelerometer, heading carried by the
+ * gyroscope) and expressed about the box's PHYSICAL axes as the 3D preview
+ * defines them — nose = long axis (y), up = out of the lid (z):
+ *
+ *   • [pitchDeg] — nose up (+) / down (−): elevation of the nose above horizontal.
+ *   • [rollDeg]  — bank right/starboard (+) / left (−) about the nose axis.
+ *   • [yawDeg]   — compass azimuth [0,360) the nose points to (render bias applied).
+ *
+ * Each is a single decoupled physical quantity — NOT a coupled Euler triple —
+ * so the signs are individually predictable and the numbers stay intuitive at
+ * the modest angles a foil sees. This side-steps the fact that the old accel-
+ * only [LiveSample.rollDeg]/[LiveSample.pitchDeg] assumed a phone-style frame
+ * (long axis = X) and so SWAPPED pitch and roll on this Y-nose box.
+ *
+ * The absolute readout passes the real heading bias so yaw is a compass
+ * heading; the calibrated (tared) readout passes `biasDeg = 0` so "how far I've
+ * turned since I zeroed" is independent of the direction calibration. Pitch and
+ * roll are invariant to the vertical bias, so both readouts agree on them.
+ *
+ * Kotlin port of iOS `struct BoardAngles` (BLE/LiveSample.swift).
+ */
+data class BoardAngles(
+    val pitchDeg: Double,
+    val rollDeg: Double,
+    val yawDeg: Double,
+) {
+    companion object {
+        fun from(rows: OriRows, nosePlusY: Boolean, biasDeg: Double): BoardAngles {
+            val s = if (nosePlusY) 1.0 else -1.0
+            // Triad.world returns [n, e, d] in the world frame, bias applied.
+            fun world(p: DoubleArray): DoubleArray = Triad.world(p, rows, biasDeg)
+            val nose = world(doubleArrayOf(0.0, s, 0.0))   // nose axis in world (n, e, d)
+            val up = world(doubleArrayOf(0.0, 0.0, 1.0))   // lid-up axis in world
+
+            // Pitch: elevation of the nose above the horizon (−Down is up).
+            val pitch = Math.toDegrees(asin((-nose[2]).coerceIn(-1.0, 1.0)))
+
+            // Yaw: compass azimuth of the nose, [0, 360).
+            var yaw = Math.toDegrees(atan2(nose[1], nose[0]))
+            if (yaw < 0) yaw += 360.0
+
+            // Roll (bank about the nose): angle of the box-up axis away from the
+            // vertical plane through the nose. levelUp = world-up projected ⟂
+            // nose; right = nose × levelUp (starboard).
+            val worldUp = doubleArrayOf(0.0, 0.0, -1.0)    // up = −Down
+            val nHat = normalize3(nose)
+            val dun = dot3(worldUp, nHat)
+            val levelUp = normalize3(
+                doubleArrayOf(
+                    worldUp[0] - dun * nHat[0],
+                    worldUp[1] - dun * nHat[1],
+                    worldUp[2] - dun * nHat[2],
+                ),
+            )
+            val right = cross3(nHat, levelUp)
+            val roll = Math.toDegrees(atan2(dot3(up, right), dot3(up, levelUp)))
+
+            return BoardAngles(pitchDeg = pitch, rollDeg = roll, yawDeg = yaw)
+        }
+
+        private fun dot3(a: DoubleArray, b: DoubleArray): Double =
+            a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+        private fun cross3(a: DoubleArray, b: DoubleArray): DoubleArray = doubleArrayOf(
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        )
+
+        private fun normalize3(v: DoubleArray): DoubleArray {
+            val m = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+            return if (m > 1e-9) doubleArrayOf(v[0] / m, v[1] / m, v[2] / m)
+            else doubleArrayOf(0.0, 0.0, 1.0)
+        }
+    }
+}
+
+/** Wrap a signed degree delta into (−180, 180] — used for the tared yaw. */
+fun normDeltaDeg(d: Double): Double {
+    var v = d % 360.0
+    if (v > 180) v -= 360.0
+    if (v <= -180) v += 360.0
+    return v
 }
