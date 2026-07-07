@@ -128,6 +128,11 @@ object FileSyncCore {
     /** The box GET_VERSION query has resolved (reply, timeout, or disconnect). */
     private var fwBoxKnown = false
 
+    /** Set when the connect-time CAL_GET is scheduled/sent so it's a
+     *  strict one-shot per connect (a later user-driven push+reply
+     *  round-trip won't re-fire it). Reset on disconnect. */
+    private var calGetRequested = false
+
     /** Hook for [BleSyncService] to react to state transitions. */
     interface Listener {
         fun onStateChanged(state: FileSyncUiState)
@@ -513,6 +518,85 @@ object FileSyncCore {
     }
 
     /**
+     * Query the box's persisted board-orientation calibration blob (CAL_GET
+     * 0x13, firmware v0.0.37+). Deferred until the single-op BLE worker is
+     * idle — the GET takes the op slot, so firing it during the connect-time
+     * GetLogMode / GetVersion / GetGpsPower / initial sync would just be
+     * rejected. If the box stays busy or is legacy firmware (< v0.0.37) that
+     * never answers, the [BleEvent.Calibration] handler receives `null` and
+     * the local `AgentConfig` copy stands. One-shot per connect (guarded by
+     * [calGetRequested]).
+     */
+    private fun queryCalibration() {
+        if (calGetRequested) return
+        calGetRequested = true
+        scope.launch {
+            val deadline = System.currentTimeMillis() + FW_VERSION_QUERY_WINDOW_MS
+            while (System.currentTimeMillis() < deadline) {
+                val s = _state.value
+                if (s.connection != Connection.Connected) return@launch
+                if (workerIdleForBriefOp(s)) {
+                    briefOpInFlight = true
+                    log("CAL_GET")
+                    ble?.send(BleCmd.GetCalibration)
+                    return@launch
+                }
+                kotlinx.coroutines.delay(500)
+            }
+            log("CAL_GET: box stayed busy — keeping local calibration")
+        }
+    }
+
+    /**
+     * Push a partial calibration update to the box via CAL_SET (0x14).
+     * Fire-and-forget from the caller's POV — the local `AgentConfig`
+     * mutation already ran; this write pushes it to the box so any other
+     * host sees it on next connect. Only fields set on [input] have their
+     * `valid_mask` bit encoded; the box's per-field merge leaves the rest
+     * alone. No-op when disconnected (the connect-time CAL_GET reconciles
+     * on the way back). Legacy firmware (< v0.0.37) silently ignores the
+     * write.
+     */
+    fun pushCalibration(input: Calibration.EncodeInput) {
+        val b = ble ?: return
+        val blob = Calibration.encode(input)
+        log("CAL_SET mask=0x%02X".format(blob[1].toInt() and 0xFF))
+        b.send(BleCmd.SetCalibration(blob))
+    }
+
+    /**
+     * Merge a decoded CAL_GET blob into local [AgentConfig] — per-field:
+     * bits set on the blob win over the local value (the box is source of
+     * truth for the specific hardware), bits clear leave the local value
+     * alone. `null` on any field means "box didn't have this yet" — the
+     * local `AgentConfig` value stands. Mirrors desktop `on_calibration`.
+     */
+    private fun mergeCalibration(d: Calibration.DecodedCal) {
+        val ctx = appContext ?: return
+        d.nosePlusY?.let { AgentConfig.setNosePlusY(ctx, it) }
+        d.magOffsetMg?.let { mo ->
+            AgentConfig.setMagOffset(ctx, floatArrayOf(mo[0].toFloat(), mo[1].toFloat(), mo[2].toFloat()))
+        }
+        d.angleZeroRef?.let { zr ->
+            // The wire treats [0,0,0] + epoch=0 as the wipe sentinel from a
+            // "Reset calibration" / "Clear" push (see pushCalibration call
+            // sites in LiveScreen). Match desktop semantics: on that pattern
+            // clear the local tare instead of writing a bogus zero pose.
+            val isWipe = zr[0] == 0.0 && zr[1] == 0.0 && zr[2] == 0.0 && d.angleZeroAtEpochMs == null
+            if (isWipe) {
+                AgentConfig.setAngleZeroRef(ctx, null)
+                AgentConfig.setAngleZeroAtMs(ctx, null)
+            } else {
+                AgentConfig.setAngleZeroRef(ctx, zr)
+                AgentConfig.setAngleZeroAtMs(ctx, d.angleZeroAtEpochMs)
+            }
+        }
+        d.headingBiasDeg?.let { bd ->
+            AgentConfig.setHeadingBias(ctx, bd.toFloat())
+        }
+    }
+
+    /**
      * Read a firmware `.bin` from the SAF content Uri, compute its SHA-256,
      * and kick off the FW_BEGIN → FW_DATA… → FW_COMMIT upload (desktop/iOS
      * OTA peer). The read + digest run on a background coroutine so a big
@@ -886,6 +970,7 @@ object FileSyncCore {
                 fwLatestKnown = false
                 fwBoxVersion = null
                 fwBoxKnown = false
+                calGetRequested = false
                 // Keep the "Keep synced" toggle + poll job alive across a
                 // disconnect — its tick guards on Connected, so it simply
                 // resumes after a reconnect (sets up Stage 3 auto-resume).
@@ -1028,6 +1113,33 @@ object FileSyncCore {
                 briefOpInFlight = false
                 _state.update { it.copy(gpsPowerOn = e.on) }
                 log("box GPS: ${if (e.on) "on" else "off (battery-save)"}")
+                // Chain the connect-time CAL_GET now that the GPS-power slot
+                // has freed: the connect flow is now GetLogMode → GetVersion →
+                // GetGpsPower → GetCalibration, each self-guarding on an idle
+                // worker. One-shot per connect on v0.0.37+ firmware and a
+                // harmless timeout on legacy. Only when no sync is queued so
+                // a live batch's LISTs don't get displaced.
+                if (!_state.value.syncing) queryCalibration()
+                pumpManualQueue()
+            }
+            is BleEvent.Calibration -> {
+                // CAL_GET / CAL_SET reply — merge the box's per-field values
+                // into local AgentConfig (LiveScreen re-reads them via
+                // LaunchedEffect on the next sample). Releases the brief-op
+                // guard like GET_MODE does.
+                briefOpInFlight = false
+                val blob = e.blob
+                if (blob == null) {
+                    log("box calibration: no reply (legacy firmware < v0.0.37, keeping local config)")
+                } else {
+                    val d = Calibration.decode(blob)
+                    if (d == null) {
+                        log("box calibration: malformed blob (${blob.size} B) — keeping local")
+                    } else {
+                        mergeCalibration(d)
+                        log("box calibration mask=0x%02X".format(blob[1].toInt() and 0xFF))
+                    }
+                }
                 pumpManualQueue()
             }
             is BleEvent.Sample -> onSample(e.sample)

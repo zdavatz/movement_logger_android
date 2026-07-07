@@ -188,6 +188,7 @@ class BleClient(private val context: Context) {
             BleCmd.List, BleCmd.GetLogMode, BleCmd.GetFirmwareVersion,
             is BleCmd.Read, is BleCmd.Delete, is BleCmd.SetLogMode,
             is BleCmd.SetGpsPower, BleCmd.GetGpsPower,
+            BleCmd.GetCalibration, is BleCmd.SetCalibration,
             -> awaitCmdSettle()
             else -> Unit
         }
@@ -216,6 +217,8 @@ class BleClient(private val context: Context) {
             is BleCmd.UbxPoll -> sendUbxPoll(cmd.frame)
             is BleCmd.SetGpsPower -> sendSetGpsPower(cmd.on)
             BleCmd.GetGpsPower -> sendGetGpsPower()
+            BleCmd.GetCalibration -> sendGetCalibration()
+            is BleCmd.SetCalibration -> sendSetCalibration(cmd.blob)
         }
     }
 
@@ -311,6 +314,14 @@ class BleClient(private val context: Context) {
             is CurrentOp.GpsPwrReq -> emitErr(
                 "${if (o.isSet) "GPS_POWER" else "GPS_GET_POWER"} aborted by disconnect"
             )
+            is CurrentOp.CalReq -> {
+                // Link dropped mid CAL_GET/CAL_SET — the client keeps its
+                // local AgentConfig. On a GET-side abort, emit
+                // Calibration(null) so the caller stops waiting; on a SET-
+                // side abort stay silent (the client keeps its optimistic
+                // local update, a re-send later is a normal path).
+                if (!o.isSet) emit(BleEvent.Calibration(null))
+            }
             is CurrentOp.VersionReq -> {
                 // Link dropped mid-query — report "unknown" so the firmware
                 // check resolves (→ treated as "older than latest") instead
@@ -556,6 +567,57 @@ class BleClient(private val context: Context) {
         }
         if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_GPS_GET_POWER))) return
         op = CurrentOp.GpsPwrReq(isSet = false, on = false, lastProgress = now())
+    }
+
+    /**
+     * CAL_GET (0x13). Fetch the box's persisted calibration blob so a
+     * "Zero here" / nosePlusY / heading-bias set on any host is visible to
+     * this one on the next connect. Firmware v0.0.37+; legacy silently
+     * ignores it → the [CurrentOp.CalReq] op times out and emits
+     * `Calibration(null)`. Self-guards on `op == Idle` (so it can't trample
+     * an in-flight LIST/READ); the reply is demuxed by [op].
+     */
+    private fun sendGetCalibration() {
+        if (op !is CurrentOp.Idle) {
+            emitErr("CAL_GET rejected — another op in flight")
+            return
+        }
+        if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_CAL_GET))) return
+        op = CurrentOp.CalReq(
+            isSet = false,
+            blob = ByteArray(0),
+            lastProgress = now(),
+        )
+    }
+
+    /**
+     * CAL_SET (0x14 + 32-byte blob). Push a partial calibration update to
+     * the box for merge into `CAL.CFG`. Box replies one status byte; on OK
+     * the [CurrentOp.CalReq] handler re-emits `Calibration(blob)` with the
+     * just-pushed blob so the caller can mirror it as authoritative without
+     * a second GET roundtrip.
+     */
+    private fun sendSetCalibration(blob: ByteArray) {
+        if (op !is CurrentOp.Idle) {
+            emitErr("CAL_SET rejected — another op in flight")
+            return
+        }
+        if (blob.size != Calibration.BLOB_SIZE) {
+            emitErr("CAL_SET rejected — blob is ${blob.size} B (expected ${Calibration.BLOB_SIZE})")
+            return
+        }
+        val payload = ByteArray(1 + blob.size)
+        payload[0] = FileSyncProtocol.OP_CAL_SET
+        System.arraycopy(blob, 0, payload, 1, blob.size)
+        if (!writeCmdBytes(payload)) return
+        op = CurrentOp.CalReq(
+            isSet = true,
+            blob = blob.copyOf(),
+            lastProgress = now(),
+        )
+        emit(BleEvent.Status(
+            "CAL_SET sent (mask=0x${"%02X".format(blob[1].toInt() and 0xFF)})"
+        ))
     }
 
     /**
@@ -892,6 +954,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Deleting -> handleDeleteNotify(current, value)
             is CurrentOp.ModeReq -> handleModeNotify(current, value)
             is CurrentOp.GpsPwrReq -> handleGpsPwrNotify(current, value)
+            is CurrentOp.CalReq -> handleCalibrationNotify(current, value)
             is CurrentOp.VersionReq -> handleVersionNotify(value)
             is CurrentOp.Uploading -> handleUploadNotify(current, value)
         }
@@ -1068,6 +1131,47 @@ class BleClient(private val context: Context) {
         } else {
             // GET reply: 0 = off, 1 = on.
             emit(BleEvent.GpsPower(on = b.toInt() != 0))
+        }
+        op = CurrentOp.Idle
+    }
+
+    /**
+     * CAL_GET / CAL_SET reply — twin of [handleGpsPwrNotify], demuxed by
+     * `state.isSet`.
+     *  - GET (0x13): 32-byte blob → emit `Calibration(Some(blob))`. Anything
+     *    shorter/longer → ignore + drop to Idle so a stray notify doesn't
+     *    lock the toggle.
+     *  - SET (0x14): 1-byte status. `0x00` OK ⇒ re-emit
+     *    `Calibration(Some(sent_blob))` with the just-pushed blob so the
+     *    receiver mirrors it as authoritative without a second GET
+     *    roundtrip. Anything else surfaces as an error and the client keeps
+     *    its optimistic local update.
+     */
+    private fun handleCalibrationNotify(state: CurrentOp.CalReq, value: ByteArray) {
+        if (state.isSet) {
+            if (value.isEmpty()) return  // tolerate stray
+            val b = value[0]
+            if (b == FileSyncProtocol.STATUS_OK) {
+                emit(BleEvent.Calibration(state.blob.copyOf()))
+                emit(BleEvent.Status(
+                    "CAL_SET OK (mask=0x${"%02X".format(state.blob[1].toInt() and 0xFF)})"
+                ))
+            } else {
+                val msg = when (b) {
+                    FileSyncProtocol.STATUS_IO_ERROR -> "IO_ERROR (SD write failed)"
+                    FileSyncProtocol.STATUS_BAD_REQUEST -> "BAD_REQUEST (wrong-size or wrong-version blob)"
+                    else -> FileSyncProtocol.statusMessage(b)
+                }
+                emitErr("CAL_SET: $msg (0x${"%02X".format(b.toInt() and 0xFF)})")
+            }
+        } else {
+            if (value.size == Calibration.BLOB_SIZE) {
+                emit(BleEvent.Calibration(value.copyOf()))
+            } else {
+                // Firmware bug or wire desync — treat as if the timeout
+                // fired (client falls back to local AgentConfig).
+                emit(BleEvent.Calibration(null))
+            }
         }
         op = CurrentOp.Idle
     }
@@ -1366,6 +1470,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.Deleting -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.ModeReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.GpsPwrReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
+            is CurrentOp.CalReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.VersionReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             // Uploading is handled by tickUploadWatchdog above (early return),
             // so it never reaches here — branch present only for exhaustiveness.
@@ -1394,6 +1499,14 @@ class BleClient(private val context: Context) {
                 "${if (o.isSet) "GPS_POWER" else "GPS_GET_POWER"} timed out — no reply " +
                     "for 20 s (firmware may not support GPS on/off)"
             )
+            is CurrentOp.CalReq -> {
+                // Legacy firmware (< v0.0.37) never replies to CAL_GET / CAL_SET.
+                // Drop to Idle without reconnecting; on a GET-side timeout emit
+                // Calibration(null) so the client stops waiting and falls back to
+                // its local AgentConfig. On a SET-side timeout stay silent — the
+                // client keeps its optimistic local update.
+                if (!o.isSet) emit(BleEvent.Calibration(null))
+            }
             is CurrentOp.VersionReq -> {
                 // Legacy firmware (≤ v0.0.28) never replies to GET_VERSION.
                 // Unlike GET_MODE we DO emit a terminal event — null — so the
@@ -1579,6 +1692,23 @@ class BleClient(private val context: Context) {
          *  Legacy firmware never answers → the watchdog resolves it to
          *  `FirmwareVersion(null)`. */
         data class VersionReq(var lastProgress: Long) : CurrentOp()
+        /** CAL_GET (0x13) / CAL_SET (0x14): waiting for the FileData reply
+         *  (a 32-byte blob for GET, one status byte for SET). Twin of
+         *  [ModeReq] / [GpsPwrReq]. Legacy firmware (< v0.0.37) never replies
+         *  → the watchdog resolves it to `Calibration(null)` on a GET-side
+         *  timeout, silence on a SET-side timeout. `blob` is the just-pushed
+         *  payload on SET so we can re-emit it as `Calibration` on OK. */
+        data class CalReq(
+            val isSet: Boolean,
+            val blob: ByteArray,
+            var lastProgress: Long,
+        ) : CurrentOp() {
+            override fun equals(other: Any?): Boolean = other is CalReq &&
+                isSet == other.isSet && blob.contentEquals(other.blob) &&
+                lastProgress == other.lastProgress
+            override fun hashCode(): Int =
+                31 * (31 * isSet.hashCode() + blob.contentHashCode()) + lastProgress.hashCode()
+        }
         /**
          * Firmware OTA upload (FW_BEGIN → FW_DATA… → FW_COMMIT). ACK-gated:
          * exactly one FW_* write is in flight at a time and we advance only

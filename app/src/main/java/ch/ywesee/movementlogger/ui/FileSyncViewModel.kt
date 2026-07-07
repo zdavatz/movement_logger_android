@@ -257,4 +257,18 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
     /** Re-seed the gyro+accel orientation filter (iOS `orientationFilter.reset()`
      *  in `resetMagCalibration`). Called from the Live tab's "Reset calibration". */
     fun resetOrientationFilter() = FileSyncCore.resetOrientationFilter()
+
+    /**
+     * Push a partial board-orientation calibration update to the connected
+     * box (CAL_SET 0x14, firmware v0.0.37+). Every Live-tab tap that
+     * mutates local calibration must ALSO call this so a "Zero here" /
+     * "USB-C south" / nose-flip / "Reset calibration" done on Android is
+     * visible from iPhone / desktop on their next connect. Only fields set
+     * on [input] have their `valid_mask` bit encoded; the box's per-field
+     * merge leaves the rest alone. No-op when disconnected — the local
+     * mutation already ran, and the connect-time CAL_GET reconciles the
+     * two directions when the box comes back.
+     */
+    fun pushCalibration(input: ch.ywesee.movementlogger.ble.Calibration.EncodeInput) =
+        FileSyncCore.pushCalibration(input)
 }

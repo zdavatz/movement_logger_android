@@ -48,6 +48,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import ch.ywesee.movementlogger.ble.BatterySample
 import ch.ywesee.movementlogger.ble.BoardAngles
+import ch.ywesee.movementlogger.ble.Calibration
 import ch.ywesee.movementlogger.ble.LiveSample
 import ch.ywesee.movementlogger.ble.OriRows
 import ch.ywesee.movementlogger.ble.Triad
@@ -87,7 +88,13 @@ fun LiveScreen(onGoToSync: () -> Unit) {
             )
         },
     ) { padding ->
-        LiveContent(state, onGoToSync, { vm.resetOrientationFilter() }, Modifier.padding(padding))
+        LiveContent(
+            state = state,
+            onGoToSync = onGoToSync,
+            onResetFilter = { vm.resetOrientationFilter() },
+            onPushCalibration = { vm.pushCalibration(it) },
+            modifier = Modifier.padding(padding),
+        )
     }
 }
 
@@ -96,6 +103,7 @@ private fun LiveContent(
     state: FileSyncUiState,
     onGoToSync: () -> Unit,
     onResetFilter: () -> Unit,
+    onPushCalibration: (Calibration.EncodeInput) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -152,8 +160,15 @@ private fun LiveContent(
         var angleZeroRef by remember { mutableStateOf(AgentConfig.angleZeroRef(ctx)) }
         var angleZeroAtMs by remember { mutableStateOf(AgentConfig.angleZeroAtMs(ctx)) }
         LaunchedEffect(sample) {
+            // Also re-read the three CAL_GET-driven fields so a connect-time
+            // merge from the box's CAL.CFG shows up in the UI on the next
+            // 0.5 Hz sample (FileSyncCore.mergeCalibration writes prefs; this
+            // is where LiveScreen picks them up).
             magOffset = AgentConfig.magOffset(ctx)
             headingBias = AgentConfig.headingBiasDeg(ctx)
+            nosePlusY = AgentConfig.nosePlusY(ctx)
+            angleZeroRef = AgentConfig.angleZeroRef(ctx)
+            angleZeroAtMs = AgentConfig.angleZeroAtMs(ctx)
         }
 
         // Board angles (pitch/roll/yaw about the box's PHYSICAL axes) — the
@@ -173,6 +188,15 @@ private fun LiveContent(
                     AgentConfig.setAngleZeroAtMs(ctx, now)
                     angleZeroRef = ref
                     angleZeroAtMs = now
+                    // Also push to the box's CAL.CFG so a "Zero here" done on
+                    // Android is visible from iPhone/desktop on their next
+                    // connect (box is source of truth per DESIGN.md). Only
+                    // the angle-zero bit is set, so the box's merge leaves
+                    // the other calibration fields alone.
+                    onPushCalibration(Calibration.EncodeInput(
+                        angleZeroRef = ref,
+                        angleZeroAtEpochMs = now,
+                    ))
                 }
             },
             onClear = {
@@ -180,6 +204,15 @@ private fun LiveContent(
                 AgentConfig.setAngleZeroAtMs(ctx, null)
                 angleZeroRef = null
                 angleZeroAtMs = null
+                // Push a zeros-with-mask-set to the box — the merge stores
+                // all-zero for the tare fields (angleZeroAtEpoch=0 is the
+                // "never zeroed" sentinel; the ref itself reads back as
+                // [0,0,0]° via decode). Any host reading afterwards sees no
+                // tare, which matches the local Clear semantics.
+                onPushCalibration(Calibration.EncodeInput(
+                    angleZeroRef = doubleArrayOf(0.0, 0.0, 0.0),
+                    angleZeroAtEpochMs = 0L,
+                ))
             },
         )
         Spacer(Modifier.height(12.dp))
@@ -198,17 +231,53 @@ private fun LiveContent(
             onSetDirection = { bias ->
                 AgentConfig.setHeadingBias(ctx, bias)
                 headingBias = bias
+                // Push the heading bias so a "USB-C south" set here is
+                // visible from iPhone/desktop on their next connect.
+                onPushCalibration(Calibration.EncodeInput(
+                    headingBiasDeg = bias.toDouble(),
+                ))
             },
-            onNoseConfirm = { v ->
+            onNoseConfirm = { v, newBias ->
                 AgentConfig.setNosePlusY(ctx, v)
                 nosePlusY = v
+                if (newBias != null) {
+                    AgentConfig.setHeadingBias(ctx, newBias)
+                    headingBias = newBias
+                }
+                // Combined into a single CAL_SET write — the BLE worker is
+                // single-op, so pushing nose + bias in one blob avoids the
+                // second write racing the first and being rejected. Bit is
+                // only set when the value actually changed (newBias != null
+                // ⇔ nose flipped).
+                onPushCalibration(Calibration.EncodeInput(
+                    nosePlusY = v,
+                    headingBiasDeg = newBias?.toDouble(),
+                ))
             },
             onReset = {
                 AgentConfig.resetMagCalibration(ctx)
+                // A tare captured under the old nose end / frame is now
+                // meaningless — drop it too, matching desktop semantics.
+                AgentConfig.setAngleZeroRef(ctx, null)
+                AgentConfig.setAngleZeroAtMs(ctx, null)
                 onResetFilter()
                 magOffset = null
                 headingBias = 0f
                 nosePlusY = null
+                angleZeroRef = null
+                angleZeroAtMs = null
+                // Wipe the box's copy too so a fresh calibration on this or
+                // any other host starts from a clean slate. All four mask
+                // bits set with all-zero payloads — the merge overwrites
+                // each field to zero, which decode()s back as the "not
+                // calibrated" sentinel. Legacy firmware ignores silently.
+                onPushCalibration(Calibration.EncodeInput(
+                    nosePlusY = false,
+                    magOffsetMg = doubleArrayOf(0.0, 0.0, 0.0),
+                    angleZeroRef = doubleArrayOf(0.0, 0.0, 0.0),
+                    angleZeroAtEpochMs = 0L,
+                    headingBiasDeg = 0.0,
+                ))
             },
         )
 
@@ -576,7 +645,15 @@ private fun OrientationSection(
     headingBias: Float,
     nosePlusY: Boolean?,
     onSetDirection: (Float) -> Unit,
-    onNoseConfirm: (Boolean) -> Unit,
+    /**
+     * `v` = the new nosePlusY. `newBias` = the flipped-by-180° heading bias
+     * when the nose end actually changed (nudged so the set direction stays
+     * valid); `null` when this tap just confirmed the existing end (no flip
+     * → no bias change). The caller writes a SINGLE combined CAL_SET so the
+     * BLE worker's single-op guard doesn't reject a second consecutive
+     * push.
+     */
+    onNoseConfirm: (v: Boolean, newBias: Float?) -> Unit,
     onReset: () -> Unit,
 ) {
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -624,10 +701,14 @@ private fun OrientationSection(
             // Nose end = the long-axis end currently pointing up.
             val was = nosePlusY ?: false
             val now = s.accMg[1].toInt() > 0
-            onNoseConfirm(now)
             // Flipping the nose end flips its azimuth by exactly 180° in any
-            // pose — nudge the bias to keep the set direction valid.
-            if (now != was) onSetDirection(normDeg(headingBias.toDouble() + 180.0).toFloat())
+            // pose — nudge the bias to keep the set direction valid. Pass
+            // the new bias to the callback so it can compose one atomic
+            // CAL_SET (nose + bias) instead of two racing writes.
+            val newBias = if (now != was)
+                normDeg(headingBias.toDouble() + 180.0).toFloat()
+            else null
+            onNoseConfirm(now, newBias)
         },
         enabled = upright,
     ) { Text("USB-C end is UP — confirm") }

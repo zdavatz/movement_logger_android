@@ -77,6 +77,26 @@ object FileSyncProtocol {
     /** GPS_GET_POWER: box replies one byte 1 = on, 0 = off. Twin of GET_MODE. */
     const val OP_GPS_GET_POWER: Byte = 0x12
 
+    /**
+     * CAL_GET (firmware v0.0.37+): host writes the single byte `0x13`; the box
+     * replies with ONE 32-byte FileData notification carrying its persisted
+     * calibration blob (nose_plus_y, mag_offset_mg, angle_zero_ref+epoch,
+     * heading_bias_deg — see [Calibration] for the wire layout). Same
+     * send+reply shape as GET_MODE (0x07) but with a 32-byte payload instead
+     * of one status byte. Legacy firmware (< v0.0.37) doesn't know 0x13 and
+     * sends NO reply → the op times out and is reported as `Calibration(null)`
+     * so the host falls back to its local `AgentConfig` copy.
+     */
+    const val OP_CAL_GET: Byte = 0x13
+    /**
+     * CAL_SET (firmware v0.0.37+): host writes `0x14 + 32-byte blob` (see
+     * [Calibration.encode]); the box merges per-field into `CAL.CFG` and
+     * replies one status byte (0x00 OK, else error). Same shape as SET_MODE
+     * (0x06). Legacy firmware silently ignores it → the op times out and the
+     * client keeps its optimistic local update.
+     */
+    const val OP_CAL_SET: Byte = 0x14
+
     // Firmware-update (OTA) opcodes (firmware v0.0.x+). The box stages a new
     // image into the inactive flash bank, then verifies + swaps + resets on
     // COMMIT. Single-in-flight through the same worker state machine as READ
@@ -224,6 +244,28 @@ sealed class BleCmd {
      * times out and the toggle stays unknown.
      */
     data object GetGpsPower : BleCmd()
+    /**
+     * CAL_GET (0x13) — fetch the box's persisted calibration blob so a
+     * "Zero here" / nosePlusY / heading-bias set on any host survives on the
+     * next connect from a different one. Reply arrives as
+     * [BleEvent.Calibration] carrying either the 32-byte blob or `null`
+     * (legacy firmware < v0.0.37 that never answered → op timed out). Twin
+     * of [GetLogMode]: single-op slot, demuxed by the worker.
+     */
+    data object GetCalibration : BleCmd()
+    /**
+     * CAL_SET (0x14 + 32-byte blob) — push a partial calibration update to
+     * the box's `CAL.CFG` (see [Calibration.encode]). Only fields whose
+     * `valid_mask` bit is set overwrite the stored ones. Reply arrives as
+     * [BleEvent.Calibration] carrying the just-pushed blob on OK (so the
+     * caller can mirror it as authoritative without a second GET
+     * roundtrip). Rejected while another op is in flight.
+     */
+    data class SetCalibration(val blob: ByteArray) : BleCmd() {
+        override fun equals(other: Any?): Boolean =
+            other is SetCalibration && blob.contentEquals(other.blob)
+        override fun hashCode(): Int = blob.contentHashCode()
+    }
 }
 
 sealed class BleEvent {
@@ -282,6 +324,20 @@ sealed class BleEvent {
      * battery. Legacy firmware that never answers leaves the toggle unknown.
      */
     data class GpsPower(val on: Boolean) : BleEvent()
+    /**
+     * Box's calibration blob, from a CAL_GET (0x13) reply or a confirmed
+     * CAL_SET (0x14) round-trip. Non-null carries the box's current 32-byte
+     * blob; the receiver should [Calibration.decode] it to drive the local
+     * `AgentConfig` merge (per-field: bits set on the blob win over local,
+     * bits clear leave the local value alone). `null` = legacy firmware
+     * (< v0.0.37) didn't reply → op timed out; the client keeps its local
+     * `AgentConfig` as before, no cross-device sync available.
+     */
+    data class Calibration(val blob: ByteArray?) : BleEvent() {
+        override fun equals(other: Any?): Boolean = other is Calibration &&
+            (blob?.contentEquals(other.blob ?: ByteArray(0)) ?: (other.blob == null))
+        override fun hashCode(): Int = blob?.contentHashCode() ?: 0
+    }
     data class Error(val msg: String) : BleEvent()
     /**
      * One decoded SensorStream snapshot (0.5 Hz). Only emitted while
