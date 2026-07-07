@@ -150,6 +150,41 @@ The Done banner exposes an **Open video** button that fires `Intent.ACTION_VIEW`
 - **HDR sources trip `OverlayShaderProgram` checkArgument.** HEVC HLG / Ultra-HDR clips (iPhone, Pixel main camera) route through Media3's HDR overlay codepath, which asserts `bitmap.hasGainmap()` on the overlay — our SDR panel bitmap fails. Fix: set `Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL` on the composition. Without it, the Ayano_Pump session crashes with `java.lang.IllegalArgumentException at OverlayShaderProgram.drawFrame:131` on Pixel 8a.
 - **Rotation:** the encoded stream keeps the source's rotation flag (1080×3840 raw bytes for a portrait source) but plays back rotated (3840×1080 displayed → 1080×3840 visible). Don't try to compensate in pixel space; trust the rotation metadata.
 
+## Box-sourced board-orientation calibration (v0.0.46+) — `Calibration.kt`
+
+The four calibration fields (`nosePlusY`, `magOffsetMg`, `angleZeroRef`
++ `angleZeroAtEpoch`, `headingBiasDeg`) live on the BOX in `CAL.CFG`
+(firmware v0.0.37+) — `AgentConfig` still mirrors them into
+`SharedPreferences`, but the box is now the source of truth. A "Zero
+here" or nose toggle done on Android is visible to iPhone + Desktop
+on their next connect (and vice versa).
+
+- **Wire format** (32-byte blob, per-field `validMask`, tenths-of-degree
+  fixed point, LE `ULong` epoch ms): `app/src/main/java/ch/ywesee/movementlogger/ble/Calibration.kt`
+  — `encode(input)` / `decode(bytes)`. 1:1 port of desktop
+  `stbox-viz-gui/src/calibration.rs`; byte-compatible. Round-trip
+  covered by `CalibrationTest`.
+- **On connect**: `FileSyncCore.queryCalibration()` chains a
+  `CAL_GET (0x13)` after the `BleEvent.GpsPower` reply lands
+  (self-guarded, one-shot per connect via `calGetRequested`). Reply →
+  `BleEvent.Calibration(bytes?)` → `mergeCalibration(d)` writes each
+  non-null field into `AgentConfig`; fields the box hasn't set leave
+  the local value alone. Legacy firmware (< v0.0.37) times out
+  silently (`.Calibration(null)`) — the app keeps SharedPreferences
+  as before. LiveScreen re-reads the merged values on the next 0.5 Hz
+  sample so the UI reflects the box's state without a manual refresh.
+- **On any user tap**: `FileSyncViewModel.pushCalibration(input)` fires
+  `CAL_SET (0x14)` with ONLY the touched field's bit set. Call sites
+  in `LiveScreen.kt`: `Zero here` / `Clear`, `USB-C south — set
+  direction`, nose-confirm (**single combined blob** — nose +
+  nudged bias in one `CAL_SET`; the strict single-op BLE worker
+  would reject a second write while the first is in flight, so the
+  atomic combined push matters — this is a deliberate deviation
+  from the desktop's two-sequential-call pattern), and
+  `Reset calibration` (full wipe on all four mask bits).
+- **Deliberately not synced**: continuous mag-offset auto-cal — same
+  "avoid SD write churn" tradeoff as desktop + iOS.
+
 ## BLE protocol gotchas (carried over from the Rust client)
 
 - Subscribe to FileData notifications **once per connection**, not per op. Subscribing per op risks losing the first packet if the box notifies before the await is parked.
