@@ -1,6 +1,7 @@
 package ch.ywesee.movementlogger.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -374,6 +375,8 @@ private fun RecordingRowContent(
         modifier = Modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surface)
+            // Tapping the row opens the track on the map — iOS Rides parity.
+            .clickable(onClick = onMap)
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
