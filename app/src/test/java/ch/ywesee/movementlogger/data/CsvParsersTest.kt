@@ -82,6 +82,53 @@ class CsvParsersTest {
         assertEquals(0.60, first.hdop, 1e-9)
     }
 
+    @Test
+    fun parsesCompactGpsSchema() {
+        // Post-22.4.2026 firmware: compact names, `ms` in raw milliseconds.
+        val csv = """
+            ms,utc,lat,lon,alt_m,speed_kmh,course_deg,fix_q,nsat,hdop
+            1010,125053.90,37.3829493,23.2481843,-0.30,0.29,231.6,1,12,0.60
+            # SYNC epoch_ms=1751882000000 tick_ms=1100
+            1110,125054.00,37.3829500,23.2481850,-0.28,0.31,231.8,1,12,0.60
+        """.trimIndent().toByteArray()
+        val rows = ByteArrayInputStream(csv).use(CsvParsers::parseGpsStream)
+        assertEquals(2, rows.size)
+        assertEquals(101.0, rows[0].ticks, 0.0) // ms ÷ 10 → 10ms ticks
+        assertEquals(37.3829493, rows[0].lat, 1e-9)
+        assertEquals(0.31, rows[1].speedKmhModule, 1e-9)
+    }
+
+    @Test
+    fun parsesBracketedUbloxGpsSchema() {
+        // USB u-blox logger (`UbloxGpsCore`) + iOS watch logger schema.
+        // A row missing lat/lon entirely is skipped; a GGA-only half row
+        // (blank speed/course) is KEPT with NaN in the optional fields.
+        val csv = """
+            Time [10ms],UTC,Lat [deg],Lon [deg],Alt [m],SpeedKMh,Course [deg],Fix,NumSat,HDOP
+            100,142025.00,47.372400,8.541700,410.100000,12.300000,88.000000,1,9,1.100000
+            200,142026.00,,,,,,0,0,
+            300,142026.00,47.372500,8.541900,410.200000,,,1,9,1.100000
+        """.trimIndent().toByteArray()
+        val rows = ByteArrayInputStream(csv).use(CsvParsers::parseGpsStream)
+        assertEquals(2, rows.size)
+        assertEquals(47.3724, rows[0].lat, 1e-9)
+        assertEquals(12.3, rows[0].speedKmhModule, 1e-9)
+        assertEquals(300.0, rows[1].ticks, 0.0)
+        assertTrue(rows[1].speedKmhModule.isNaN())
+        assertEquals(1, rows[1].fix)
+    }
+
+    @Test
+    fun gpsSkipsTornTailRow() {
+        val csv = """
+            Time [10ms],UTC,Lat,Lon,Alt [m],Speed [km/h],Course [deg],Fix,NumSat,HDOP
+            101,125053.90,37.3829493,23.2481843,-0.30,0.29,231.6,1,12,0.60
+            201,125054.90,37.38
+        """.trimIndent().toByteArray()
+        val rows = ByteArrayInputStream(csv).use(CsvParsers::parseGpsStream)
+        assertEquals(1, rows.size)
+    }
+
     // ---- Battery ---------------------------------------------------------
 
     @Test

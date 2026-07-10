@@ -202,41 +202,53 @@ object CsvParsers {
         val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
         val header = reader.readLine() ?: throw IOException("gps csv: empty file")
         val cols = HeaderMap(header)
-        val iT = cols.idxAny("Time [10ms]", "Time [mS]")
-        val iUtc = cols.idxAny("UTC")
-        val iLat = cols.idxAny("Lat")
-        val iLon = cols.idxAny("Lon")
-        val iAlt = cols.idxAny("Alt [m]")
-        val iSpd = cols.idxAny("Speed [km/h]")
-        val iCrs = cols.idxAny("Course [deg]")
-        val iFix = cols.idxAny("Fix")
-        val iSat = cols.idxAny("NumSat")
-        val iHdp = cols.idxAny("HDOP")
+        // Post-22.4.2026 firmware switched to compact column names. `ms` is
+        // raw milliseconds, so divide by 10 to stay in 10ms ticks. (Exact
+        // mirror of the iOS parser, incl. the bracketed u-blox/watch names.)
+        val iMs = cols.idxOrNull("ms")
+        val iT = iMs ?: cols.idxAny("Time [10ms]", "Time [mS]")
+        val tickDiv = if (iMs != null) 10.0 else 1.0
+        val iUtc = cols.idxAny("UTC", "utc")
+        // The USB u-blox logger (`UbloxGpsCore`) and the iOS watch logger
+        // write bracketed column names — `Lat [deg]` / `Lon [deg]` /
+        // `SpeedKMh` — so accept those alongside the box firmware's
+        // `Lat`/`lat` and `speed_kmh`.
+        val iLat = cols.idxAny("Lat", "lat", "Lat [deg]")
+        val iLon = cols.idxAny("Lon", "lon", "Lon [deg]")
+        val iAlt = cols.idxAny("Alt [m]", "alt_m")
+        val iSpd = cols.idxAny("Speed [km/h]", "speed_kmh", "SpeedKMh")
+        val iCrs = cols.idxAny("Course [deg]", "course_deg")
+        val iFix = cols.idxAny("Fix", "fix_q")
+        val iSat = cols.idxAny("NumSat", "nsat")
+        val iHdp = cols.idxAny("HDOP", "hdop")
 
         val out = ArrayList<GpsRow>(2048)
-        var lineNo = 1
         while (true) {
             val line = reader.readLine() ?: break
-            lineNo++
             if (line.isBlank()) continue
             val r = splitTrim(line)
+            // Skip corrupted rows (torn tail of a live-mirrored file, `#`
+            // comment lines) instead of failing the whole file — iOS parity.
+            // Only ticks + lat + lon are essential; the USB u-blox logger
+            // legitimately leaves alt/speed/course/hdop blank on rows where
+            // only one NMEA sentence contributed (→ NaN / 0 defaults).
             try {
                 out.add(
                     GpsRow(
-                        ticks = parseDouble(r, iT),
+                        ticks = parseDouble(r, iT) / tickDiv,
                         utc = r[iUtc],
                         lat = parseDouble(r, iLat),
                         lon = parseDouble(r, iLon),
-                        altM = parseDouble(r, iAlt),
-                        speedKmhModule = parseDouble(r, iSpd),
-                        courseDeg = parseDouble(r, iCrs),
-                        fix = parseInt(r, iFix),
-                        numSat = parseInt(r, iSat),
-                        hdop = parseDouble(r, iHdp),
+                        altM = parseDoubleOrNan(r, iAlt),
+                        speedKmhModule = parseDoubleOrNan(r, iSpd),
+                        courseDeg = parseDoubleOrNan(r, iCrs),
+                        fix = parseIntOrZero(r, iFix),
+                        numSat = parseIntOrZero(r, iSat),
+                        hdop = parseDoubleOrNan(r, iHdp),
                     )
                 )
-            } catch (e: Exception) {
-                throw IOException("gps csv row $lineNo: ${e.message}", e)
+            } catch (_: Exception) {
+                continue
             }
         }
         return out
@@ -280,6 +292,8 @@ private class HeaderMap(headerLine: String) {
     private val map: Map<String, Int> =
         splitTrim(headerLine).withIndex().associate { (i, name) -> name to i }
 
+    fun idxOrNull(name: String): Int? = map[name]
+
     fun idxAny(vararg names: String): Int {
         for (n in names) map[n]?.let { return it }
         throw IOException("missing column, expected one of ${names.toList()}; got ${map.keys}")
@@ -297,3 +311,9 @@ private fun parseInt(row: List<String>, idx: Int): Int {
     val s = row.getOrNull(idx) ?: throw IOException("missing column at index $idx")
     return s.toIntOrNull() ?: throw IOException("not an int: \"$s\"")
 }
+
+private fun parseDoubleOrNan(row: List<String>, idx: Int): Double =
+    row.getOrNull(idx)?.toDoubleOrNull() ?: Double.NaN
+
+private fun parseIntOrZero(row: List<String>, idx: Int): Int =
+    row.getOrNull(idx)?.toIntOrNull() ?: 0

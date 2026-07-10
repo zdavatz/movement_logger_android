@@ -44,6 +44,9 @@
     <!-- Reach GitHub Releases to check for / download a newer box firmware
          image (FirmwareRelease → the "New box firmware" banner + FOTA flow). -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- osmdroid (ride-map tiles) skips all tile downloads when it can't
+         check connectivity — without this the map stays a grey grid. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 

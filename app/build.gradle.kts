@@ -29,8 +29,8 @@ android {
         applicationId = "ch.ywesee.movementlogger"
         minSdk = 26
         targetSdk = 35
-        versionCode = cliVersionCode ?: 46
-        versionName = cliVersionName ?: "0.0.46"
+        versionCode = cliVersionCode ?: 47
+        versionName = cliVersionName ?: "0.0.47"
     }
 
     if (signingProps != null) {
@@ -45,6 +45,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Own app id so a debug build installs ALONGSIDE the Play-signed
+            // release on a test phone instead of failing the signature check.
+            // FileProvider authority follows via ${applicationId}.
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
@@ -107,6 +114,9 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.usb.serial)
+    // OSM map view for the ride-map screen (interactive track display).
+    // Tile fetches go to tile.openstreetmap.org with the app's user agent.
+    implementation(libs.osmdroid.android)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
 

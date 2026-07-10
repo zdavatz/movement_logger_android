@@ -24,13 +24,19 @@ Requires Android 8.0 (API 26) or newer. Targets API 35.
 
 ## What it does
 
-Three screens via the bottom navigation bar.
+Five tabs via the bottom navigation bar: Live, GPS, Sync, Replay, GPS Debug.
 
 ### Live
 
 When connected to a PumpLogger-firmware box (advertises as `STBoxFs`), shows the 0.5 Hz SensorStream snapshot live: accel / gyro / mag / baro / GPS readouts plus two sparklines (acceleration magnitude, barometric pressure). Subscription is automatic on Connect — no extra button. On connect, the app requests an ATT MTU of 247 so each 46-byte snapshot lands in a single notify (the firmware doesn't chunk on small MTUs, so the upgrade is required to see data). Legacy PumpTsueri firmware doesn't expose the SensorStream characteristic, so the tab stays empty with a one-shot log line in the Sync log explaining why.
 
 A **Board angles** card sits above the readouts: live **Pitch** (up/down hill), **Roll** (lean left/right) and **Yaw** (heading), computed about the box's *physical* axes from the gyro + accel orientation filter (not the raw accel formulas). The box's nose is its Y axis, so these come out right where the old accel-only roll/pitch — which assumed a phone's long X axis — were swapped. Two readouts: **Absolute** (yaw = compass heading) and **Calibrated** — tap **Zero here** to tare the current pose to 0°, **Clear** to reset; a "zeroed M:SS ago" line shows how long the tare has stood. The tare is remembered across launches **and — with box firmware ≥ v0.0.37 — is stored on the box itself** (`CAL.CFG` on the SD), so a calibration set on Android is visible to the Desktop / iPhone on their next connect without a re-tap.
+
+### GPS
+
+Drives a u-blox GNSS receiver plugged into the phone's USB-C port (CDC-ACM serial) — an independent fix to cross-check the box GPS. On connect the app bumps the receiver from its factory 1 Hz to **10 Hz** (`UBX-CFG-RATE`), shows a live fix readout + per-sentence rate counters, and **Record** writes `UbloxGps_*.csv` files in the box's `Gps*.csv` schema (mirrored to `Download/MovementLogger/`). A recordings list shows every file with max speed / distance / duration, swipe-left-to-delete, and a per-row menu with **Map / View / Share**.
+
+**Map** draws the recorded track on an interactive OpenStreetMap view — pinch-zoom/pan, green start and red end markers. Its **Share** button exports a shareable ride image, the Android twin of the iOS Rides-tab PNG: real map tiles under a **speed-coloured track** (blue slow → red fast), start/end markers, and a branded footer with the app logo, top speed, distance, duration and the project link. Downloaded `Gps*.csv` files in the Sync tab get the same **Map** button.
 
 ### Sync
 

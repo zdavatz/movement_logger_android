@@ -805,6 +805,14 @@ private fun FileRow(
     // that opens the file in an inline preview (iOS parity, a86fd6d).
     val downloaded = f.size > 0L && (state.localBytes[f.name] ?: 0L) >= f.size
     var viewing by remember { mutableStateOf(false) }
+    var mapping by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
+    // Mirror location on disk; savedPaths only carries entries for files
+    // downloaded this process lifetime, older mirrors are still right here.
+    val localPath = savedPath
+        ?: java.io.File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, f.name).path
+    val isGpsCsv = f.name.startsWith("Gps", ignoreCase = true) &&
+        f.name.endsWith(".csv", ignoreCase = true)
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         colors = CardDefaults.cardColors(
@@ -834,6 +842,10 @@ private fun FileRow(
                     // Opens an inline preview sheet with a Share button —
                     // same pattern as the global Log viewer, now per-file
                     // (iOS parity, a86fd6d).
+                    if (isGpsCsv) {
+                        OutlinedButton(onClick = { mapping = true }) { Text("Map") }
+                        Spacer(Modifier.width(4.dp))
+                    }
                     OutlinedButton(onClick = { viewing = true }) { Text("View") }
                 } else {
                     OutlinedButton(
@@ -882,6 +894,9 @@ private fun FileRow(
             path = savedPath,
             onDismiss = { viewing = false },
         )
+    }
+    if (mapping) {
+        RideMapView(name = f.name, path = localPath, onDismiss = { mapping = false })
     }
 }
 

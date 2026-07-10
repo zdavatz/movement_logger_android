@@ -271,6 +271,7 @@ private fun LogCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
 private fun RecordingsCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
     val recordings by UbloxGpsCore.recordings.collectAsStateWithLifecycle()
     var viewing by remember { mutableStateOf<GpsRecording?>(null) }
+    var mapping by remember { mutableStateOf<GpsRecording?>(null) }
 
     // Re-scan every 3 s while a recording is in progress so the in-flight
     // row's distance/duration tick up; idle otherwise (no wasted IO).
@@ -310,7 +311,7 @@ private fun RecordingsCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
                 )
                 recordings.forEach { rec ->
                     key(rec.name) {
-                        RecordingRow(rec = rec, onView = { viewing = rec })
+                        RecordingRow(rec = rec, onView = { viewing = rec }, onMap = { mapping = rec })
                     }
                 }
             }
@@ -320,11 +321,14 @@ private fun RecordingsCard(state: ch.ywesee.movementlogger.usb.UbloxUiState) {
     viewing?.let { rec ->
         GpsRecordingViewer(name = rec.name, path = rec.path, onDismiss = { viewing = null })
     }
+    mapping?.let { rec ->
+        RideMapView(name = rec.name, path = rec.path, onDismiss = { mapping = null })
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun RecordingRow(rec: GpsRecording, onView: () -> Unit) {
+private fun RecordingRow(rec: GpsRecording, onView: () -> Unit, onMap: () -> Unit) {
     val context = LocalContext.current
     val dismissState = rememberSwipeToDismissBoxState()
 
@@ -354,7 +358,7 @@ private fun RecordingRow(rec: GpsRecording, onView: () -> Unit) {
             }
         },
     ) {
-        RecordingRowContent(rec = rec, context = context, onView = onView)
+        RecordingRowContent(rec = rec, context = context, onView = onView, onMap = onMap)
     }
 }
 
@@ -363,6 +367,7 @@ private fun RecordingRowContent(
     rec: GpsRecording,
     context: Context,
     onView: () -> Unit,
+    onMap: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(
@@ -399,6 +404,10 @@ private fun RecordingRowContent(
                 Icon(Icons.Default.Share, contentDescription = "Share ${rec.name}")
             }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Map") },
+                    onClick = { menuOpen = false; onMap() },
+                )
                 DropdownMenuItem(
                     text = { Text("View") },
                     onClick = { menuOpen = false; onView() },

@@ -10,6 +10,7 @@ navigation = "2.8.5"
 media3 = "1.4.1"
 work = "2.9.1"
 usbSerial = "v3.10.0"
+osmdroid = "6.1.20"
 junit = "4.13.2"
 playPublisher = "3.13.0"
 
@@ -34,6 +35,7 @@ androidx-media3-effect = { group = "androidx.media3", name = "media3-effect", ve
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 androidx-work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
 usb-serial = { group = "com.github.mik3y", name = "usb-serial-for-android", version.ref = "usbSerial" }
+osmdroid-android = { group = "org.osmdroid", name = "osmdroid-android", version.ref = "osmdroid" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 
 [plugins]

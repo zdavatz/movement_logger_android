@@ -56,14 +56,16 @@ app/src/main/java/ch/ywesee/movementlogger/
 │   ├── PublicMirror.kt        dual-write synced files into Download/MovementLogger/
 │   ├── ReplayTrim.kt          slice parallel arrays to a UTC-ms window
 │   ├── ExportPanelRenderer.kt android.graphics.Canvas port of the four panels
-│   └── VideoExporter.kt       Media3 Transformer combined-video pipeline
+│   ├── VideoExporter.kt       Media3 Transformer combined-video pipeline
+│   └── RideMapRenderer.kt     shareable ride-map PNG (OSM tile stitch + track + footer)
 └── ui/
     ├── MainNav.kt             bottom-nav scaffold (Live / Sync / Replay)
     ├── LiveScreen.kt          Live tab UI: readout grid + two Compose Canvas sparklines
     ├── FileSyncScreen.kt      Sync tab UI
     ├── FileSyncViewModel.kt   thin façade over FileSyncCore (Activity-scoped)
     ├── ReplayScreen.kt        Replay tab UI + Compose Canvas panels
-    └── ReplayViewModel.kt     CSV + fusion pipeline orchestration
+    ├── ReplayViewModel.kt     CSV + fusion pipeline orchestration
+    └── RideMap.kt             GPS track on an interactive osmdroid map + Share-PNG
 ```
 
 ### Live tab — SensorStream readouts
@@ -195,6 +197,51 @@ on their next connect (and vice versa).
 - **Time sync (`OP_SET_TIME 0x08 <epoch_ms:u64-LE>`, identical in firmware + iOS).** The box has no RTC. `FileSyncCore` sends `BleCmd.SetTime(System.currentTimeMillis())` on **every** `Connected` (first connect + every reconnect), sampling the epoch *right before the send* so it matches the box tick the firmware stamps. The firmware pairs the epoch with its free-running `HAL_GetTick()` ms counter (the CSV `ms` column) and appends a `# SYNC epoch_ms=<u64> tick_ms=<u32>` comment line into the open `Sens*`/`Gps*` CSVs. Replay then maps box ticks → absolute wall-clock with zero drift and no GPS dependency. **Fire-and-forget**: `BleClient.sendSetTime` writes the 9-byte payload but does NOT occupy a `CurrentOp` slot and never tracks the OK reply — legacy firmware without 0x08 ignores the write, so tracking it would stall the op for the 20 s watchdog window. It self-skips when an op is mid-flight so a stray marker can't interleave with a READ. **Sequencing**: `GetLogMode → SET_TIME → startSyncPass` are spaced 500 ms apart in the `Connected` handler — the firmware holds only ONE pending command and the BLE worker is single-op, so back-to-back writes clobber each other. **Settle window (BleClient `SETTIME_SETTLE_MS = 2000`).** After `0x08` the firmware is busy appending the `# SYNC` line to SD and **silently drops the next FileCmd that arrives too soon** — confirmed on the wire: a LIST ~0.5 s after SET_TIME timed out (20 s watchdog), the same LIST ≥1.8 s later always succeeded. This bit hard in **Auto mode** where the user connects and immediately taps List. `sendSetTime` sets `setTimeSettleUntil = now() + SETTIME_SETTLE_MS`; `handleCommand` calls `awaitCmdSettle()` (a one-shot `delay` of the remaining window) before dispatching List/Read/Delete/Get-or-Set-mode — connection-control commands and SET_TIME itself never wait. So the first file command after a connect is held up to ~2 s instead of being swallowed. The worker is single-op, so blocking there can't starve a concurrent transfer.
 - **START_LOG no longer reboots / disconnects.** Current firmware (v0.0.7+) treats `0x05 START_LOG [<dur:u32-LE>]` as "open a session, auto-stop after dur seconds, stay connected" — only meaningful in **manual** mode (in auto the box already logs from boot). `FileSyncCore.startSession()` no longer queues a Disconnect and the banner text dropped the "rebooting" wording. The ~500 ms post-write settle is kept (write-without-response returns when queued, not transmitted). Legacy PumpTsueri rebooted on START_LOG; we no longer rely on that.
 - STOP_LOG button was removed from the UI (always-on firmware makes it a footgun); `vm.stopLog()` / `OP_STOP_LOG 0x04` plumbing is kept. It gracefully closes the active session; connection stays up.
+
+## Ride map — GPS track on a map + shareable PNG (iOS `RideMap.swift` port)
+
+`ui/RideMap.kt` (`RideMapView`) + `data/RideMapRenderer.kt`. Reached from the
+GPS tab's per-recording dropdown (**Map** / View / Share) and from a **Map**
+button on downloaded `Gps*.csv` rows in the Sync tab. Interactive map is an
+osmdroid `MapView` (OSM tiles, no API key) inside `AndroidView`: downsampled
+teal polyline (≤2000 pts), green start / red end dot markers. **Share**
+renders a 1080×1630 PNG — hand-stitched Web-Mercator OSM tiles (1080×1440),
+white-cased speed-coloured track (blue slow → red fast, 95th-pct vMax like
+iOS), and the branded 190 px footer (launcher icon, "Movement Logger",
+`Top km/h · km · min`, GitHub link) — saved to
+`getExternalFilesDir/RideMaps/` and shared via the existing FileProvider.
+Pure math (mercator px, `fitZoom`, downsample, 95th-pct, speed hue,
+`fillSpeedGaps`) is `internal` + JVM-only → `RideMapRendererTest`.
+
+Hard-won gotchas (each cost an on-device debug round):
+
+- **`ACCESS_NETWORK_STATE` is mandatory** — osmdroid's downloader silently
+  skips every tile without it (grey grid, zero log errors).
+- **`Modifier.clipToBounds()` on the `AndroidView`** — osmdroid paints
+  outside its layout bounds and otherwise draws over the dialog's top bar.
+- **Don't use `zoomToBoundingBox` pre-layout** — it left the camera at z21
+  over null island; zoom > tile-source max (19) disables all downloads.
+  Camera is set deterministically from `RideMapRenderer.boundingBox` +
+  `fitZoom` in a one-shot `OnLayoutChangeListener`.
+- OSM tile policy: identifying `userAgentValue` set on both the osmdroid
+  `Configuration` and the PNG renderer's HTTP fetches.
+
+**GPS parser leniency (required by this feature).** `parseGpsStream` accepts
+all three header generations — spaced (`Lat`, `Speed [km/h]`), compact
+firmware ≥ 22.4.2026 (`ms`→÷10, `lat`, `speed_kmh`, `fix_q`…) and bracketed
+u-blox/watch (`Lat [deg]`, `SpeedKMh`) — mirrors iOS `parseGpsText`. Only
+ticks/lat/lon are hard-required per row; blank optional fields → NaN (fix/
+nsat → 0) and corrupted rows are skipped, not fatal. This matters because
+`UbloxGpsCore` writes **two half-rows per epoch** (u-blox emits GGA before
+RMC: a GGA row with fix/alt but blank speed, then an RMC row with speed but
+`fix=0`) — the old strict parser dropped 707 of 708 rows of a real session.
+`RideMapRenderer.fillSpeedGaps` forward/back-fills the NaN speeds for the
+colour scale; footer top-speed reads ALL rows so it matches the
+recordings-list stat.
+
+**Debug builds install alongside the Play app**: `applicationIdSuffix
+".dev"` + `versionNameSuffix "-dev"` on the debug build type (the phone's
+Play-signed install used to block `installDebug` entirely).
 
 ## GPS Debug tab — u-blox UBX survey over BLE
 
