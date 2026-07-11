@@ -1,11 +1,11 @@
 ---
 name: release
-description: Release Movement Logger to GitHub + Google Play (tag-push pipeline, secrets, production promotion, Play listing source of truth, first-release caveats)
+description: Release Movement Logger to GitHub + Google Play (tag-push pipeline straight to the production track, secrets, Play listing source of truth, first-release caveats)
 ---
 
 ## Release pipeline
 
-Releases are driven from a single source: push a `vX.Y.Z` git tag and the GitHub Actions workflow at `.github/workflows/release.yml` builds the signed AAB + APK, runs `scripts/publish_to_play.py` to upload everything (bundle, listing texts, screenshots, 512×512 icon, video URL, contact email, release notes) to the Play Store **internal** track via the Android Publisher v3 API directly, and creates a GitHub release with the binaries attached. No local commit-and-bump dance needed.
+Releases are driven from a single source: push a `vX.Y.Z` git tag and the GitHub Actions workflow at `.github/workflows/release.yml` builds the signed AAB + APK, runs `scripts/publish_to_play.py` to upload everything (bundle, listing texts, screenshots, 512×512 icon, video URL, contact email, release notes) **straight to the Play Store production track** (`--release-status completed` — 100 % rollout as soon as Google's review approves; zdavatz's standing rule: always release straight to production, no internal-track staging) via the Android Publisher v3 API directly, and creates a GitHub release with the binaries attached. No local commit-and-bump dance needed.
 
 ```sh
 git tag v0.0.6
@@ -38,9 +38,15 @@ Service-account JSON comes from Google Cloud Console (Service Accounts → Creat
 
 `signing.properties` + `keystore/movement_logger_upload.keystore` at the repo root work the same as before for local signed builds (`./gradlew bundleRelease assembleRelease`). The Play Publisher plugin's tasks are disabled via `play { enabled.set(false) }`, so day-to-day builds are unaffected by the missing service-account JSON. Drop `play-service-account.json` at the repo root if you want to run `scripts/publish_to_play.py` locally — it's gitignored.
 
-### Promoting to production
+### Production is the default — no promotion step
 
-The workflow defaults to the **internal** track with status `completed`. To push to production:
+Every tag push publishes to the **production** track with status `completed`;
+Google auto-sends it for review and it rolls out to 100 % on approval (hours
+to a couple of days). There is no internal-track staging step anymore — the
+old two-stage flow (internal upload + manual promote) is retired.
+
+Manual publish (fallback only — e.g. re-pushing a version after a Play-side
+failure without re-tagging):
 
 ```sh
 ./gradlew bundleRelease -PappVersionName=0.0.X -PappVersionCode=X --rerun-tasks
@@ -48,10 +54,19 @@ python3 scripts/publish_to_play.py \
   --aab app/build/outputs/bundle/release/app-release.aab \
   --version-name 0.0.X \
   --track production \
-  --release-status draft
+  --release-status completed
 ```
 
-`--release-status draft` is required while the app itself is still in Play Console "draft" state (i.e. no production release has ever been approved). The release lands as a draft in Play Console; complete the data-safety / content-rating / target-audience / app-category / privacy-policy forms in the web UI, then click **Send for review** to actually publish.
+Needs `signing.properties` + keystore + `play-service-account.json` locally —
+none of which live on the dev machine by default (CI has them as secrets), so
+in practice: fix the problem, bump the patch version, push a new tag.
+
+While the app was still in Play Console "draft" state (no production release
+ever approved), the API only accepted `--release-status draft`; both the
+script and the workflow auto-fall back to draft in that case and the release
+then needs a manual **Send for review** click in Play Console. That one-time
+gate has been passed (v0.0.48 committed with status=completed), so it's
+history unless the app is ever re-created.
 
 ### Play listing source of truth
 
@@ -85,4 +100,4 @@ Before the first production push from this pipeline, the developer must have:
 3. **Granted the service-account Admin (or Release manager)** on Movement Logger via Play Console → Nutzer und Berechtigungen.
 4. **Completed the Play-Console-only forms** before production reviews accept anything: Datenschutzerklärung URL, Datenschutz/Data safety, Altersfreigabe/Content rating questionnaire, Zielgruppe/Target audience, App-Kategorie. The API can stage a draft release without these but cannot send it for review.
 
-Internal track uploads work as soon as 1+2+3 are done; production reviews need 4 on top.
+All four are done for Movement Logger (production releases flow since v0.0.48); the list only matters if the app entry is ever re-created.
