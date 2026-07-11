@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds install ALONGSIDE the Play app (applicationIdSuffix
+     ".dev") with the same icon — a distinct launcher label is the only
+     way to tell the two apart on the phone. -->
+<resources>
+    <string name="app_name">Movement Logger DEV</string>
+</resources>
