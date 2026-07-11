@@ -80,7 +80,11 @@ fun RideMapView(name: String, path: String, onDismiss: () -> Unit) {
         )
     }
 
-    val pts = rows?.let { RideMapRenderer.validPoints(it) } ?: emptyList()
+    // Blackout-cleaned segments: fabricated antenna-under-water positions
+    // are dropped and the polyline breaks across fix holes instead of
+    // bridging them with straight connector lines.
+    val segments = rows?.let { RideMapRenderer.cleanTrackSegments(it) } ?: emptyList()
+    val pts = segments.flatten()
 
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(modifier = Modifier.fillMaxSize()) {
@@ -136,7 +140,7 @@ fun RideMapView(name: String, path: String, onDismiss: () -> Unit) {
                         pts.size < 2 -> CenteredNote(
                             "No GPS fixes — this recording has fewer than two valid points to plot.",
                         )
-                        else -> TrackMap(pts)
+                        else -> TrackMap(segments)
                     }
                 }
             }
@@ -155,9 +159,11 @@ private fun CenteredNote(text: String) {
     }
 }
 
-/** The interactive osmdroid map with the downsampled track + start/end dots. */
+/** The interactive osmdroid map with the downsampled track + start/end dots.
+ *  One polyline per blackout-cleaned segment — never a line across a hole. */
 @Composable
-private fun TrackMap(pts: List<GpsRow>) {
+private fun TrackMap(segments: List<List<GpsRow>>) {
+    val pts = segments.flatten()
     AndroidView(
         // clipToBounds: osmdroid paints outside its layout bounds while
         // panning/zooming and would otherwise draw over the dialog's top bar.
@@ -176,17 +182,24 @@ private fun TrackMap(pts: List<GpsRow>) {
                 setMultiTouchControls(true)
                 zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
 
-                val idx = RideMapRenderer.downsampleIndices(pts.size, 2000)
-                val geo = idx.map { GeoPoint(pts[it].lat, pts[it].lon) }
-                overlays.add(Polyline(this).apply {
-                    outlinePaint.color = AColor.rgb(0x30, 0xB0, 0xC7) // iOS .teal
-                    outlinePaint.strokeWidth = 9f
-                    outlinePaint.strokeCap = Paint.Cap.ROUND
-                    setPoints(geo)
-                    infoWindow = null
-                })
-                overlays.add(dotMarker(this, geo.first(), AColor.rgb(52, 199, 89)))
-                overlays.add(dotMarker(this, geo.last(), AColor.rgb(255, 59, 48)))
+                for (seg in segments) {
+                    val idx = RideMapRenderer.downsampleIndices(
+                        seg.size, (2000 * seg.size / pts.size).coerceAtLeast(2),
+                    )
+                    overlays.add(Polyline(this).apply {
+                        outlinePaint.color = AColor.rgb(0x30, 0xB0, 0xC7) // iOS .teal
+                        outlinePaint.strokeWidth = 9f
+                        outlinePaint.strokeCap = Paint.Cap.ROUND
+                        setPoints(idx.map { GeoPoint(seg[it].lat, seg[it].lon) })
+                        infoWindow = null
+                    })
+                }
+                overlays.add(
+                    dotMarker(this, GeoPoint(pts.first().lat, pts.first().lon), AColor.rgb(52, 199, 89)),
+                )
+                overlays.add(
+                    dotMarker(this, GeoPoint(pts.last().lat, pts.last().lon), AColor.rgb(255, 59, 48)),
+                )
 
                 // Deterministic camera fit: reuse the PNG renderer's margin +
                 // min-span + zoom math once the view has real dimensions.

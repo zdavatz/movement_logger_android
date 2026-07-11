@@ -301,11 +301,9 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         val w = csvWriter ?: return
         try { w.flush(); w.close() } catch (_: Exception) {}
         csvWriter = null
-        // The finished file's stats equal the live counters — seed the cache
-        // so the recording never needs a full re-parse in this process.
-        csvFile?.let { f ->
-            synchronized(statsCache) { statsCache[f.name] = f.length() to liveStats }
-        }
+        // Deliberately NOT seeding statsCache from liveStats: the live fold
+        // is an approximation (no blackout cleaning), so the finished file
+        // gets one accurate computeStats parse on the next refresh instead.
         _state.update { it.copy(isLogging = false) }
         refreshRecordings()
     }
@@ -408,19 +406,12 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         val rows = file.inputStream().use { CsvParsers.parseGpsStream(it) }
         if (rows.isEmpty()) return GpsStats.EMPTY
         val maxSpeed = RideMapRenderer.robustTopSpeed(rows)
-        var dist = 0.0
-        var prevLat = Double.NaN
-        var prevLon = Double.NaN
-        for (r in rows) {
-            if (r.fix > 0 && r.lat.isFinite() && r.lon.isFinite()) {
-                if (!prevLat.isNaN()) {
-                    val hop = GpsMath.haversineM(prevLat, prevLon, r.lat, r.lon)
-                    if (hop <= MAX_HOP_M) dist += hop
-                }
-                prevLat = r.lat
-                prevLon = r.lon
-            }
-        }
+        // Same blackout-cleaned segments as the drawn track, so the list's
+        // distance and the share-PNG footer can never disagree — and the
+        // fabricated antenna-under-water positions don't inflate it.
+        val dist = RideMapRenderer.segmentsDistanceKm(
+            RideMapRenderer.cleanTrackSegments(rows)
+        ) * 1000.0
         val durSec = ((rows.last().ticks - rows.first().ticks) * 10.0 / 1000.0).toLong()
         return GpsStats(maxSpeed, dist, durSec, rows.size)
     }

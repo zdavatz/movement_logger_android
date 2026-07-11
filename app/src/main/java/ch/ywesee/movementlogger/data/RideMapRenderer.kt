@@ -129,9 +129,35 @@ object RideMapRenderer {
         return m / 1000.0
     }
 
-    /** Keep only plottable fixes: fix>0, finite, and not (0,0) null island. */
+    /** Positions with a worse claimed accuracy than this are flagged
+     *  garbage: the 11.7.2026 watch ride carried one WiFi-database fallback
+     *  fix 70 km away — honestly stamped with a 149 000 m accuracy. The
+     *  u-blox HDOP is dimensionless (≤ ~20 with any usable fix) and the
+     *  watch column carries metres, but one threshold covers both. NaN
+     *  (column absent) passes. */
+    internal const val MAX_PLAUSIBLE_HDOP = 50.0
+
+    /** Keep only plottable fixes: fix>0, finite, not (0,0) null island,
+     *  and not flagged wildly-inaccurate (see [MAX_PLAUSIBLE_HDOP]). */
     fun validPoints(rows: List<GpsRow>): List<GpsRow> = rows.filter {
-        it.fix > 0 && it.lat.isFinite() && it.lon.isFinite() && !(it.lat == 0.0 && it.lon == 0.0)
+        it.fix > 0 && it.lat.isFinite() && it.lon.isFinite() &&
+            !(it.lat == 0.0 && it.lon == 0.0) && !(it.hdop > MAX_PLAUSIBLE_HDOP)
+    }
+
+    /** The watch logger writes the LAST KNOWN location once per second while
+     *  no fresh fix arrives (42 identical rows during the 11.7.2026 stall),
+     *  so a dead receiver still looks like a live fix timeline. Collapse
+     *  consecutive identical fixes so a stall becomes a real hole that the
+     *  blackout rule can see. u-blox epochs always advance UTC, so genuine
+     *  stationary tracks are never collapsed. */
+    private fun dedupFixes(fixes: List<GpsRow>): List<GpsRow> {
+        val out = ArrayList<GpsRow>(fixes.size)
+        for (f in fixes) {
+            val p = out.lastOrNull()
+            if (p != null && p.utc == f.utc && p.lat == f.lat && p.lon == f.lon) continue
+            out.add(f)
+        }
+        return out
     }
 
     /** Same hard clip as `GpsMath.smoothSpeedKmh` — >60 km/h on a pumpfoil
@@ -183,25 +209,10 @@ object RideMapRenderer {
      * recordings-list stat stay equal.
      */
     internal fun robustTopSpeed(rows: List<GpsRow>): Double {
-        val fixes = validPoints(rows)
+        val fixes = dedupFixes(validPoints(rows))
         if (fixes.size < 2) return 0.0
         val fixTicks = DoubleArray(fixes.size) { fixes[it].ticks }
-
-        // Blackout exclusion zones: before the first fix settles, around
-        // every ≥2 s hole in the fix timeline, and after the last fix.
-        val zones = ArrayList<DoubleArray>()
-        zones.add(doubleArrayOf(Double.NEGATIVE_INFINITY, fixTicks[0] + BLACKOUT_PAD_TICKS))
-        for (i in 1 until fixTicks.size) {
-            if (fixTicks[i] - fixTicks[i - 1] >= BLACKOUT_GAP_TICKS) {
-                zones.add(
-                    doubleArrayOf(
-                        fixTicks[i - 1] - BLACKOUT_PAD_TICKS,
-                        fixTicks[i] + BLACKOUT_PAD_TICKS,
-                    )
-                )
-            }
-        }
-        zones.add(doubleArrayOf(fixTicks.last() + 1e-9, Double.POSITIVE_INFINITY))
+        val zones = blackoutZones(fixTicks)
 
         var top = 0.0
         for (r in rows) {
@@ -220,6 +231,71 @@ object RideMapRenderer {
             if (v <= chordKmh * SPEED_VS_TRACK_FACTOR + SPEED_VS_TRACK_FLOOR_KMH) top = v
         }
         return top
+    }
+
+    /** Blackout exclusion zones as [start, end] tick pairs: before the
+     *  first fix settles, around every ≥2 s hole in the fix timeline, and
+     *  after the last fix. */
+    private fun blackoutZones(fixTicks: DoubleArray): List<DoubleArray> {
+        val zones = ArrayList<DoubleArray>()
+        zones.add(doubleArrayOf(Double.NEGATIVE_INFINITY, fixTicks[0] + BLACKOUT_PAD_TICKS))
+        for (i in 1 until fixTicks.size) {
+            if (fixTicks[i] - fixTicks[i - 1] >= BLACKOUT_GAP_TICKS) {
+                zones.add(
+                    doubleArrayOf(
+                        fixTicks[i - 1] - BLACKOUT_PAD_TICKS,
+                        fixTicks[i] + BLACKOUT_PAD_TICKS,
+                    )
+                )
+            }
+        }
+        zones.add(doubleArrayOf(fixTicks.last() + 1e-9, Double.POSITIVE_INFINITY))
+        return zones
+    }
+
+    /**
+     * The drawable track, cleaned with the same blackout rule as
+     * [robustTopSpeed] and split into continuous segments: positions within
+     * ±10 s of a ≥2 s fix hole are dropped (that's where u-blox fabricates
+     * a sliding solution — the "straight line across town" on the
+     * 11.7.2026 Ermioni ride), and the polyline breaks across the holes so
+     * two distant real points are never bridged by a fake straight
+     * connector. Segments with fewer than 2 points are dropped.
+     */
+    fun cleanTrackSegments(rows: List<GpsRow>): List<List<GpsRow>> {
+        val fixes = dedupFixes(validPoints(rows))
+        if (fixes.size < 2) return emptyList()
+        val fixTicks = DoubleArray(fixes.size) { fixes[it].ticks }
+        val zones = blackoutZones(fixTicks)
+        val segments = ArrayList<List<GpsRow>>()
+        var cur = ArrayList<GpsRow>()
+        for (f in fixes) {
+            if (zones.any { f.ticks >= it[0] && f.ticks <= it[1] }) continue
+            if (cur.isNotEmpty() && f.ticks - cur.last().ticks >= BLACKOUT_GAP_TICKS) {
+                if (cur.size >= 2) segments.add(cur)
+                cur = ArrayList()
+            }
+            cur.add(f)
+        }
+        if (cur.size >= 2) segments.add(cur)
+        return segments
+    }
+
+    /** Single hops longer than this are GPS glitches (>200 km/h at 1 Hz)
+     *  and don't count toward distance. */
+    private const val TRACK_MAX_HOP_M = 60.0
+
+    /** Σ haversine within segments — never across the blackout holes
+     *  between them — with the [TRACK_MAX_HOP_M] glitch gate per hop. */
+    fun segmentsDistanceKm(segments: List<List<GpsRow>>): Double {
+        var m = 0.0
+        for (seg in segments) {
+            for (i in 1 until seg.size) {
+                val hop = GpsMath.haversineM(seg[i - 1].lat, seg[i - 1].lon, seg[i].lat, seg[i].lon)
+                if (hop <= TRACK_MAX_HOP_M) m += hop
+            }
+        }
+        return m / 1000.0
     }
 
     /** Index of the first element ≥ [key] in the sorted [arr]. */
@@ -261,8 +337,11 @@ object RideMapRenderer {
      */
     suspend fun render(context: Context, rows: List<GpsRow>, title: String): File? =
         withContext(Dispatchers.IO) {
-            val valid = validPoints(rows)
-            if (valid.size < 2) return@withContext null
+            // Blackout-cleaned segments: no fabricated antenna-under-water
+            // positions, no straight connector lines across the fix holes.
+            val segments = cleanTrackSegments(rows)
+            if (segments.isEmpty()) return@withContext null
+            val valid = segments.flatten()
 
             val width = 1080
             val mapHeight = 1440
@@ -304,9 +383,13 @@ object RideMapRenderer {
                 strokeJoin = Paint.Join.ROUND
                 color = Color.argb(230, 255, 255, 255)
             }
-            val path = Path().apply {
-                moveTo(px[0], py[0])
-                for (i in 1 until valid.size) lineTo(px[i], py[i])
+            // One sub-path per segment — the path never crosses a blackout.
+            val path = Path()
+            var off = 0
+            for (s in segments) {
+                path.moveTo(px[off], py[off])
+                for (i in 1 until s.size) path.lineTo(px[off + i], py[off + i])
+                off += s.size
             }
             canvas.drawPath(path, casing)
 
@@ -316,11 +399,15 @@ object RideMapRenderer {
                 strokeWidth = 5f
                 strokeCap = Paint.Cap.ROUND
             }
-            for (i in 1 until valid.size) {
-                seg.color = Color.HSVToColor(
-                    floatArrayOf((speedHue(speeds[i], vMax) * 360).toFloat(), 0.9f, 0.95f)
-                )
-                canvas.drawLine(px[i - 1], py[i - 1], px[i], py[i], seg)
+            off = 0
+            for (s in segments) {
+                for (i in 1 until s.size) {
+                    seg.color = Color.HSVToColor(
+                        floatArrayOf((speedHue(speeds[off + i], vMax) * 360).toFloat(), 0.9f, 0.95f)
+                    )
+                    canvas.drawLine(px[off + i - 1], py[off + i - 1], px[off + i], py[off + i], seg)
+                }
+                off += s.size
             }
 
             drawMarker(canvas, px[0], py[0], Color.rgb(52, 199, 89))   // systemGreen
@@ -329,7 +416,7 @@ object RideMapRenderer {
             // Over ALL rows (RMC half-rows carry the speed with fix column
             // 0), but gated on a nearby valid fix — see robustTopSpeed.
             val topSpeed = robustTopSpeed(rows)
-            val distanceKm = trackDistanceKm(lats, lons)
+            val distanceKm = segmentsDistanceKm(segments)
             val durMin = (valid.last().ticks - valid.first().ticks) * 0.01 / 60.0
             drawFooter(context, canvas, width, mapHeight, footerHeight, topSpeed, distanceKm, durMin)
 

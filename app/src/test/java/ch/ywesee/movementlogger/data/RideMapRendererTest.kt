@@ -96,9 +96,68 @@ class RideMapRendererTest {
                 row(47.0, 8.0, 0),          // no fix
                 row(Double.NaN, 8.0, 1),    // NaN
                 row(47.1, 8.1, 2),
+                // Flagged-garbage accuracy: the 11.7.2026 watch ride carried
+                // a WiFi-fallback fix 70 km away at accuracy 149 000 m.
+                GpsRow(
+                    ticks = 0.0, utc = "", lat = 38.0, lon = 23.3, altM = 0.0,
+                    speedKmhModule = 0.0, courseDeg = 0.0, fix = 1, numSat = 0,
+                    hdop = 149_000.0,
+                ),
             )
         )
         assertEquals(2, pts.size)
+    }
+
+    @Test
+    fun cleanTrackSegmentsDropsFabricationAndBreaksAtHoles() {
+        val mPerDegLon = Math.PI * 6_371_000.0 / 180.0
+        fun fixRow(ticks: Double, meters: Double, utc: String = ticks.toString()) = GpsRow(
+            ticks = ticks, utc = utc, lat = 0.0, lon = meters / mPerDegLon, altM = 0.0,
+            speedKmhModule = Double.NaN, courseDeg = 0.0, fix = 2, numSat = 8, hdop = 1.0,
+        )
+        val rows = mutableListOf<GpsRow>()
+        var meters = 100.0   // away from (0,0) so the null-island filter stays out of the way
+        for (t in 0..2500 step 10) { rows.add(fixRow(t.toDouble(), meters)); meters += 6.0 / 3.6 * 0.1 }
+        // Fabricated 27 km/h slide right before the blackout.
+        for (t in 2510..3000 step 10) { rows.add(fixRow(t.toDouble(), meters)); meters += 27.0 / 3.6 * 0.1 }
+        // Blackout 3000..3500, then honest cruise resumes.
+        for (t in 3500..7000 step 10) { rows.add(fixRow(t.toDouble(), meters)); meters += 6.0 / 3.6 * 0.1 }
+
+        val segs = RideMapRenderer.cleanTrackSegments(rows)
+        assertEquals(2, segs.size)
+        // Leading 10 s convergence window is dropped…
+        assertEquals(1010.0, segs[0].first().ticks, 1e-9)
+        // …the fabricated slide and both blackout pads are gone…
+        assertEquals(1990.0, segs[0].last().ticks, 1e-9)
+        assertEquals(4510.0, segs[1].first().ticks, 1e-9)
+        // …and distance never bridges the hole between the segments.
+        val distM = RideMapRenderer.segmentsDistanceKm(segs) * 1000.0
+        val expected = (1990 - 1010 + 7000 - 4510) / 100.0 * (6.0 / 3.6)
+        assertEquals(expected, distM, 1.0)
+    }
+
+    @Test
+    fun stalledDuplicateRowsBecomeABlackout() {
+        val mPerDegLon = Math.PI * 6_371_000.0 / 180.0
+        fun fixRow(ticks: Double, meters: Double, utc: String) = GpsRow(
+            ticks = ticks, utc = utc, lat = 0.0, lon = meters / mPerDegLon, altM = 0.0,
+            speedKmhModule = 9.4, courseDeg = 0.0, fix = 1, numSat = 0, hdop = 10.0,
+        )
+        val rows = mutableListOf<GpsRow>()
+        var meters = 100.0
+        for (t in 0..3000 step 100) { rows.add(fixRow(t.toDouble(), meters, t.toString())); meters += 6.0 / 3.6 }
+        // Watch-logger stall: the same last-known row rewritten every second
+        // (frozen UTC + position + speed) — must NOT read as a live fix
+        // timeline, and the frozen 9.4 km/h must not become the top speed.
+        for (t in 3100..7000 step 100) rows.add(fixRow(t.toDouble(), meters, "STALL"))
+        for (t in 7100..12000 step 100) { rows.add(fixRow(t.toDouble(), meters, t.toString())); meters += 2.0 / 3.6 }
+
+        val segs = RideMapRenderer.cleanTrackSegments(rows)
+        assertEquals(2, segs.size)
+        // The stall duplicates collapse to one fix, opening a ≥2 s hole —
+        // nothing from the stall window survives in either segment.
+        assertTrue(segs[0].last().ticks < 3100.0)
+        assertTrue(segs[1].first().ticks > 7000.0)
     }
 
     @Test

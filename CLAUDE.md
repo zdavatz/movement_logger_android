@@ -243,7 +243,7 @@ recordings-list stat.
 ".dev"` + `versionNameSuffix "-dev"` on the debug build type (the phone's
 Play-signed install used to block `installDebug` entirely).
 
-## USB GPS tab (`usb/`) — reliability hardening (v0.0.48–49)
+## USB GPS tab (`usb/`) — reliability hardening (v0.0.48–50)
 
 Post-mortem of the 11.7.2026 water test (33-min recording died at 15:49:52,
 tombstone: `Scudo ERROR: internal map failure (Out of memory)` inside
@@ -279,6 +279,18 @@ the rules that now guard it:
   window you need for post-ride forensics.
 - Shared ride-map PNGs are additionally published to
   `Download/MovementLogger/` via `PublicMirror` (`png → image/png` MIME).
+- **Track drawing is blackout-cleaned too (v0.0.50).**
+  `RideMapRenderer.cleanTrackSegments` drops positions inside the blackout
+  zones and splits the polyline into per-segment runs so two real points
+  are never bridged across a hole (the fake straight lines across Ermioni
+  town). Consumers: PNG renderer, interactive osmdroid map, and
+  `computeStats`' distance (via `segmentsDistanceKm` — the 11.7.2026 ride
+  dropped 1.65 → 1.10 km once the fabricated drift was excluded).
+  `validPoints` also gates on `hdop ≤ 50` (the watch logged one WiFi-
+  fallback fix 70 km away, honestly stamped accuracy 149 000 m), and
+  consecutive identical fixes (same UTC+lat+lon) collapse to one —
+  the watch logger rewrites the last-known location every second during
+  a signal stall, which otherwise masks the hole from the blackout rule.
 - **Top-speed stat is outlier-hardened (v0.0.49) — the raw `SpeedKMh` max
   is garbage when the antenna dips under water.** On the 11.7.2026 ride the
   receiver fabricated a smooth 5 → 27 km/h ramp (on a ~7 km/h session)
