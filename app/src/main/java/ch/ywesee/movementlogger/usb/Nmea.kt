@@ -19,6 +19,26 @@ package ch.ywesee.movementlogger.usb
  * responsible for combining RMC + GGA into a single fix row.
  */
 
+/**
+ * Regex-free `toDoubleOrNull`. Kotlin's stdlib version screens every call
+ * through `ScreenFloatValueRegEx` — one native ICU regex match per
+ * invocation. At NMEA/CSV hot-loop rates (~20 sentence fields/s live plus
+ * ~25k CSV fields/s during the recordings-stats tick) that native churn
+ * exhausted the allocator after ~19 h of process uptime: Scudo aborted with
+ * `internal map failure (Out of memory)` inside `computeStats` and killed
+ * the 11.7.2026 water-test recording. `Double.parseDouble` does its own
+ * trim + validation; the exception path only fires on genuinely malformed
+ * fields, which are rare on this wire.
+ */
+internal fun fastDoubleOrNull(s: String): Double? {
+    if (s.isEmpty()) return null
+    return try {
+        java.lang.Double.parseDouble(s)
+    } catch (_: NumberFormatException) {
+        null
+    }
+}
+
 data class RmcFix(
     val utc: String,            // hhmmss.ss verbatim (empty if absent)
     val statusValid: Boolean,   // 'A' = active, 'V' = void
@@ -70,8 +90,8 @@ object Nmea {
             statusValid = f[2] == "A",
             latDeg = ddmmToDeg(f[3], f[4]),
             lonDeg = ddmmToDeg(f[5], f[6]),
-            speedKmh = f[7].toDoubleOrNull()?.let { it * 1.852 },
-            courseDeg = f[8].toDoubleOrNull(),
+            speedKmh = fastDoubleOrNull(f[7])?.let { it * 1.852 },
+            courseDeg = fastDoubleOrNull(f[8]),
             dateDdmmyy = f[9],
         )
     }
@@ -87,8 +107,8 @@ object Nmea {
             lonDeg = ddmmToDeg(f[4], f[5]),
             fixQuality = f[6].toIntOrNull() ?: 0,
             numSat = f[7].toIntOrNull() ?: 0,
-            hdop = f[8].toDoubleOrNull(),
-            altM = f[9].toDoubleOrNull(),
+            hdop = fastDoubleOrNull(f[8]),
+            altM = fastDoubleOrNull(f[9]),
         )
     }
 
@@ -99,7 +119,7 @@ object Nmea {
      */
     private fun ddmmToDeg(value: String, hemisphere: String): Double? {
         if (value.isEmpty()) return null
-        val raw = value.toDoubleOrNull() ?: return null
+        val raw = fastDoubleOrNull(value) ?: return null
         // Degrees portion = integer hundreds of `raw` (i.e. value / 100,
         // floored). Minutes portion = remainder.
         val deg = (raw / 100.0).toInt()

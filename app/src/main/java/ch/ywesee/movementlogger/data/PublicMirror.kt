@@ -143,6 +143,7 @@ class PublicMirror(private val context: Context) {
         "log", "txt" -> "text/plain"
         "wav" -> "audio/x-wav"
         "mp4", "mov", "m4v" -> "video/mp4"
+        "png" -> "image/png"
         else -> "application/octet-stream"
     }
 

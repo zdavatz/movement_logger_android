@@ -243,6 +243,43 @@ recordings-list stat.
 ".dev"` + `versionNameSuffix "-dev"` on the debug build type (the phone's
 Play-signed install used to block `installDebug` entirely).
 
+## USB GPS tab (`usb/`) — reliability hardening (v0.0.48)
+
+Post-mortem of the 11.7.2026 water test (33-min recording died at 15:49:52,
+tombstone: `Scudo ERROR: internal map failure (Out of memory)` inside
+`UbloxGpsCore.computeStats` after 19.4 h process uptime). Root cause chain +
+the rules that now guard it:
+
+- **Never use Kotlin's `toDoubleOrNull` in a hot loop.** It screens every
+  call through `ScreenFloatValueRegEx` — one *native* ICU regex match per
+  field. The 3 s recordings tick re-parsed the growing 1 MB CSV each pass
+  (~25k fields/s sustained) until the native allocator couldn't map more
+  memory and SIGABRT'd the whole app. `usb/Nmea.kt:fastDoubleOrNull` is the
+  regex-free replacement (plain `Double.parseDouble` + catch); the NMEA and
+  `computeStats` paths use it.
+- **The in-flight recording's stats are folded incrementally** per written
+  row (`updateLiveStats` in `UbloxGpsCore`, zero file IO); finished files
+  parse once into a (name, size)-keyed `statsCache`, seeded from the live
+  counters at `stopLogging`. `refreshRecordings` never re-reads a file whose
+  size hasn't changed.
+- **`UbloxGpsService`** — foreground service (`connectedDevice`, twin of
+  `BleSyncService`, notification id 2) started from `startReader`; polls
+  state every 2 s for the sticky notification and self-stops 5 s after
+  reading + logging end. Without it the cached-app freezer stalls the read
+  loop on screen-off (the water-test recording survived DOZE only because
+  the freezer happened to exempt the USB-fd holder).
+- **Reader auto-reconnects**: a read error or 5 s of port silence (a healthy
+  receiver never pauses at 10 Hz) recycles the connection and polls the USB
+  device list at 1 Hz until the same vid/pid re-enumerates with permission —
+  unbounded until the user taps Disconnect. Re-attach normally re-grants
+  permission via the manifest `USB_DEVICE_ATTACHED` filter.
+- **Per-NMEA-line `Log.v` is gated** behind `Log.isLoggable` (enable with
+  `adb shell setprop log.tag.UbloxGpsReader V`). Unconditional logging wrote
+  ~40 lines/s and rolled the main logcat buffer to ~20 min — exactly the
+  window you need for post-ride forensics.
+- Shared ride-map PNGs are additionally published to
+  `Download/MovementLogger/` via `PublicMirror` (`png → image/png` MIME).
+
 ## GPS Debug tab — u-blox UBX survey over BLE
 
 Live u-blox diagnostics for antenna selection/mounting, bridged over the box's

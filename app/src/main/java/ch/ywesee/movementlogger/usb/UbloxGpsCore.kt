@@ -153,6 +153,20 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      *  gets the correct resume offset (header + every row written so far). */
     private var csvPublicOffset: Long = 0L
 
+    /** Live stats for the in-flight recording, folded per written row in
+     *  [maybeFlushCsvRow] so the 3 s recordings-list tick never re-reads the
+     *  growing file. Re-parsing it every tick is what exhausted native
+     *  memory on the 11.7.2026 water test — see [fastDoubleOrNull]. */
+    @Volatile private var liveStats = GpsStats.EMPTY
+    private var liveFirstTick = Double.NaN
+    private var livePrevLat = Double.NaN
+    private var livePrevLon = Double.NaN
+
+    /** Finished recordings never change, so stats are parsed once per
+     *  (name, size) and cached; entries for deleted files are pruned on the
+     *  next [refreshRecordings] pass. */
+    private val statsCache = HashMap<String, Pair<Long, GpsStats>>()
+
     private val dateFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
     fun init(ctx: Context) {
@@ -251,6 +265,10 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
             csvFile = file
             csvStartMonoMs = System.nanoTime() / 1_000_000L
             csvPublicOffset = 0L
+            liveStats = GpsStats.EMPTY
+            liveFirstTick = Double.NaN
+            livePrevLat = Double.NaN
+            livePrevLon = Double.NaN
             // Drop any prior session with this exact name (timestamped, so
             // collisions are vanishingly rare — but a re-start within the
             // same second would otherwise append onto stale bytes).
@@ -271,6 +289,11 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         val w = csvWriter ?: return
         try { w.flush(); w.close() } catch (_: Exception) {}
         csvWriter = null
+        // The finished file's stats equal the live counters — seed the cache
+        // so the recording never needs a full re-parse in this process.
+        csvFile?.let { f ->
+            synchronized(statsCache) { statsCache[f.name] = f.length() to liveStats }
+        }
         _state.update { it.copy(isLogging = false) }
         refreshRecordings()
     }
@@ -292,7 +315,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
                 ?.filter { it.isFile && it.name.startsWith("UbloxGps_") && it.name.endsWith(".csv") }
                 .orEmpty()
             val list = files.map { f ->
-                val s = runCatching { computeStats(f) }.getOrDefault(GpsStats.EMPTY)
+                val s = statsFor(f, isActive = f.name == activeName)
                 GpsRecording(
                     name = f.name,
                     path = f.absolutePath,
@@ -303,8 +326,23 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
                     isRecording = f.name == activeName,
                 )
             }.sortedByDescending { it.name }
+            val names = files.mapTo(HashSet()) { it.name }
+            synchronized(statsCache) { statsCache.keys.retainAll(names) }
             _recordings.value = list
         }
+    }
+
+    /** Stats for one recording: the in-flight file reads the live counters
+     *  (zero file IO), finished files parse once and hit the size-keyed
+     *  cache on every later pass. */
+    private fun statsFor(f: File, isActive: Boolean): GpsStats {
+        if (isActive) return liveStats
+        val len = f.length()
+        synchronized(statsCache) { statsCache[f.name] }
+            ?.let { (size, s) -> if (size == len) return s }
+        val computed = runCatching { computeStats(f) }.getOrNull() ?: return GpsStats.EMPTY
+        synchronized(statsCache) { statsCache[f.name] = len to computed }
+        return computed
     }
 
     /**
@@ -363,14 +401,17 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
                 val c = line.split(',')
                 if (c.size < 8) continue
                 rows++
-                c[0].toDoubleOrNull()?.let { t ->
+                // fastDoubleOrNull, not toDoubleOrNull: the stdlib version
+                // burns a native ICU regex match per field, which at this
+                // loop's volume OOM'd the process — see the note on it.
+                fastDoubleOrNull(c[0])?.let { t ->
                     if (firstTick.isNaN()) firstTick = t
                     lastTick = t
                 }
-                c.getOrNull(5)?.toDoubleOrNull()?.let { if (it > maxSpeed) maxSpeed = it }
+                c.getOrNull(5)?.let(::fastDoubleOrNull)?.let { if (it > maxSpeed) maxSpeed = it }
                 val fix = c.getOrNull(7)?.toIntOrNull() ?: 0
-                val lat = c.getOrNull(2)?.toDoubleOrNull()
-                val lon = c.getOrNull(3)?.toDoubleOrNull()
+                val lat = c.getOrNull(2)?.let(::fastDoubleOrNull)
+                val lon = c.getOrNull(3)?.let(::fastDoubleOrNull)
                 if (fix > 0 && lat != null && lon != null) {
                     if (!prevLat.isNaN()) {
                         val hop = GpsMath.haversineM(prevLat, prevLon, lat, lon)
@@ -384,6 +425,27 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         val durSec = if (firstTick.isNaN()) 0L
         else ((lastTick - firstTick) * 10.0 / 1000.0).toLong()
         return GpsStats(maxSpeed, dist, durSec, rows)
+    }
+
+    /** Fold one just-written CSV row into [liveStats] — same accumulation
+     *  rules as [computeStats] (max speed over all rows, distance over
+     *  fixed rows gated by [MAX_HOP_M], duration from the tick column). */
+    private fun updateLiveStats(ticks: Long, speedKmh: Double?, fix: Int, lat: Double?, lon: Double?) {
+        val s = liveStats
+        if (liveFirstTick.isNaN()) liveFirstTick = ticks.toDouble()
+        var maxSpeed = s.maxSpeedKmh
+        if (speedKmh != null && speedKmh.isFinite() && speedKmh > maxSpeed) maxSpeed = speedKmh
+        var dist = s.distanceMeters
+        if (fix > 0 && lat != null && lon != null) {
+            if (!livePrevLat.isNaN()) {
+                val hop = GpsMath.haversineM(livePrevLat, livePrevLon, lat, lon)
+                if (hop <= MAX_HOP_M) dist += hop
+            }
+            livePrevLat = lat
+            livePrevLon = lon
+        }
+        val durSec = ((ticks - liveFirstTick) * 10.0 / 1000.0).toLong()
+        liveStats = GpsStats(maxSpeed, dist, durSec, s.rows + 1)
     }
 
     // --- UbloxGpsReader.Sink ---
@@ -444,6 +506,9 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
                     deviceName = device.productName,
                 )
             }
+            // Foreground service so screen-off / app-switch can't freeze the
+            // read loop mid-recording. Self-stops when reading + logging end.
+            appContext?.let { UbloxGpsService.start(it) }
         }
     }
 
@@ -551,6 +616,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
                 csvPublicOffset += rowBytes.size
             }
             _state.update { it.copy(loggedRows = it.loggedRows + 1) }
+            updateLiveStats(ticks, speed, fix, lat, lon)
         } catch (e: Exception) {
             _state.update { it.copy(status = "CSV write failed: ${e.message}") }
         }

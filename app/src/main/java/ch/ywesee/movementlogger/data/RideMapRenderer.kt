@@ -241,6 +241,10 @@ object RideMapRenderer {
             val out = File(dir, "${title}_map.png")
             out.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
             bmp.recycle()
+            // Also publish into Download/MovementLogger/ so the map shows up
+            // in Google Files without going through the share sheet.
+            // appendAt(base = 0) truncates a previous share of the same ride.
+            runCatching { PublicMirror(context).appendAt(out.name, 0L, out.readBytes()) }
             out
         }
 

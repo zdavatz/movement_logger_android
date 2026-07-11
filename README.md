@@ -36,7 +36,9 @@ A **Board angles** card sits above the readouts: live **Pitch** (up/down hill), 
 
 Drives a u-blox GNSS receiver plugged into the phone's USB-C port (CDC-ACM serial) — an independent fix to cross-check the box GPS. On connect the app bumps the receiver from its factory 1 Hz to **10 Hz** (`UBX-CFG-RATE`), shows a live fix readout + per-sentence rate counters, and **Record** writes `UbloxGps_*.csv` files in the box's `Gps*.csv` schema (mirrored to `Download/MovementLogger/`). A recordings list shows every file with max speed / distance / duration, swipe-left-to-delete, and a per-row menu with **Map / View / Share**.
 
-**Map** draws the recorded track on an interactive OpenStreetMap view — pinch-zoom/pan, green start and red end markers. Its **Share** button exports a shareable ride image, the Android twin of the iOS Rides-tab PNG: real map tiles under a **speed-coloured track** (blue slow → red fast), start/end markers, and a branded footer with the app logo, top speed, distance, duration and the project link. Downloaded `Gps*.csv` files in the Sync tab get the same **Map** button.
+Recording is built to survive a session on the water: a foreground notification ("Recording GPS — N rows · 10.0 Hz") keeps the reader alive with the screen off or the app in the background, and after a USB glitch or a silently stalled port the reader **auto-reconnects** as soon as the receiver re-enumerates — no more dead sessions until you notice and tap Connect by hand.
+
+**Map** draws the recorded track on an interactive OpenStreetMap view — pinch-zoom/pan, green start and red end markers. Its **Share** button exports a shareable ride image, the Android twin of the iOS Rides-tab PNG: real map tiles under a **speed-coloured track** (blue slow → red fast), start/end markers, and a branded footer with the app logo, top speed, distance, duration and the project link. The exported PNG also lands in `Download/MovementLogger/`, so it shows up in Google Files without going through the share sheet. Downloaded `Gps*.csv` files in the Sync tab get the same **Map** button.
 
 ### Sync
 

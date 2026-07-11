@@ -1,6 +1,8 @@
 package ch.ywesee.movementlogger.usb
 
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class UbloxGpsReaderTest {
@@ -28,5 +30,18 @@ class UbloxGpsReaderTest {
         )
         val actual = UbloxGpsReader.buildUbxCfgRate(measRateMs = 100)
         assertArrayEquals(expected, actual)
+    }
+
+    /** The regex-free replacement must agree with stdlib toDoubleOrNull on
+     *  everything the NMEA/CSV wire actually carries. */
+    @Test
+    fun fastDoubleOrNull_matchesStdlibOnWireValues() {
+        for (s in listOf(
+            "0", "-1.5", "37.383809", "23.247223", "121750.40", "0.550000",
+            "1.188984", "", "abc", "12,5", "--3", "1e3", "-0.0",
+        )) {
+            assertEquals("input <$s>", s.toDoubleOrNull(), fastDoubleOrNull(s))
+        }
+        assertNull(fastDoubleOrNull(""))
     }
 }

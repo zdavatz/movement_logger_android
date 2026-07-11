@@ -11,6 +11,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -31,6 +33,16 @@ import kotlinx.coroutines.launch
  * for replay interpolation and above the ~4 Hz Nyquist floor for pump
  * detection). The reader buffers bytes into lines on `\n`, validates
  * the `*HH` checksum, and routes RMC/GGA to the sink in arrival order.
+ *
+ * **Self-healing**: a read error or a silent port (no bytes for
+ * [STALL_NS] while a healthy receiver talks continuously) recycles the
+ * connection and re-opens the device as soon as it re-enumerates with
+ * permission — the loop retries until [stop] is called, so a transient
+ * USB glitch mid-ride no longer kills the session until the user notices
+ * and taps Connect again. Re-attach usually re-grants permission
+ * automatically via the manifest's USB_DEVICE_ATTACHED filter; when it
+ * doesn't, the loop waits and picks up the grant from the user's next
+ * Connect tap.
  */
 class UbloxGpsReader(
     private val usbManager: UsbManager,
@@ -50,8 +62,14 @@ class UbloxGpsReader(
     private var job: Job? = null
     private var connection: UsbDeviceConnection? = null
     private var port: UsbSerialPort? = null
+    /** vid/pid template for the reconnect path's re-enumeration. */
+    private var lastDevice: UsbDevice? = null
+    /** Set by [stop] before closing the port so the read loop can tell a
+     *  user-initiated close from a USB glitch (only the latter reconnects). */
+    @Volatile private var stopRequested = false
 
-    /** True while [start] has succeeded and the reader is pumping bytes. */
+    /** True while [start] has succeeded and the reader is pumping bytes
+     *  (or trying to re-open the device after a glitch). */
     val isRunning: Boolean get() = job?.isActive == true
 
     /**
@@ -67,21 +85,43 @@ class UbloxGpsReader(
             sink.onLog("reader: already running")
             return false
         }
+        stopRequested = false
+        val p = openPort(device) ?: return false
+        lastDevice = device
+        val msg = "opened ${device.productName} @ ${device.deviceName}"
+        Log.i(TAG, msg)
+        sink.onLog("reader: $msg")
+        job = scope.launch { readLoop(p) }
+        return true
+    }
+
+    fun stop() {
+        stopRequested = true
+        job?.cancel()
+        job = null
+        closeQuietly()
+        Log.i(TAG, "stopped")
+        sink.onLog("reader: stopped")
+    }
+
+    /** Probe / open / configure one device. Sets [connection]/[port] and
+     *  returns the port, or null (everything closed) on any failure. */
+    private fun openPort(device: UsbDevice): UsbSerialPort? {
         val driver: UsbSerialDriver? = UsbSerialProber.getDefaultProber().probeDevice(device)
         if (driver == null) {
             sink.onLog("reader: no CDC-ACM driver for ${device.productName}")
-            return false
+            return null
         }
         val conn = usbManager.openDevice(driver.device)
         if (conn == null) {
             sink.onLog("reader: openDevice() returned null")
-            return false
+            return null
         }
         val p = driver.ports.firstOrNull()
         if (p == null) {
             conn.close()
             sink.onLog("reader: driver has no ports")
-            return false
+            return null
         }
         try {
             p.open(conn)
@@ -110,41 +150,54 @@ class UbloxGpsReader(
             try { p.close() } catch (_: Exception) {}
             conn.close()
             sink.onLog("reader: open failed — ${e.message}")
-            return false
+            return null
         }
         connection = conn
         port = p
-        val msg = "opened ${device.productName} @ ${device.deviceName}"
-        Log.i(TAG, msg)
-        sink.onLog("reader: $msg")
-        job = scope.launch { readLoop(p) }
-        return true
+        return p
     }
 
-    fun stop() {
-        job?.cancel()
-        job = null
+    private fun closeQuietly() {
         try { port?.close() } catch (_: Exception) {}
         port = null
         try { connection?.close() } catch (_: Exception) {}
         connection = null
-        Log.i(TAG, "stopped")
-        sink.onLog("reader: stopped")
     }
 
-    private suspend fun readLoop(port: UsbSerialPort) {
+    private suspend fun readLoop(initial: UsbSerialPort) {
+        var p: UsbSerialPort? = initial
         val buf = ByteArray(4096)
         val line = StringBuilder(256)
-        while (scope.isActive) {
-            val n = try {
-                port.read(buf, READ_TIMEOUT_MS)
-            } catch (e: Exception) {
-                Log.w(TAG, "read error", e)
-                sink.onLog("reader: read error — ${e.message}")
-                break
+        var lastData = System.nanoTime()
+        while (currentCoroutineContext().isActive) {
+            if (p == null) {
+                p = reopenWithRetry() ?: break   // null = stopped/cancelled
+                lastData = System.nanoTime()
+                line.setLength(0)                // drop any torn partial line
             }
-            if (n <= 0) continue
+            val n = try {
+                p.read(buf, READ_TIMEOUT_MS)
+            } catch (e: Exception) {
+                if (stopRequested) break
+                Log.w(TAG, "read error", e)
+                sink.onLog("reader: read error — ${e.message}; reconnecting…")
+                closeQuietly()
+                p = null
+                continue
+            }
             val monoNs = System.nanoTime()
+            if (n <= 0) {
+                // A healthy receiver talks continuously (10 Hz). Prolonged
+                // silence means a stale port after a USB glitch the driver
+                // didn't surface as an error — recycle the connection.
+                if (monoNs - lastData > STALL_NS && !stopRequested) {
+                    sink.onLog("reader: no data for ${STALL_NS / 1_000_000_000} s — reconnecting…")
+                    closeQuietly()
+                    p = null
+                }
+                continue
+            }
+            lastData = monoNs
             for (i in 0 until n) {
                 val b = buf[i].toInt() and 0xFF
                 when (b) {
@@ -165,11 +218,53 @@ class UbloxGpsReader(
         }
     }
 
+    /**
+     * Poll the USB device list until the receiver is back (same vid/pid as
+     * the device [start] opened) with permission, then re-open it. Returns
+     * the fresh port, or null when [stop] cancelled the wait. Unbounded on
+     * purpose: mid-ride the right behaviour is "keep trying until the user
+     * gives up", and one enumeration per second is free.
+     */
+    private suspend fun reopenWithRetry(): UsbSerialPort? {
+        val template = lastDevice ?: return null
+        var attempt = 0
+        while (currentCoroutineContext().isActive && !stopRequested) {
+            delay(RECONNECT_DELAY_MS)
+            attempt++
+            val dev = usbManager.deviceList.values.firstOrNull {
+                it.vendorId == template.vendorId && it.productId == template.productId
+            }
+            when {
+                dev == null -> {
+                    if (attempt == 1 || attempt % LOG_EVERY == 0) {
+                        sink.onLog("reader: receiver not enumerated — waiting for re-attach")
+                    }
+                }
+                !usbManager.hasPermission(dev) -> {
+                    if (attempt == 1 || attempt % LOG_EVERY == 0) {
+                        sink.onLog("reader: waiting for USB permission — tap Connect if asked")
+                    }
+                }
+                else -> {
+                    val p = openPort(dev)
+                    if (p != null) {
+                        lastDevice = dev
+                        sink.onLog("reader: reconnected after $attempt attempt(s)")
+                        return p
+                    }
+                    // openPort logged the failure; keep polling.
+                }
+            }
+        }
+        return null
+    }
+
     private fun dispatch(rawLine: String, monoNs: Long) {
-        // Verbose: every raw NMEA line ends up in logcat for off-device
-        // debugging. Filter `UbloxGpsReader:V` to see them; default level
-        // is INFO so this is essentially free in release builds.
-        Log.v(TAG, rawLine)
+        // Per-line wire tap for off-device debugging, opt-in via
+        // `adb shell setprop log.tag.UbloxGpsReader V`. Unconditional
+        // Log.v flooded logd with ~40 lines/s and rolled the main buffer
+        // to ~20 min, which is exactly the window you need after a ride.
+        if (Log.isLoggable(TAG, Log.VERBOSE)) Log.v(TAG, rawLine)
         val payload = Nmea.verifyAndStrip(rawLine) ?: return
         // payload like "GPRMC,..." or "GNGGA,...". The 2-char talker
         // (GN/GP/GL/GA/BD) precedes the 3-char message ID, so match on
@@ -194,6 +289,11 @@ class UbloxGpsReader(
         private const val UBX_WRITE_TIMEOUT_MS = 200
         /** Target measurement interval in ms. 100 = 10 Hz (matches the box). */
         private const val TARGET_MEAS_RATE_MS = 100
+        /** Silent-port watchdog: a live receiver never pauses this long. */
+        private const val STALL_NS = 5_000_000_000L
+        private const val RECONNECT_DELAY_MS = 1_000L
+        /** Throttle for the reconnect loop's status lines (~15 s apart). */
+        private const val LOG_EVERY = 15
 
         /**
          * Build a UBX-CFG-RATE frame (class 0x06, id 0x08) requesting the

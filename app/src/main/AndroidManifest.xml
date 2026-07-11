@@ -93,6 +93,14 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
+        <!-- Keeps the USB GPS read loop + CSV logger alive while the app is
+             backgrounded (screen off / app switch) — otherwise the cached-app
+             freezer stalls the recording silently. -->
+        <service
+            android:name=".usb.UbloxGpsService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
         <!-- WorkManager's internal SystemForegroundService is what carries
              SyncWorker's setForeground(...) notification. Lint flags
              SyncWorker.kt's FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE unless
