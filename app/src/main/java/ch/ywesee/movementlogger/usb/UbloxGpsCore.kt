@@ -10,8 +10,10 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
+import ch.ywesee.movementlogger.data.CsvParsers
 import ch.ywesee.movementlogger.data.GpsMath
 import ch.ywesee.movementlogger.data.PublicMirror
+import ch.ywesee.movementlogger.data.RideMapRenderer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -116,6 +118,14 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      *  this (metres) as a GPS glitch — see [computeStats]. */
     private const val MAX_HOP_M = 60.0
 
+    /** Belt-and-braces gates for the LIVE max-speed fold (the primary
+     *  defence is upstream: [maybeFlushCsvRow] never logs speed from a void
+     *  RMC). Finished-file stats use the stronger position-consistency rule
+     *  in [RideMapRenderer.robustTopSpeed] instead. */
+    private const val FIX_NEIGHBOR_TICKS = 50.0
+    /** Same hard clip as `GpsMath.smoothSpeedKmh`. */
+    private const val MAX_PLAUSIBLE_SPEED_KMH = 60.0
+
     private val _state = MutableStateFlow(UbloxUiState())
     val state: StateFlow<UbloxUiState> = _state.asStateFlow()
 
@@ -161,6 +171,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
     private var liveFirstTick = Double.NaN
     private var livePrevLat = Double.NaN
     private var livePrevLon = Double.NaN
+    private var liveLastFixTick = Double.NEGATIVE_INFINITY
 
     /** Finished recordings never change, so stats are parsed once per
      *  (name, size) and cached; entries for deleted files are pruned on the
@@ -269,6 +280,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
             liveFirstTick = Double.NaN
             livePrevLat = Double.NaN
             livePrevLon = Double.NaN
+            liveLastFixTick = Double.NEGATIVE_INFINITY
             // Drop any prior session with this exact name (timestamped, so
             // collisions are vanishingly rare — but a re-start within the
             // same second would otherwise append onto stale bytes).
@@ -375,7 +387,10 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      * the fixed schema written by [startLogging]:
      * `Time [10ms],UTC,Lat,Lon,Alt,SpeedKMh,Course,Fix,NumSat,HDOP`.
      *
-     * - **Max speed** = peak parseable `SpeedKMh`.
+     * - **Max speed** = [RideMapRenderer.robustTopSpeed] — ≤ 60 km/h and
+     *   position-consistent, so the fantasy speed bursts u-blox emits while
+     *   reacquiring a fix can't become the headline stat (the share-PNG
+     *   footer runs the same code, so the two always agree).
      * - **Distance** = Σ haversine between consecutive rows that both have
      *   a fix (>0) and valid lat/lon. Hops > [MAX_HOP_M] are dropped as GPS
      *   glitches (a real hop that large implies >200 km/h at 1 Hz); the
@@ -383,58 +398,48 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      *   over a glitch spiking the total.
      * - **Duration** = `(lastTick − firstTick) × 10 ms`, drift-free vs. the
      *   phone monotonic clock the tick column is stamped from.
+     *
+     * Parsing goes through [CsvParsers.parseGpsStream] (regex-free since the
+     * 11.7.2026 OOM — see `fastDoubleOrNull`); the materialised row list is
+     * fine memory-wise because stats are computed once per (name, size) and
+     * cached, never on the 3 s tick.
      */
     private fun computeStats(file: File): GpsStats {
-        var maxSpeed = 0.0
+        val rows = file.inputStream().use { CsvParsers.parseGpsStream(it) }
+        if (rows.isEmpty()) return GpsStats.EMPTY
+        val maxSpeed = RideMapRenderer.robustTopSpeed(rows)
         var dist = 0.0
-        var firstTick = Double.NaN
-        var lastTick = 0.0
-        var rows = 0
         var prevLat = Double.NaN
         var prevLon = Double.NaN
-        var headerSeen = false
-        file.bufferedReader(Charsets.UTF_8).useLines { lines ->
-            for (raw in lines) {
-                val line = raw.trim()
-                if (line.isEmpty() || line.startsWith("#")) continue
-                if (!headerSeen) { headerSeen = true; continue }  // skip CSV header row
-                val c = line.split(',')
-                if (c.size < 8) continue
-                rows++
-                // fastDoubleOrNull, not toDoubleOrNull: the stdlib version
-                // burns a native ICU regex match per field, which at this
-                // loop's volume OOM'd the process — see the note on it.
-                fastDoubleOrNull(c[0])?.let { t ->
-                    if (firstTick.isNaN()) firstTick = t
-                    lastTick = t
+        for (r in rows) {
+            if (r.fix > 0 && r.lat.isFinite() && r.lon.isFinite()) {
+                if (!prevLat.isNaN()) {
+                    val hop = GpsMath.haversineM(prevLat, prevLon, r.lat, r.lon)
+                    if (hop <= MAX_HOP_M) dist += hop
                 }
-                c.getOrNull(5)?.let(::fastDoubleOrNull)?.let { if (it > maxSpeed) maxSpeed = it }
-                val fix = c.getOrNull(7)?.toIntOrNull() ?: 0
-                val lat = c.getOrNull(2)?.let(::fastDoubleOrNull)
-                val lon = c.getOrNull(3)?.let(::fastDoubleOrNull)
-                if (fix > 0 && lat != null && lon != null) {
-                    if (!prevLat.isNaN()) {
-                        val hop = GpsMath.haversineM(prevLat, prevLon, lat, lon)
-                        if (hop <= MAX_HOP_M) dist += hop
-                    }
-                    prevLat = lat
-                    prevLon = lon
-                }
+                prevLat = r.lat
+                prevLon = r.lon
             }
         }
-        val durSec = if (firstTick.isNaN()) 0L
-        else ((lastTick - firstTick) * 10.0 / 1000.0).toLong()
-        return GpsStats(maxSpeed, dist, durSec, rows)
+        val durSec = ((rows.last().ticks - rows.first().ticks) * 10.0 / 1000.0).toLong()
+        return GpsStats(maxSpeed, dist, durSec, rows.size)
     }
 
-    /** Fold one just-written CSV row into [liveStats] — same accumulation
-     *  rules as [computeStats] (max speed over all rows, distance over
-     *  fixed rows gated by [MAX_HOP_M], duration from the tick column). */
+    /** Fold one just-written CSV row into [liveStats] — mirrors
+     *  [computeStats]' distance ([MAX_HOP_M] gate) and duration rules; max
+     *  speed uses the forward-only gates above (a live fold can't apply the
+     *  full position-consistency check, and doesn't need to — void-RMC
+     *  speeds never reach here since [maybeFlushCsvRow] drops them). */
     private fun updateLiveStats(ticks: Long, speedKmh: Double?, fix: Int, lat: Double?, lon: Double?) {
         val s = liveStats
         if (liveFirstTick.isNaN()) liveFirstTick = ticks.toDouble()
+        if (fix > 0) liveLastFixTick = ticks.toDouble()
         var maxSpeed = s.maxSpeedKmh
-        if (speedKmh != null && speedKmh.isFinite() && speedKmh > maxSpeed) maxSpeed = speedKmh
+        if (speedKmh != null && speedKmh.isFinite() &&
+            speedKmh <= MAX_PLAUSIBLE_SPEED_KMH &&
+            ticks - liveLastFixTick <= FIX_NEIGHBOR_TICKS &&
+            speedKmh > maxSpeed
+        ) maxSpeed = speedKmh
         var dist = s.distanceMeters
         if (fix > 0 && lat != null && lon != null) {
             if (!livePrevLat.isNaN()) {
@@ -458,8 +463,10 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
                 utc = fix.utc,
                 latDeg = fix.latDeg ?: it.latDeg,
                 lonDeg = fix.lonDeg ?: it.lonDeg,
-                speedKmh = fix.speedKmh ?: it.speedKmh,
-                courseDeg = fix.courseDeg ?: it.courseDeg,
+                // Void (status V) RMC speed/course is reacquisition fantasy —
+                // hold the last valid reading instead of flashing 27 km/h.
+                speedKmh = fix.takeIf { f -> f.statusValid }?.speedKmh ?: it.speedKmh,
+                courseDeg = fix.takeIf { f -> f.statusValid }?.courseDeg ?: it.courseDeg,
                 rmcHz = hz,
                 sentenceCount = it.sentenceCount + 1,
             )
@@ -585,8 +592,13 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         val lat = gga?.latDeg ?: rmc?.latDeg
         val lon = gga?.lonDeg ?: rmc?.lonDeg
         val alt = gga?.altM
-        val speed = rmc?.speedKmh
-        val course = rmc?.courseDeg
+        // Only log speed/course from an RMC the receiver marks valid
+        // (status A). While reacquiring a fix, u-blox keeps emitting
+        // speed-over-ground on VOID (status V) sentences — a burst of those
+        // fantasy values became "Top 27.1 km/h" on the ~6 km/h 11.7.2026
+        // Ermioni session.
+        val speed = rmc?.takeIf { it.statusValid }?.speedKmh
+        val course = rmc?.takeIf { it.statusValid }?.courseDeg
         val fix = gga?.fixQuality ?: 0
         val sats = gga?.numSat ?: 0
         val hdop = gga?.hdop

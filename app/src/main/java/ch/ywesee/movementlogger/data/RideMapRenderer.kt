@@ -134,6 +134,105 @@ object RideMapRenderer {
         it.fix > 0 && it.lat.isFinite() && it.lon.isFinite() && !(it.lat == 0.0 && it.lon == 0.0)
     }
 
+    /** Same hard clip as `GpsMath.smoothSpeedKmh` — >60 km/h on a pumpfoil
+     *  is always a bad fix. */
+    internal const val MAX_PLAUSIBLE_SPEED_KMH = 60.0
+    /** The fix pair backing the position cross-check must sit within ±1 s
+     *  of the speed row (`Time [10ms]` ticks — box ms columns are ÷10 by
+     *  the parser, so the unit holds across all CSV generations)… */
+    private const val FIX_WINDOW_TICKS = 100.0
+    /** …and span at least 0.5 s, so 10 Hz position jitter (±0.5 m) can't
+     *  fake a huge derived speed. */
+    private const val MIN_FIX_SPAN_TICKS = 50.0
+    /** Reported speed may exceed the chord-derived speed by this factor
+     *  (curved path inside the window, doppler vs. position lag)… */
+    private const val SPEED_VS_TRACK_FACTOR = 3.0
+    /** …plus this floor, so near-stationary jitter doesn't reject slow rows. */
+    private const val SPEED_VS_TRACK_FLOOR_KMH = 5.0
+    /** A hole ≥ this (2 s) in the valid-fix timeline is a signal blackout —
+     *  on the water that means the antenna went under… */
+    private const val BLACKOUT_GAP_TICKS = 200.0
+    /** …and no speed row within this (10 s) of a blackout counts: while the
+     *  antenna sinks, u-blox's filter fabricates a smooth, self-consistent
+     *  speed ramp WITH matching sliding positions and healthy quality flags
+     *  (12 sats / HDOP 0.6 claimed on the 11.7.2026 ride while the reported
+     *  speed climbed 5 → 27 km/h on a ~1.5 km/h swimmer), so neither
+     *  quality gates, nor an acceleration limit, nor the position
+     *  cross-check below can catch it. Blackout adjacency is the one
+     *  reliable signature — the fabrication episode always brackets the
+     *  moment the signal actually died. */
+    private const val BLACKOUT_PAD_TICKS = 1_000.0
+
+    /**
+     * Top speed for the footer stat, outlier-hardened. Three gates, each
+     * physical and each verified against the 11.7.2026 Ermioni ride, whose
+     * raw column peaked at a fantasy 27.1 km/h on a ~7 km/h session:
+     *
+     *  1. Hard clip at [MAX_PLAUSIBLE_SPEED_KMH].
+     *  2. Blackout adjacency (see [BLACKOUT_PAD_TICKS]) — kills the
+     *     antenna-under-water fabrication episodes.
+     *  3. Position consistency: the earliest and latest valid fix within
+     *     ±[FIX_WINDOW_TICKS] must span ≥ [MIN_FIX_SPAN_TICKS], and the row
+     *     is accepted iff `v ≤ chordSpeed × [SPEED_VS_TRACK_FACTOR] +
+     *     [SPEED_VS_TRACK_FLOOR_KMH]` — kills isolated doppler blips that
+     *     aren't blackout-adjacent. Ordinary RMC half-rows (fix column 0,
+     *     speed valid) pass because fixed GGA rows land within 0.1 s on
+     *     both sides.
+     *
+     * `UbloxGpsCore.computeStats` delegates here so the footer and the
+     * recordings-list stat stay equal.
+     */
+    internal fun robustTopSpeed(rows: List<GpsRow>): Double {
+        val fixes = validPoints(rows)
+        if (fixes.size < 2) return 0.0
+        val fixTicks = DoubleArray(fixes.size) { fixes[it].ticks }
+
+        // Blackout exclusion zones: before the first fix settles, around
+        // every ≥2 s hole in the fix timeline, and after the last fix.
+        val zones = ArrayList<DoubleArray>()
+        zones.add(doubleArrayOf(Double.NEGATIVE_INFINITY, fixTicks[0] + BLACKOUT_PAD_TICKS))
+        for (i in 1 until fixTicks.size) {
+            if (fixTicks[i] - fixTicks[i - 1] >= BLACKOUT_GAP_TICKS) {
+                zones.add(
+                    doubleArrayOf(
+                        fixTicks[i - 1] - BLACKOUT_PAD_TICKS,
+                        fixTicks[i] + BLACKOUT_PAD_TICKS,
+                    )
+                )
+            }
+        }
+        zones.add(doubleArrayOf(fixTicks.last() + 1e-9, Double.POSITIVE_INFINITY))
+
+        var top = 0.0
+        for (r in rows) {
+            val v = r.speedKmhModule
+            if (!v.isFinite() || v < 0.0 || v > MAX_PLAUSIBLE_SPEED_KMH) continue
+            if (v <= top || !r.ticks.isFinite()) continue
+            if (zones.any { r.ticks >= it[0] && r.ticks <= it[1] }) continue
+            val a = lowerBound(fixTicks, r.ticks - FIX_WINDOW_TICKS)
+            val b = lowerBound(fixTicks, r.ticks + FIX_WINDOW_TICKS + 1e-9) - 1
+            if (b <= a) continue
+            val span = fixTicks[b] - fixTicks[a]
+            if (span < MIN_FIX_SPAN_TICKS) continue
+            val chordKmh = GpsMath.haversineM(
+                fixes[a].lat, fixes[a].lon, fixes[b].lat, fixes[b].lon,
+            ) / (span / GpsMath.TICKS_PER_SEC) * 3.6
+            if (v <= chordKmh * SPEED_VS_TRACK_FACTOR + SPEED_VS_TRACK_FLOOR_KMH) top = v
+        }
+        return top
+    }
+
+    /** Index of the first element ≥ [key] in the sorted [arr]. */
+    private fun lowerBound(arr: DoubleArray, key: Double): Int {
+        var lo = 0
+        var hi = arr.size
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (arr[mid] < key) lo = mid + 1 else hi = mid
+        }
+        return lo
+    }
+
     /**
      * Replace NaN speeds (u-blox rows where only the GGA sentence
      * contributed) with the nearest earlier finite value, back-filling the
@@ -227,11 +326,9 @@ object RideMapRenderer {
             drawMarker(canvas, px[0], py[0], Color.rgb(52, 199, 89))   // systemGreen
             drawMarker(canvas, px[valid.size - 1], py[valid.size - 1], Color.rgb(255, 59, 48)) // systemRed
 
-            // Top speed over ALL rows, not just plottable ones — the u-blox
-            // logger carries speed on RMC half-rows whose fix column is 0,
-            // and the recordings-list stat counts those too.
-            val topSpeed = rows.asSequence().map { it.speedKmhModule }
-                .filter { it.isFinite() }.maxOrNull() ?: speeds.max()
+            // Over ALL rows (RMC half-rows carry the speed with fix column
+            // 0), but gated on a nearby valid fix — see robustTopSpeed.
+            val topSpeed = robustTopSpeed(rows)
             val distanceKm = trackDistanceKm(lats, lons)
             val durMin = (valid.last().ticks - valid.first().ticks) * 0.01 / 60.0
             drawFooter(context, canvas, width, mapHeight, footerHeight, topSpeed, distanceKm, durMin)

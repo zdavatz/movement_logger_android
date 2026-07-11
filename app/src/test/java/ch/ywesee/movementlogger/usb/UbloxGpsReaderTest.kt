@@ -1,5 +1,6 @@
 package ch.ywesee.movementlogger.usb
 
+import ch.ywesee.movementlogger.data.fastDoubleOrNull
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull

@@ -243,7 +243,7 @@ recordings-list stat.
 ".dev"` + `versionNameSuffix "-dev"` on the debug build type (the phone's
 Play-signed install used to block `installDebug` entirely).
 
-## USB GPS tab (`usb/`) — reliability hardening (v0.0.48)
+## USB GPS tab (`usb/`) — reliability hardening (v0.0.48–49)
 
 Post-mortem of the 11.7.2026 water test (33-min recording died at 15:49:52,
 tombstone: `Scudo ERROR: internal map failure (Out of memory)` inside
@@ -254,9 +254,9 @@ the rules that now guard it:
   call through `ScreenFloatValueRegEx` — one *native* ICU regex match per
   field. The 3 s recordings tick re-parsed the growing 1 MB CSV each pass
   (~25k fields/s sustained) until the native allocator couldn't map more
-  memory and SIGABRT'd the whole app. `usb/Nmea.kt:fastDoubleOrNull` is the
-  regex-free replacement (plain `Double.parseDouble` + catch); the NMEA and
-  `computeStats` paths use it.
+  memory and SIGABRT'd the whole app. `data/CsvParsers.kt:fastDoubleOrNull`
+  is the regex-free replacement (plain `Double.parseDouble` + catch); the
+  NMEA and CSV-parsing paths use it.
 - **The in-flight recording's stats are folded incrementally** per written
   row (`updateLiveStats` in `UbloxGpsCore`, zero file IO); finished files
   parse once into a (name, size)-keyed `statsCache`, seeded from the live
@@ -279,6 +279,24 @@ the rules that now guard it:
   window you need for post-ride forensics.
 - Shared ride-map PNGs are additionally published to
   `Download/MovementLogger/` via `PublicMirror` (`png → image/png` MIME).
+- **Top-speed stat is outlier-hardened (v0.0.49) — the raw `SpeedKMh` max
+  is garbage when the antenna dips under water.** On the 11.7.2026 ride the
+  receiver fabricated a smooth 5 → 27 km/h ramp (on a ~7 km/h session)
+  while STILL claiming 12 sats / HDOP 0.6, with positions sliding
+  consistently (the straight line across town on the map) — so quality
+  flags, an accel limit, AND a position cross-check all pass it. Rules in
+  `RideMapRenderer.robustTopSpeed` (shared by the recordings list via
+  `computeStats` and the PNG footer; iOS `RideMap.robustTopSpeed` is the
+  port): (1) hard clip 60 km/h; (2) **blackout adjacency** — no speed row
+  within ±10 s of a ≥2 s hole in the valid-fix timeline counts (the
+  fabrication episode always brackets the moment the signal actually
+  died); (3) position consistency — earliest/latest valid fix within ±1 s
+  must span ≥0.5 s and move commensurately (`v ≤ chord×3 + 5`), which
+  kills isolated doppler blips. Write-time guard on top: `maybeFlushCsvRow`
+  only logs speed/course from RMC sentences flagged valid (status A) —
+  void (V) sentences during reacquisition used to land in the CSV.
+  `computeStats` now parses via `CsvParsers.parseGpsStream` and delegates
+  max-speed to `robustTopSpeed` so list + footer can never disagree.
 
 ## GPS Debug tab — u-blox UBX survey over BLE
 

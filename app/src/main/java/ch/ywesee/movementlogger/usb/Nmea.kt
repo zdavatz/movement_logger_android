@@ -1,5 +1,7 @@
 package ch.ywesee.movementlogger.usb
 
+import ch.ywesee.movementlogger.data.fastDoubleOrNull
+
 /**
  * Minimal NMEA-0183 parser for the u-blox GNSS receiver — handles the two
  * sentence types we care about for a live fix display:
@@ -18,26 +20,6 @@ package ch.ywesee.movementlogger.usb
  * with sign for lat/lon, km/h for speed, metres for altitude). Caller is
  * responsible for combining RMC + GGA into a single fix row.
  */
-
-/**
- * Regex-free `toDoubleOrNull`. Kotlin's stdlib version screens every call
- * through `ScreenFloatValueRegEx` — one native ICU regex match per
- * invocation. At NMEA/CSV hot-loop rates (~20 sentence fields/s live plus
- * ~25k CSV fields/s during the recordings-stats tick) that native churn
- * exhausted the allocator after ~19 h of process uptime: Scudo aborted with
- * `internal map failure (Out of memory)` inside `computeStats` and killed
- * the 11.7.2026 water-test recording. `Double.parseDouble` does its own
- * trim + validation; the exception path only fires on genuinely malformed
- * fields, which are rare on this wire.
- */
-internal fun fastDoubleOrNull(s: String): Double? {
-    if (s.isEmpty()) return null
-    return try {
-        java.lang.Double.parseDouble(s)
-    } catch (_: NumberFormatException) {
-        null
-    }
-}
 
 data class RmcFix(
     val utc: String,            // hhmmss.ss verbatim (empty if absent)

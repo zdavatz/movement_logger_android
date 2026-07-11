@@ -100,4 +100,37 @@ class RideMapRendererTest {
         )
         assertEquals(2, pts.size)
     }
+
+    @Test
+    fun robustTopSpeedSurvivesUnderwaterFabricationAndBlips() {
+        // Track along the equator so metres → degrees is trivial.
+        val mPerDegLon = Math.PI * 6_371_000.0 / 180.0
+        fun fixRow(ticks: Double, meters: Double) = GpsRow(
+            ticks = ticks, utc = "", lat = 0.0, lon = meters / mPerDegLon, altM = 0.0,
+            speedKmhModule = Double.NaN, courseDeg = 0.0, fix = 2, numSat = 8, hdop = 1.0,
+        )
+        fun spdRow(ticks: Double, v: Double) = GpsRow(
+            ticks = ticks, utc = "", lat = 0.0, lon = 0.0, altM = Double.NaN,
+            speedKmhModule = v, courseDeg = Double.NaN, fix = 0, numSat = 0, hdop = Double.NaN,
+        )
+        val rows = mutableListOf<GpsRow>()
+        var meters = 0.0
+        // Honest 6 km/h cruise, fixes at 10 Hz, ticks 0..2500.
+        for (t in 0..2500 step 10) { rows.add(fixRow(t.toDouble(), meters)); meters += 6.0 / 3.6 * 0.1 }
+        // Antenna sinking: the filter fabricates a self-consistent 27 km/h
+        // slide (positions AND speed agree) right before the signal dies.
+        for (t in 2510..3000 step 10) { rows.add(fixRow(t.toDouble(), meters)); meters += 27.0 / 3.6 * 0.1 }
+        // Blackout: no fixes ticks 3000..3500. Then honest cruise resumes.
+        for (t in 3500..7000 step 10) { rows.add(fixRow(t.toDouble(), meters)); meters += 6.0 / 3.6 * 0.1 }
+
+        rows.add(spdRow(1505.0, 7.0))   // honest peak mid-cruise → counts
+        rows.add(spdRow(2805.0, 27.1))  // fabricated slide: position-consistent,
+                                        // but blackout-adjacent → out
+        rows.add(spdRow(5005.0, 6.5))   // honest, far from the blackout → counts
+        rows.add(spdRow(5205.0, 80.0))  // above the 60 km/h hard clip → out
+        rows.add(spdRow(5505.0, 25.0))  // isolated doppler blip amid a 6 km/h
+                                        // cruise: chord check rejects → out
+        rows.sortBy { it.ticks }
+        assertEquals(7.0, RideMapRenderer.robustTopSpeed(rows), 1e-9)
+    }
 }

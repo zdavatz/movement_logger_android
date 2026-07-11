@@ -302,9 +302,28 @@ private class HeaderMap(headerLine: String) {
 
 private fun splitTrim(line: String): List<String> = line.split(',').map { it.trim() }
 
+/**
+ * Regex-free `toDoubleOrNull`. Kotlin's stdlib version screens every call
+ * through `ScreenFloatValueRegEx` — one native ICU regex match per
+ * invocation. At CSV/NMEA hot-loop rates that native churn exhausted the
+ * allocator after ~19 h of process uptime: Scudo aborted with `internal map
+ * failure (Out of memory)` inside the GPS recordings-stats path and killed
+ * the 11.7.2026 water-test recording. `Double.parseDouble` does its own
+ * trim + validation; the exception path only fires on genuinely malformed
+ * fields, which are rare on this wire.
+ */
+internal fun fastDoubleOrNull(s: String): Double? {
+    if (s.isEmpty()) return null
+    return try {
+        java.lang.Double.parseDouble(s)
+    } catch (_: NumberFormatException) {
+        null
+    }
+}
+
 private fun parseDouble(row: List<String>, idx: Int): Double {
     val s = row.getOrNull(idx) ?: throw IOException("missing column at index $idx")
-    return s.toDoubleOrNull() ?: throw IOException("not a float: \"$s\"")
+    return fastDoubleOrNull(s) ?: throw IOException("not a float: \"$s\"")
 }
 
 private fun parseInt(row: List<String>, idx: Int): Int {
@@ -313,7 +332,7 @@ private fun parseInt(row: List<String>, idx: Int): Int {
 }
 
 private fun parseDoubleOrNan(row: List<String>, idx: Int): Double =
-    row.getOrNull(idx)?.toDoubleOrNull() ?: Double.NaN
+    row.getOrNull(idx)?.let(::fastDoubleOrNull) ?: Double.NaN
 
 private fun parseIntOrZero(row: List<String>, idx: Int): Int =
     row.getOrNull(idx)?.toIntOrNull() ?: 0
