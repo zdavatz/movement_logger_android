@@ -343,7 +343,7 @@ the rules that now guard it:
 Race-day streaming to the desktop app's **Race** tab: a card in the GPS
 tab (rider name + desktop `ip:port` + **source picker** — "u-blox USB"
 or "Phone GPS" — persisted in `movement_logger_race` prefs) toggles a
-UDP uplink that fires one JSON datagram per fix, throttled to 2 Hz —
+UDP uplink that fires one JSON datagram per fix, throttled to 5 Hz —
 `{"v":1,"rider":..,"src":"ublox","lat":..,"lon":..,"kmh":..,"deg":..,
 "ts":<epoch ms>,"batt":0-100}`, default port 47777 (constants shared
 with iOS `RaceUplink.swift` + desktop `race.rs`, which owns the wire

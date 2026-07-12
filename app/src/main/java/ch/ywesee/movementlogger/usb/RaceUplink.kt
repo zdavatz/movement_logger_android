@@ -16,7 +16,7 @@ import java.util.concurrent.Executors
 /**
  * Race mode — live position uplink to the desktop app's Race tab.
  *
- * One small JSON datagram per fix, throttled to 2 Hz, fired at the
+ * One small JSON datagram per fix, throttled to 5 Hz, fired at the
  * configured `host:port` (the desktop shows its LAN ip:port in the Race
  * tab; over cellular a relay forwarding the same datagrams works
  * unchanged). Wire format shared with iOS `RaceUplink.swift` and parsed
@@ -35,7 +35,7 @@ import java.util.concurrent.Executors
 object RaceUplink {
     private const val TAG = "RaceUplink"
     private const val PREFS = "movement_logger_race"
-    private const val MIN_SEND_INTERVAL_MS = 450L // ≤ ~2 Hz on a 5–10 Hz fix stream
+    private const val MIN_SEND_INTERVAL_MS = 180L // ≤ ~5 Hz on a 5–10 Hz fix stream
     const val DEFAULT_PORT = 47777
     const val SOURCE_UBLOX = "ublox"
     const val SOURCE_PHONE = "phone"
