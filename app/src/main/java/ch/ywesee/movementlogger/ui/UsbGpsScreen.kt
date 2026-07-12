@@ -22,10 +22,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -156,10 +159,27 @@ fun UsbGpsScreen() {
  */
 @Composable
 private fun RaceCard() {
+    val ctx = LocalContext.current
     val race by RaceUplink.state.collectAsStateWithLifecycle()
     var rider by remember(race.rider) { mutableStateOf(race.rider) }
     var host by remember(race.host) { mutableStateOf(race.host) }
     var port by remember(race.port) { mutableStateOf(race.port.toString()) }
+    var source by remember(race.source) { mutableStateOf(race.source) }
+
+    fun enableNow() {
+        RaceUplink.configure(
+            rider.trim(),
+            host.trim(),
+            port.trim().toIntOrNull() ?: RaceUplink.DEFAULT_PORT,
+            source,
+        )
+        RaceUplink.setEnabled(true)
+    }
+    // Phone-GPS source needs the runtime location grant (the u-blox
+    // source reads USB serial and never touches Android location).
+    val locPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> if (granted) enableNow() }
 
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp)) {
@@ -169,14 +189,17 @@ private fun RaceCard() {
                 Switch(
                     checked = race.enabled,
                     onCheckedChange = { on ->
-                        if (on) {
-                            RaceUplink.configure(
-                                rider.trim(),
-                                host.trim(),
-                                port.trim().toIntOrNull() ?: RaceUplink.DEFAULT_PORT,
-                            )
+                        when {
+                            !on -> RaceUplink.setEnabled(false)
+                            source == RaceUplink.SOURCE_PHONE &&
+                                ctx.checkSelfPermission(
+                                    android.Manifest.permission.ACCESS_FINE_LOCATION,
+                                ) != android.content.pm.PackageManager.PERMISSION_GRANTED ->
+                                locPermLauncher.launch(
+                                    android.Manifest.permission.ACCESS_FINE_LOCATION,
+                                )
+                            else -> enableNow()
                         }
-                        RaceUplink.setEnabled(on)
                     },
                     // Sending without a target/name is pointless.
                     enabled = race.enabled || (rider.isNotBlank() && host.isNotBlank()),
@@ -187,6 +210,24 @@ private fun RaceCard() {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            Spacer(Modifier.height(8.dp))
+            // GPS source: the plugged u-blox receiver, or the phone's own
+            // GNSS when no receiver is available (iOS-parity picker).
+            Row {
+                FilterChip(
+                    selected = source == RaceUplink.SOURCE_UBLOX,
+                    onClick = { if (!race.enabled) source = RaceUplink.SOURCE_UBLOX },
+                    label = { Text("u-blox USB") },
+                    enabled = !race.enabled,
+                )
+                Spacer(Modifier.width(8.dp))
+                FilterChip(
+                    selected = source == RaceUplink.SOURCE_PHONE,
+                    onClick = { if (!race.enabled) source = RaceUplink.SOURCE_PHONE },
+                    label = { Text("Phone GPS") },
+                    enabled = !race.enabled,
+                )
+            }
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
                 value = rider,
@@ -220,7 +261,13 @@ private fun RaceCard() {
                 Spacer(Modifier.height(8.dp))
                 Text(
                     "Sending — ${race.sent} fixes to ${race.host}:${race.port}" +
-                        if (race.sent == 0L) " (waiting for a GPS fix)" else "",
+                        if (race.sent == 0L) {
+                            if (race.source == RaceUplink.SOURCE_PHONE) {
+                                " (waiting for a phone GPS fix)"
+                            } else {
+                                " (waiting for a GPS fix — is the receiver connected?)"
+                            }
+                        } else "",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 race.lastError?.let {

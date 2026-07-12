@@ -10,20 +10,28 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"
         tools:targetApi="31" />
 
-    <!-- Legacy permissions for API 26-30. ACCESS_FINE_LOCATION was historically required
-         for BLE scan; capped at API 30 to avoid the location prompt on 31+. -->
+    <!-- Legacy permissions for API 26-30 (BLE scan). -->
     <uses-permission android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+    <!-- Race mode's "Phone GPS" source reads the phone's own GNSS when no
+         u-blox receiver is plugged in (historically this permission was
+         API ≤ 30 only, for BLE scans). Requested at runtime from the Race
+         card; the BLE flow on 31+ still never asks for location. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <!-- Foreground service keeps the BLE worker alive while the app is in
          the background (long READ, listing, mid-session). connectedDevice
          is the canonical type for "talking to an external device over BLE". -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"
+        tools:targetApi="34" />
+    <!-- Race mode with the Phone GPS source keeps streaming with the
+         screen off — the Android pendant of iOS's location background
+         mode (the u-blox path rides UbloxGpsService instead). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"
         tools:targetApi="34" />
     <!-- Required at runtime on API 33+ to show the foreground-service notification. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"
@@ -100,6 +108,13 @@
             android:name=".usb.UbloxGpsService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Race mode "Phone GPS" source: keeps the LocationManager
+             updates + UDP uplink alive with the screen off. -->
+        <service
+            android:name=".usb.RaceGpsService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
 
         <!-- WorkManager's internal SystemForegroundService is what carries
              SyncWorker's setForeground(...) notification. Lint flags
