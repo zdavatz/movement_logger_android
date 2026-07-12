@@ -47,6 +47,8 @@ object RaceUplink {
         val port: Int = DEFAULT_PORT,
         /** GPS source: "ublox" (USB receiver) or "phone" (built-in GNSS). */
         val source: String = SOURCE_UBLOX,
+        /** Optional shared race token — must match the desktop's. */
+        val race: String = "",
         val sent: Long = 0,
         val lastError: String? = null,
     )
@@ -76,17 +78,24 @@ object RaceUplink {
                 host = p.getString("host", "") ?: "",
                 port = p.getInt("port", DEFAULT_PORT),
                 source = p.getString("source", SOURCE_UBLOX) ?: SOURCE_UBLOX,
+                race = p.getString("race", "") ?: "",
             )
         }
     }
 
-    fun configure(rider: String, host: String, port: Int, source: String = SOURCE_UBLOX) {
-        _state.update { it.copy(rider = rider, host = host, port = port, source = source) }
+    fun configure(
+        rider: String, host: String, port: Int,
+        source: String = SOURCE_UBLOX, race: String = "",
+    ) {
+        _state.update {
+            it.copy(rider = rider, host = host, port = port, source = source, race = race)
+        }
         appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()
             ?.putString("rider", rider)
             ?.putString("host", host)
             ?.putInt("port", port)
             ?.putString("source", source)
+            ?.putString("race", race)
             ?.apply()
         // A new target invalidates the cached DNS result.
         resolved = null
@@ -141,6 +150,7 @@ object RaceUplink {
             // ~3 m UERE. Feeds the desktop's per-rider accuracy circle.
             accM = s.hdop?.let { it * 3.0 },
             sat = s.numSat,
+            race = cfg.race,
         )
         executor.execute {
             try {
@@ -176,6 +186,7 @@ object RaceUplink {
             accM = if (loc.hasAccuracy()) loc.accuracy.toDouble() else null,
             sat = sats,
             src = SOURCE_PHONE,
+            race = cfg.race,
         )
         executor.execute {
             try {
@@ -196,6 +207,7 @@ object RaceUplink {
         rider: String, lat: Double, lon: Double,
         kmh: Double?, deg: Double?, ts: Long, batt: Int,
         accM: Double? = null, sat: Int = -1, src: String = SOURCE_UBLOX,
+        race: String = "",
     ): ByteArray {
         val o = JSONObject()
         o.put("v", 1)
@@ -209,6 +221,7 @@ object RaceUplink {
         if (batt >= 0) o.put("batt", batt)
         if (accM != null && accM.isFinite() && accM > 0) o.put("acc", accM)
         if (sat > 0) o.put("sat", sat)
+        if (race.isNotBlank()) o.put("race", race)
         return o.toString().toByteArray(Charsets.UTF_8)
     }
 }

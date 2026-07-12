@@ -165,6 +165,7 @@ private fun RaceCard() {
     var host by remember(race.host) { mutableStateOf(race.host) }
     var port by remember(race.port) { mutableStateOf(race.port.toString()) }
     var source by remember(race.source) { mutableStateOf(race.source) }
+    var token by remember(race.race) { mutableStateOf(race.race) }
 
     fun enableNow() {
         RaceUplink.configure(
@@ -172,6 +173,7 @@ private fun RaceCard() {
             host.trim(),
             port.trim().toIntOrNull() ?: RaceUplink.DEFAULT_PORT,
             source,
+            token.trim(),
         )
         RaceUplink.setEnabled(true)
     }
@@ -257,6 +259,15 @@ private fun RaceCard() {
                     modifier = Modifier.weight(1f),
                 )
             }
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = token,
+                onValueChange = { token = it },
+                label = { Text("Race token (optional)") },
+                singleLine = true,
+                enabled = !race.enabled,
+                modifier = Modifier.fillMaxWidth(),
+            )
             if (race.enabled) {
                 Spacer(Modifier.height(8.dp))
                 Text(
