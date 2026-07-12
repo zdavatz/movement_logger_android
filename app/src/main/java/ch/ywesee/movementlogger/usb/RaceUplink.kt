@@ -120,6 +120,10 @@ object RaceUplink {
             deg = s.courseDeg,
             ts = now,
             batt = battery?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1,
+            // Rough horizontal accuracy from HDOP: dimensionless HDOP ×
+            // ~3 m UERE. Feeds the desktop's per-rider accuracy circle.
+            accM = s.hdop?.let { it * 3.0 },
+            sat = s.numSat,
         )
         executor.execute {
             try {
@@ -139,6 +143,7 @@ object RaceUplink {
     internal fun encode(
         rider: String, lat: Double, lon: Double,
         kmh: Double?, deg: Double?, ts: Long, batt: Int,
+        accM: Double? = null, sat: Int = -1,
     ): ByteArray {
         val o = JSONObject()
         o.put("v", 1)
@@ -150,6 +155,8 @@ object RaceUplink {
         if (deg != null && deg.isFinite()) o.put("deg", deg)
         o.put("ts", ts)
         if (batt >= 0) o.put("batt", batt)
+        if (accM != null && accM.isFinite() && accM > 0) o.put("acc", accM)
+        if (sat > 0) o.put("sat", sat)
         return o.toString().toByteArray(Charsets.UTF_8)
     }
 }
