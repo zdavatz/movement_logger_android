@@ -298,6 +298,14 @@ object RideMapRenderer {
      *  and don't count toward distance. */
     private const val TRACK_MAX_HOP_M = 60.0
 
+    /** Bridge the hole between two segments with a dashed "in water"
+     *  connector when their real endpoints are at most this far apart —
+     *  a blackout hole means the antenna was under water, so the rider
+     *  was in the water between the two points (e.g. jumping in off the
+     *  harbour wall). Above this it's a genuine teleport and the track
+     *  stays broken (never re-draw the fake across-town lines). */
+    const val HOLE_BRIDGE_MAX_M = 200.0
+
     /** Σ haversine within segments — never across the blackout holes
      *  between them — with the [TRACK_MAX_HOP_M] glitch gate per hop. */
     fun segmentsDistanceKm(segments: List<List<GpsRow>>): Double {
@@ -628,6 +636,27 @@ object RideMapRenderer {
                 off += s.size
             }
 
+            // Dashed "in water" connectors across short blackout holes
+            // (see HOLE_BRIDGE_MAX_M) — the rider swam from A to B while
+            // the antenna was under; dashes mark it as untracked.
+            val dash = android.graphics.DashPathEffect(floatArrayOf(14f, 10f), 0f)
+            val connCasing = Paint(casing).apply { pathEffect = dash }
+            val conn = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeWidth = 5f
+                color = RideMode.SWIM.argb
+                pathEffect = dash
+            }
+            off = 0
+            for (k in 0 until segments.size - 1) {
+                off += segments[k].size
+                val a = segments[k].last()
+                val b = segments[k + 1].first()
+                if (GpsMath.haversineM(a.lat, a.lon, b.lat, b.lon) > HOLE_BRIDGE_MAX_M) continue
+                canvas.drawLine(px[off - 1], py[off - 1], px[off], py[off], connCasing)
+                canvas.drawLine(px[off - 1], py[off - 1], px[off], py[off], conn)
+            }
+
             drawMarker(canvas, px[0], py[0], Color.rgb(52, 199, 89))   // systemGreen
             drawMarker(canvas, px[valid.size - 1], py[valid.size - 1], Color.rgb(255, 59, 48)) // systemRed
 
@@ -767,8 +796,10 @@ object RideMapRenderer {
             Color.rgb(115, 204, 255), Typeface.MONOSPACE,
         )
 
-        // Activity legend in the footer's right third (iOS drawLegend).
-        val legendW = 330f
+        // Activity legend in the footer's right column (iOS drawLegend).
+        // Kept narrow (152 px at the right edge) so it clears the long
+        // monospace source-URL line, which runs to ~x 890.
+        val legendW = 152f
         val lx = width - legendW - pad
         fun legendText(s: String, x: Float, yTop: Float, size: Float, color: Int, tf: Typeface) {
             canvas.drawText(s, x, yTop + size * 0.85f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -776,16 +807,16 @@ object RideMapRenderer {
             })
         }
         legendText(
-            "Activity", lx, top + pad - 4, 24f, Color.rgb(217, 217, 217),
+            "Activity", lx, top + pad - 4, 22f, Color.rgb(217, 217, 217),
             Typeface.create(Typeface.DEFAULT, Typeface.BOLD),
         )
-        var ly = top + pad + 4 + 40
+        var ly = top + pad + 34
         val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         for (m in legendModes) {
             dot.color = m.argb
-            canvas.drawCircle(lx + 11f, ly + 4 + 11f, 11f, dot)
-            legendText(m.label, lx + 32f, ly, 26f, Color.WHITE, Typeface.DEFAULT)
-            ly += 40
+            canvas.drawCircle(lx + 9f, ly + 3 + 9f, 9f, dot)
+            legendText(m.label, lx + 27f, ly, 22f, Color.WHITE, Typeface.DEFAULT)
+            ly += 34
         }
     }
 }

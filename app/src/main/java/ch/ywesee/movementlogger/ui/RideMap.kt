@@ -189,7 +189,12 @@ private fun TrackMap(segments: List<List<GpsRow>>, modes: List<RideMode>?) {
         if (modes != null) {
             ActivityLegend(
                 RideMode.entries.filter { modes.contains(it) },
-                Modifier.align(Alignment.BottomStart).padding(12.dp),
+                // Fixed 36 dp bottom clearance: the full-screen dialog
+                // extends behind the gesture bar and dialog windows don't
+                // dispatch insets, so navigationBarsPadding() is a no-op
+                // here and would leave the legend's bottom row clipped.
+                Modifier.align(Alignment.BottomStart)
+                    .padding(start = 12.dp, bottom = 36.dp),
             )
         }
     }
@@ -330,6 +335,27 @@ private fun TrackMapView(segments: List<List<GpsRow>>, modes: List<RideMode>?, p
                         addRun(seg, cur, curMode.argb)
                     }
                     off += seg.size
+                }
+                // Dashed "in water" connectors across short blackout holes
+                // (jumping in off the harbour wall, a swim while the
+                // antenna was under) — dashes mark the stretch as
+                // untracked; long gaps stay broken.
+                for (k in 1 until segments.size) {
+                    val a = segments[k - 1].last()
+                    val b = segments[k].first()
+                    if (ch.ywesee.movementlogger.data.GpsMath.haversineM(a.lat, a.lon, b.lat, b.lon) >
+                        RideMapRenderer.HOLE_BRIDGE_MAX_M
+                    ) continue
+                    val line = Polyline(map).apply {
+                        outlinePaint.color = RideMode.SWIM.argb
+                        outlinePaint.strokeWidth = 9f
+                        outlinePaint.pathEffect =
+                            android.graphics.DashPathEffect(floatArrayOf(24f, 16f), 0f)
+                        setPoints(listOf(GeoPoint(a.lat, a.lon), GeoPoint(b.lat, b.lon)))
+                        infoWindow = null
+                    }
+                    holder.lines.add(line)
+                    map.overlays.add(0, line)
                 }
                 holder.applied = modes
                 holder.appliedAny = true
