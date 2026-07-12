@@ -161,6 +161,106 @@ class RideMapRendererTest {
     }
 
     @Test
+    fun smoothKeysAbsorbsShortRunsIntoLongerNeighbour() {
+        // A 1-sample flicker and a 10 s run both sit under the 20 s floor —
+        // both collapse into the sustained run around them.
+        val ticks = doubleArrayOf(0.0, 1000.0, 2000.0, 2100.0, 3000.0, 4000.0)
+        val keys = intArrayOf(0, 0, 0, 1, 1, 1)
+        val out = RideMapRenderer.smoothKeys(keys, ticks, 20.0)
+        assertTrue(out.all { it == 0 })
+        // Sustained runs (≥ 20 s each) stay untouched.
+        val ticks2 = doubleArrayOf(0.0, 2000.0, 4500.0, 5500.0, 7000.0)
+        val keys2 = intArrayOf(0, 0, 1, 1, 1)
+        org.junit.Assert.assertArrayEquals(keys2, RideMapRenderer.smoothKeys(keys2, ticks2, 20.0))
+    }
+
+    @Test
+    fun rideModesClassifyWalkRideSwim() {
+        // Synthetic session along the equator: walk to the water, ride,
+        // fall in (blackout holes every ~30 s while swimming — the antenna
+        // rides at the surface), remount, ride home. Speeds sit on the fix
+        // rows box-CSV-style.
+        val mPerDegLon = Math.PI * 6_371_000.0 / 180.0
+        fun row(ticks: Double, meters: Double, v: Double) = GpsRow(
+            ticks = ticks, utc = ticks.toString(), lat = 0.0, lon = meters / mPerDegLon,
+            altM = 0.0, speedKmhModule = v, courseDeg = 0.0, fix = 2, numSat = 8, hdop = 1.0,
+        )
+        val rows = mutableListOf<GpsRow>()
+        var meters = 100.0
+        fun phase(fromT: Int, toT: Int, v: Double) {
+            var t = fromT
+            while (t <= toT) { rows.add(row(t.toDouble(), meters, v)); meters += v / 3.6 * 0.1; t += 10 }
+        }
+        phase(0, 6000, 4.0)        // walk on land
+        phase(6010, 19990, 15.0)   // on board
+        // fall in at 20000: holes 20000-21000, 24000-25000, 28000-29000
+        phase(21000, 23990, 1.5)   // swimming between the holes
+        phase(25000, 27990, 1.5)
+        phase(29000, 32000, 1.5)
+        phase(32010, 45000, 15.0)  // remounted, riding home
+
+        val pts = RideMapRenderer.cleanTrackSegments(rows).flatten()
+        // No water mask (offline fallback): fast → board, near-hole → swim,
+        // else land.
+        val modes = RideMapRenderer.rideModes(rows, pts, null)
+        assertEquals(pts.size, modes.size)
+        for ((i, p) in pts.withIndex()) {
+            val expect = when {
+                p.ticks <= 6000.0 -> RideMode.LAND
+                p.ticks <= 19990.0 -> RideMode.BOARD
+                p.ticks <= 32000.0 -> RideMode.SWIM
+                else -> RideMode.BOARD
+            }
+            assertEquals("tick ${p.ticks}", expect, modes[i])
+        }
+        // All three modes actually appear (guards the test itself).
+        assertEquals(RideMode.entries.toSet(), modes.toSet())
+    }
+
+    @Test
+    fun rideModesWithWaterMaskSplitDriftFromRideAndLand() {
+        // Geography decides land vs water; on water, speed decides swim vs
+        // board — this is where the mask beats the fallback: a clean slow
+        // drift is IN the water (fallback would call it land), and slow
+        // para-wing riding at 4.5 km/h is on the board (fallback needs 6).
+        val mPerDegLon = Math.PI * 6_371_000.0 / 180.0
+        fun row(ticks: Double, meters: Double, v: Double) = GpsRow(
+            ticks = ticks, utc = ticks.toString(), lat = 0.0, lon = meters / mPerDegLon,
+            altM = 0.0, speedKmhModule = v, courseDeg = 0.0, fix = 2, numSat = 8, hdop = 1.0,
+        )
+        val rows = mutableListOf<GpsRow>()
+        var meters = 100.0
+        fun phase(fromT: Int, toT: Int, v: Double) {
+            var t = fromT
+            while (t <= toT) { rows.add(row(t.toDouble(), meters, v)); meters += v / 3.6 * 0.1; t += 10 }
+        }
+        phase(0, 6000, 4.0)        // walking on the quay — 4 km/h but LAND
+        phase(6010, 12000, 2.0)    // drifting in the water, clean fixes
+        phase(12010, 20000, 4.5)   // slow para-wing riding
+
+        val pts = RideMapRenderer.cleanTrackSegments(rows).flatten()
+        val mask = BooleanArray(pts.size) { pts[it].ticks > 6000.0 }
+        val modes = RideMapRenderer.rideModes(rows, pts, mask)
+        for ((i, p) in pts.withIndex()) {
+            val expect = when {
+                p.ticks <= 6000.0 -> RideMode.LAND
+                p.ticks <= 12000.0 -> RideMode.SWIM
+                else -> RideMode.BOARD
+            }
+            assertEquals("tick ${p.ticks}", expect, modes[i])
+        }
+    }
+
+    @Test
+    fun waterColorMatchesOsmCartoWithTolerance() {
+        assertTrue(RideMapRenderer.isWaterColor(0xFFAAD3DF.toInt()))   // exact
+        assertTrue(RideMapRenderer.isWaterColor(0xFFA0D3DF.toInt()))   // −10 red
+        assertTrue(!RideMapRenderer.isWaterColor(0xFF9FD3DF.toInt()))  // −11 red
+        assertTrue(!RideMapRenderer.isWaterColor(0xFFD2C7BD.toInt()))  // Ermioni quay
+        assertTrue(!RideMapRenderer.isWaterColor(0xFFF2EFE9.toInt()))  // OSM land fill
+    }
+
+    @Test
     fun robustTopSpeedSurvivesUnderwaterFabricationAndBlips() {
         // Track along the equator so metres → degrees is trivial.
         val mPerDegLon = Math.PI * 6_371_000.0 / 180.0

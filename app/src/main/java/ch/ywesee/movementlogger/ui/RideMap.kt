@@ -7,8 +7,10 @@ import android.graphics.Canvas
 import android.graphics.Color as AColor
 import android.graphics.Paint
 import android.graphics.drawable.BitmapDrawable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -31,6 +33,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -42,6 +45,7 @@ import androidx.core.content.FileProvider
 import ch.ywesee.movementlogger.data.CsvParsers
 import ch.ywesee.movementlogger.data.GpsRow
 import ch.ywesee.movementlogger.data.RideMapRenderer
+import ch.ywesee.movementlogger.data.RideMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -56,7 +60,7 @@ import java.io.File
 
 /**
  * Detail screen for one GPS CSV: draws the recorded track on an interactive
- * OSM map and exports a shareable PNG (map tiles under a speed-coloured
+ * OSM map and exports a shareable PNG (map tiles under an activity-coloured
  * track with logo + stats + source link — see [RideMapRenderer]). Port of
  * the iOS `RideMapView` (`RideMap.swift`); reached from the GPS tab's
  * recordings list and from downloaded `Gps*.csv` rows in the Sync tab.
@@ -70,12 +74,24 @@ fun RideMapView(name: String, path: String, onDismiss: () -> Unit) {
     var rendering by remember(path) { mutableStateOf(false) }
     var shareError by remember(path) { mutableStateOf<String?>(null) }
 
+    // Per-point activity (swim / board / land, iOS colours). null while the
+    // water-mask tiles are still loading — the track shows neutral teal
+    // until classification lands, then recolours in place.
+    var modes by remember(path) { mutableStateOf<List<RideMode>?>(null) }
+
     LaunchedEffect(path) {
         val result = withContext(Dispatchers.IO) {
             runCatching { CsvParsers.parseGpsFile(File(path)) }
         }
         result.fold(
-            onSuccess = { rows = it; loadError = if (it.isEmpty()) "no rows parsed" else null },
+            onSuccess = { parsed ->
+                rows = parsed
+                loadError = if (parsed.isEmpty()) "no rows parsed" else null
+                val cleanPts = RideMapRenderer.cleanTrackSegments(parsed).flatten()
+                modes = withContext(Dispatchers.IO) {
+                    RideMapRenderer.rideModes(parsed, cleanPts, RideMapRenderer.waterMask(cleanPts))
+                }
+            },
             onFailure = { loadError = it.message ?: "couldn't read file" },
         )
     }
@@ -140,7 +156,7 @@ fun RideMapView(name: String, path: String, onDismiss: () -> Unit) {
                         pts.size < 2 -> CenteredNote(
                             "No GPS fixes — this recording has fewer than two valid points to plot.",
                         )
-                        else -> TrackMap(segments)
+                        else -> TrackMap(segments, modes)
                     }
                 }
             }
@@ -160,10 +176,63 @@ private fun CenteredNote(text: String) {
 }
 
 /** The interactive osmdroid map with the downsampled track + start/end dots.
- *  One polyline per blackout-cleaned segment — never a line across a hole. */
+ *  One polyline per activity-colour run per blackout-cleaned segment —
+ *  adjacent runs share their boundary point so the line reads continuous
+ *  while the colour changes, and no line ever crosses a hole. [modes] is
+ *  null while the water-mask classification is still loading — the track
+ *  draws neutral teal and recolours in place when it lands. */
 @Composable
-private fun TrackMap(segments: List<List<GpsRow>>) {
+private fun TrackMap(segments: List<List<GpsRow>>, modes: List<RideMode>?) {
     val pts = segments.flatten()
+    Box(Modifier.fillMaxSize()) {
+        TrackMapView(segments, modes, pts)
+        if (modes != null) {
+            ActivityLegend(
+                RideMode.entries.filter { modes.contains(it) },
+                Modifier.align(Alignment.BottomStart).padding(12.dp),
+            )
+        }
+    }
+}
+
+/** Small translucent legend card — mode swatch + label (iOS `legendCard`). */
+@Composable
+private fun ActivityLegend(modes: List<RideMode>, modifier: Modifier = Modifier) {
+    if (modes.isEmpty()) return
+    Surface(
+        modifier = modifier,
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+    ) {
+        Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            for (m in modes) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.size(11.dp)
+                            .background(ComposeColor(m.argb), CircleShape),
+                    )
+                    Text(
+                        m.label,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(start = 6.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Track polylines currently on the map + the modes they were built from,
+ *  so the `update` pass only rebuilds when classification changes. */
+private class TrackOverlays {
+    var applied: List<RideMode>? = null
+    var appliedAny = false
+    val lines = mutableListOf<Polyline>()
+}
+
+@Composable
+private fun TrackMapView(segments: List<List<GpsRow>>, modes: List<RideMode>?, pts: List<GpsRow>) {
+    val holder = remember(segments) { TrackOverlays() }
     AndroidView(
         // clipToBounds: osmdroid paints outside its layout bounds while
         // panning/zooming and would otherwise draw over the dialog's top bar.
@@ -182,18 +251,6 @@ private fun TrackMap(segments: List<List<GpsRow>>) {
                 setMultiTouchControls(true)
                 zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
 
-                for (seg in segments) {
-                    val idx = RideMapRenderer.downsampleIndices(
-                        seg.size, (2000 * seg.size / pts.size).coerceAtLeast(2),
-                    )
-                    overlays.add(Polyline(this).apply {
-                        outlinePaint.color = AColor.rgb(0x30, 0xB0, 0xC7) // iOS .teal
-                        outlinePaint.strokeWidth = 9f
-                        outlinePaint.strokeCap = Paint.Cap.ROUND
-                        setPoints(idx.map { GeoPoint(seg[it].lat, seg[it].lon) })
-                        infoWindow = null
-                    })
-                }
                 overlays.add(
                     dotMarker(this, GeoPoint(pts.first().lat, pts.first().lon), AColor.rgb(52, 199, 89)),
                 )
@@ -224,6 +281,59 @@ private fun TrackMap(segments: List<List<GpsRow>>) {
                         )
                     }
                 })
+            }
+        },
+        update = { map ->
+            // (Re)build the track polylines when the classification changes
+            // — from null (neutral teal) to the activity colours. Inserted
+            // at index 0 so the start/end dots stay on top.
+            if (!holder.appliedAny || holder.applied !== modes) {
+                holder.lines.forEach { map.overlays.remove(it) }
+                holder.lines.clear()
+                fun addRun(seg: List<GpsRow>, run: List<Int>, color: Int) {
+                    if (run.size < 2) return
+                    val line = Polyline(map).apply {
+                        outlinePaint.color = color
+                        outlinePaint.strokeWidth = 9f
+                        outlinePaint.strokeCap = Paint.Cap.ROUND
+                        setPoints(run.map { GeoPoint(seg[it].lat, seg[it].lon) })
+                        infoWindow = null
+                    }
+                    holder.lines.add(line)
+                    map.overlays.add(0, line)
+                }
+                var off = 0
+                for (seg in segments) {
+                    val idx = RideMapRenderer.downsampleIndices(
+                        seg.size, (2000 * seg.size / pts.size).coerceAtLeast(2),
+                    )
+                    if (modes == null) {
+                        addRun(seg, idx.toList(), AColor.rgb(0x30, 0xB0, 0xC7)) // iOS .teal
+                    } else {
+                        // Split the downsampled points into runs of equal
+                        // mode; each edge takes its endpoint's mode, and
+                        // adjacent runs share the boundary point (iOS
+                        // polylineRuns).
+                        var cur = ArrayList<Int>()
+                        var curMode = modes[off + idx[0]]
+                        cur.add(idx[0])
+                        for (t in 1 until idx.size) {
+                            val m = modes[off + idx[t]]
+                            if (m == curMode) {
+                                cur.add(idx[t])
+                            } else {
+                                addRun(seg, cur, curMode.argb)
+                                cur = arrayListOf(idx[t - 1], idx[t])
+                                curMode = m
+                            }
+                        }
+                        addRun(seg, cur, curMode.argb)
+                    }
+                    off += seg.size
+                }
+                holder.applied = modes
+                holder.appliedAny = true
+                map.invalidate()
             }
         },
         onRelease = { it.onDetach() },

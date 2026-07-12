@@ -279,6 +279,34 @@ the rules that now guard it:
   window you need for post-ride forensics.
 - Shared ride-map PNGs are additionally published to
   `Download/MovementLogger/` via `PublicMirror` (`png → image/png` MIME).
+- **Track is activity-coloured (swim / board / land), same colours as
+  iOS.** `RideMode` (blue `0xFF338CF2` In water / green `0xFF29C76B` On
+  board / orange `0xFFF28C21` On land — the iOS `RideMode` sRGB values
+  verbatim) + `RideMapRenderer.rideModes(rows, pts, onWater)`. The
+  Android substitute for the watch's submersion sensor is **geography**:
+  `waterMask(pts)` samples the OSM z16 tile pixel under each track point
+  (3×3 majority of carto water `#AAD3DF` ± 10/channel, verified on the
+  Ermioni tiles; only tiles touched by the track are fetched). Rules with
+  a mask: land pixel → land; within ±30 s (`WET_NEAR_TICKS`) of an
+  interior fix hole → swim (near a hole the speed is fabrication anyway);
+  speed ≥ `WATER_BOARD_KMH` (3.5) → board; else swim. Offline (mask
+  null) it degrades to: speed ≥ `BOARD_KMH` (6) → board, near-hole →
+  swim, else land. Runs shorter than `MODE_MIN_RUN_SEC` (20 s) are
+  absorbed into their longer temporal neighbour (`smoothKeys`,
+  absorb-shortest-first — iOS `RideActivity.smoothKeys` port).
+  **Per-point speed is the median of ALL finite speed rows within
+  ±2.5 s (`SPEED_WINDOW_TICKS`) — never read speed off the cleaned
+  points: `dedupFixes` drops the RMC half-row twin (same UTC+position as
+  its GGA sibling), which is exactly the row carrying the speed, so the
+  points' own speed column is ~all NaN/stale.** Thresholds calibrated on
+  the 11.7.2026 Ermioni ride, which the classifier reproduces
+  minute-by-minute (quay walk → 12:19:05 jump-in → swim → 4.3 km/h
+  para-wing riding 12:27–12:31 → floating till the crash). Consumers:
+  PNG renderer (per-edge colour + "Activity" legend in the 240 px
+  footer) and the interactive osmdroid map (one Polyline per colour run,
+  adjacent runs share their boundary point; teal until the async mask
+  lands, then recoloured in place via the AndroidView `update` pass;
+  legend card bottom-left).
 - **Track drawing is blackout-cleaned too (v0.0.50).**
   `RideMapRenderer.cleanTrackSegments` drops positions inside the blackout
   zones and splits the polyline into per-segment runs so two real points

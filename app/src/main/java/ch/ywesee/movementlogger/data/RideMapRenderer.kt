@@ -17,6 +17,7 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.ln
 import kotlin.math.log2
@@ -26,15 +27,27 @@ import kotlin.math.tan
 
 /**
  * Shareable ride-map PNG — Android port of the iOS `RideMapRenderer`
- * (`RideMap.swift`): real map tiles under a speed-coloured track, with the
- * app logo, ride stats and the GitHub source link baked into a branded
- * footer. iOS snapshots Apple Maps via `MKMapSnapshotter`; here we stitch
+ * (`RideMap.swift`): real map tiles under an activity-coloured track
+ * (swim / board / land, see [RideMode]), with the app logo, ride stats and
+ * the GitHub source link baked into a branded footer. iOS snapshots Apple
+ * Maps via `MKMapSnapshotter`; here we stitch
  * OpenStreetMap tiles ourselves (Web-Mercator math below), which keeps the
  * output identical in spirit and needs no API key.
  *
  * The pure geometry/statistics helpers are `internal` and JVM-only (no
  * android.* types) so `RideMapMathTest` can cover them.
  */
+/**
+ * Inferred activity for a stretch of the ride. Colours and labels are the
+ * iOS `RideMode` values verbatim (swim 0.20/0.55/0.95, board 0.16/0.78/0.42,
+ * land 0.95/0.55/0.13 in sRGB) so both apps' maps read identically.
+ */
+enum class RideMode(val label: String, val argb: Int) {
+    SWIM("In water", 0xFF338CF2.toInt()),   // blue
+    BOARD("On board", 0xFF29C76B.toInt()),  // green
+    LAND("On land", 0xFFF28C21.toInt()),    // orange
+}
+
 object RideMapRenderer {
     const val SOURCE_URL = "github.com/zdavatz/movement_logger_android"
 
@@ -327,6 +340,212 @@ object RideMapRenderer {
         return out
     }
 
+    // ---- activity classification (swim / board / land) --------------------
+
+    /** Fallback board threshold when no water mask is available — no one
+     *  swims or walks this fast (iOS `RideActivity.boardKmh`). */
+    internal const val BOARD_KMH = 6.0
+
+    /** On-water board threshold when the water mask says the point is on
+     *  water: sustained ≥ 3.5 km/h means propelled (board / wing), below is
+     *  swimming or drifting. Calibrated on the 11.7.2026 Ermioni para-wing
+     *  ride: riding stretches held a 4.0–4.3 km/h median while floating
+     *  stayed ≤ 2.9 — walking pace never enters here because walking points
+     *  are on land pixels. */
+    internal const val WATER_BOARD_KMH = 3.5
+
+    /** Mode runs shorter than this get absorbed into a neighbour, so the
+     *  track shows sustained activity, not a 1–2 s flicker (iOS
+     *  `RideActivity.minRunSec`). */
+    internal const val MODE_MIN_RUN_SEC = 20.0
+
+    /** How far (ticks, 30 s) around a blackout hole a point still counts as
+     *  "in the water": when the rider is off the board the antenna rides
+     *  at/under the surface and the fix timeline gets ≥2 s holes. Near a
+     *  hole the reported speed is fabrication anyway, so the hole signal
+     *  overrides the speed rule. */
+    private const val WET_NEAR_TICKS = 3_000.0
+
+    /** Per-point speed = median of ALL finite speed rows within ±2.5 s.
+     *  Never read speed off the cleaned points themselves: `dedupFixes`
+     *  drops the RMC half-row twin (same UTC + position as its GGA
+     *  sibling) — which is exactly the row that carries the speed. */
+    private const val SPEED_WINDOW_TICKS = 250.0
+
+    /**
+     * Per-point smoothed activity for the drawn track — colours + labels
+     * match the iOS `RideMode` exactly. [rows] is the full CSV (for the
+     * fix timeline + speed rows), [pts] the flattened cleaned track from
+     * [cleanTrackSegments], [onWater] the per-point [waterMask] (null when
+     * offline / tiles unavailable).
+     *
+     * With a mask, geography decides land vs water and speed decides swim
+     * vs board — verified against the 11.7.2026 Ermioni ride, where it
+     * reproduces the session minute-by-minute (quay → jump-in → swim →
+     * para-wing riding → floating). Without a mask it degrades to the
+     * weaker heuristic: fast → board, near a fix hole → swim, else land.
+     */
+    fun rideModes(rows: List<GpsRow>, pts: List<GpsRow>, onWater: BooleanArray?): List<RideMode> {
+        if (pts.isEmpty()) return emptyList()
+        // Speed timeline over all rows, sorted by tick.
+        val st = rows.filter { it.speedKmhModule.isFinite() && it.ticks.isFinite() }
+            .sortedBy { it.ticks }
+        val sTicks = DoubleArray(st.size) { st[it].ticks }
+        val sVals = DoubleArray(st.size) { st[it].speedKmhModule }
+        fun speedAt(t: Double): Double {
+            val a = lowerBound(sTicks, t - SPEED_WINDOW_TICKS)
+            val b = lowerBound(sTicks, t + SPEED_WINDOW_TICKS + 1e-9)
+            if (b <= a) return 0.0
+            val w = sVals.copyOfRange(a, b)
+            w.sort()
+            return w[(w.size - 1) / 2]
+        }
+        // Wet intervals: ±WET_NEAR_TICKS around every interior fix hole.
+        // The leading/trailing convergence zones don't count — a session
+        // usually starts and ends on land.
+        val fixes = dedupFixes(validPoints(rows))
+        val wet = ArrayList<DoubleArray>()
+        for (i in 1 until fixes.size) {
+            if (fixes[i].ticks - fixes[i - 1].ticks >= BLACKOUT_GAP_TICKS) {
+                wet.add(
+                    doubleArrayOf(
+                        fixes[i - 1].ticks - WET_NEAR_TICKS,
+                        fixes[i].ticks + WET_NEAR_TICKS,
+                    )
+                )
+            }
+        }
+        fun nearHole(t: Double) = wet.any { t >= it[0] && t <= it[1] }
+        val raw = IntArray(pts.size) { i ->
+            val t = pts[i].ticks
+            if (onWater != null) {
+                when {
+                    !onWater[i] -> RideMode.LAND.ordinal
+                    nearHole(t) -> RideMode.SWIM.ordinal
+                    speedAt(t) >= WATER_BOARD_KMH -> RideMode.BOARD.ordinal
+                    else -> RideMode.SWIM.ordinal
+                }
+            } else {
+                when {
+                    speedAt(t) >= BOARD_KMH -> RideMode.BOARD.ordinal
+                    nearHole(t) -> RideMode.SWIM.ordinal
+                    else -> RideMode.LAND.ordinal
+                }
+            }
+        }
+        val ticks = DoubleArray(pts.size) { pts[it].ticks }
+        return smoothKeys(raw, ticks, MODE_MIN_RUN_SEC).map { RideMode.entries[it] }
+    }
+
+    /** Merge any run of equal keys shorter than [minRunSec] into its longer
+     *  temporal neighbour, repeatedly, until only sustained runs remain
+     *  (iOS `RideActivity.smoothKeys`, absorb-shortest-first). */
+    internal fun smoothKeys(keys: IntArray, ticks: DoubleArray, minRunSec: Double): IntArray {
+        if (keys.size <= 1) return keys
+        class Run(var s: Int, var e: Int, var k: Int)
+        var runs = ArrayList<Run>()
+        var s = 0
+        for (i in 1..keys.size) {
+            if (i == keys.size || keys[i] != keys[s]) {
+                runs.add(Run(s, i, keys[s])); s = i
+            }
+        }
+        fun dur(r: Run) = (ticks[r.e - 1] - ticks[r.s]) / GpsMath.TICKS_PER_SEC
+        while (runs.size > 1) {
+            // Absorb the single shortest sub-threshold run per pass.
+            var idx = -1
+            var shortest = minRunSec
+            for ((i, r) in runs.withIndex()) {
+                if (dur(r) < shortest) { shortest = dur(r); idx = i }
+            }
+            if (idx < 0) break
+            val left = runs.getOrNull(idx - 1)
+            val right = runs.getOrNull(idx + 1)
+            runs[idx].k = when {
+                left != null && right != null -> if (dur(left) >= dur(right)) left.k else right.k
+                left != null -> left.k
+                else -> right!!.k // runs.size > 1 guarantees a neighbour
+            }
+            val merged = ArrayList<Run>()
+            for (r in runs) {
+                val last = merged.lastOrNull()
+                if (last != null && last.k == r.k) last.e = r.e else merged.add(r)
+            }
+            runs = merged
+        }
+        val out = IntArray(keys.size)
+        for (r in runs) for (i in r.s until r.e) out[i] = r.k
+        return out
+    }
+
+    /** OSM standard-carto water fill is a uniform #AAD3DF at every zoom —
+     *  verified empirically on the Ermioni harbour tiles (830/872 track
+     *  samples hit it exactly). Small tolerance covers shoreline
+     *  anti-aliasing. */
+    internal fun isWaterColor(argb: Int): Boolean {
+        val r = (argb shr 16) and 0xFF
+        val g = (argb shr 8) and 0xFF
+        val b = argb and 0xFF
+        return abs(r - 170) <= 10 && abs(g - 211) <= 10 && abs(b - 223) <= 10
+    }
+
+    /** Zoom for the water lookup: z16 ≈ 2.4 m/px shoreline resolution,
+     *  independent of the render zoom. Only tiles actually touched by
+     *  track points are fetched (~3 for a harbour session, ~20 for a
+     *  10 km downwinder). */
+    private const val WATER_ZOOM = 16
+
+    /**
+     * Per-point water/land lookup from OSM tile pixels — the Android
+     * substitute for the Apple Watch's submersion sensor: the map already
+     * knows where the water is. A point is on water when ≥5 of the 3×3
+     * pixels around it match the carto water colour (majority vote rides
+     * out labels and ferry-route lines drawn over water). Returns null
+     * when any tile fetch fails (offline) so callers fall back to the
+     * maskless heuristic.
+     */
+    suspend fun waterMask(pts: List<GpsRow>): BooleanArray? = withContext(Dispatchers.IO) {
+        if (pts.isEmpty()) return@withContext null
+        val n = 1 shl WATER_ZOOM
+        val gx = DoubleArray(pts.size) { lonToPx(pts[it].lon, WATER_ZOOM) }
+        val gy = DoubleArray(pts.size) { latToPx(pts[it].lat, WATER_ZOOM) }
+        fun tileKey(i: Int): Long {
+            val tx = floor(gx[i] / TILE_SIZE).toLong()
+            val ty = floor(gy[i] / TILE_SIZE).toLong()
+            return (tx shl 32) or (ty and 0xffffffffL)
+        }
+        val keys = LinkedHashSet<Long>()
+        for (i in pts.indices) keys.add(tileKey(i))
+        val tiles = HashMap<Long, Bitmap>()
+        try {
+            val fetched = coroutineScope {
+                keys.map { key ->
+                    async(Dispatchers.IO) {
+                        key to fetchTile(WATER_ZOOM, Math.floorMod((key shr 32).toInt(), n), key.toInt())
+                    }
+                }.map { it.await() }
+            }
+            for ((key, bmp) in fetched) if (bmp != null) tiles[key] = bmp
+            if (tiles.size != keys.size) return@withContext null
+            BooleanArray(pts.size) { i ->
+                val tile = tiles[tileKey(i)]!!
+                val px = (gx[i] - floor(gx[i] / TILE_SIZE) * TILE_SIZE).toInt().coerceIn(0, TILE_SIZE - 1)
+                val py = (gy[i] - floor(gy[i] / TILE_SIZE) * TILE_SIZE).toInt().coerceIn(0, TILE_SIZE - 1)
+                var hit = 0
+                for (dx in -1..1) {
+                    for (dy in -1..1) {
+                        val sx = (px + dx).coerceIn(0, TILE_SIZE - 1)
+                        val sy = (py + dy).coerceIn(0, TILE_SIZE - 1)
+                        if (isWaterColor(tile.getPixel(sx, sy))) hit++
+                    }
+                }
+                hit >= 5
+            }
+        } finally {
+            tiles.values.forEach { it.recycle() }
+        }
+    }
+
     // ---- PNG rendering ----------------------------------------------------
 
     /**
@@ -345,11 +564,10 @@ object RideMapRenderer {
 
             val width = 1080
             val mapHeight = 1440
-            val footerHeight = 190
+            val footerHeight = 240 // iOS parity — 3 stat lines + activity legend
 
             val lats = DoubleArray(valid.size) { valid[it].lat }
             val lons = DoubleArray(valid.size) { valid[it].lon }
-            val speeds = fillSpeedGaps(DoubleArray(valid.size) { valid[it].speedKmhModule })
             val bbox = boundingBox(lats, lons) ?: return@withContext null
             val zoom = fitZoom(bbox, width, mapHeight)
 
@@ -367,7 +585,7 @@ object RideMapRenderer {
                 return@withContext null
             }
 
-            // Track: white casing first for contrast, then speed-coloured
+            // Track: white casing first for contrast, then activity-coloured
             // segments on top (iOS parity, same widths ×1 since we render
             // at the same 1080 px reference width).
             val px = FloatArray(valid.size)
@@ -393,7 +611,9 @@ object RideMapRenderer {
             }
             canvas.drawPath(path, casing)
 
-            val vMax = max(robustMaxSpeed(speeds), 5.0)
+            // Activity-coloured track: swim blue / board green / land orange
+            // (iOS colours). Each edge takes its endpoint's mode.
+            val modes = rideModes(rows, valid, waterMask(valid))
             val seg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 style = Paint.Style.STROKE
                 strokeWidth = 5f
@@ -402,9 +622,7 @@ object RideMapRenderer {
             off = 0
             for (s in segments) {
                 for (i in 1 until s.size) {
-                    seg.color = Color.HSVToColor(
-                        floatArrayOf((speedHue(speeds[off + i], vMax) * 360).toFloat(), 0.9f, 0.95f)
-                    )
+                    seg.color = modes[off + i].argb
                     canvas.drawLine(px[off + i - 1], py[off + i - 1], px[off + i], py[off + i], seg)
                 }
                 off += s.size
@@ -418,7 +636,10 @@ object RideMapRenderer {
             val topSpeed = robustTopSpeed(rows)
             val distanceKm = segmentsDistanceKm(segments)
             val durMin = (valid.last().ticks - valid.first().ticks) * 0.01 / 60.0
-            drawFooter(context, canvas, width, mapHeight, footerHeight, topSpeed, distanceKm, durMin)
+            drawFooter(
+                context, canvas, width, mapHeight, footerHeight, topSpeed, distanceKm, durMin,
+                RideMode.entries.filter { modes.contains(it) },
+            )
 
             val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "RideMaps")
             dir.mkdirs()
@@ -492,7 +713,7 @@ object RideMapRenderer {
 
     private fun drawFooter(
         context: Context, canvas: Canvas, width: Int, mapHeight: Int, footerHeight: Int,
-        topSpeed: Double, distanceKm: Double, durMin: Double,
+        topSpeed: Double, distanceKm: Double, durMin: Double, legendModes: List<RideMode>,
     ) {
         val top = mapHeight.toFloat()
         canvas.drawRect(
@@ -501,8 +722,9 @@ object RideMapRenderer {
         )
 
         val pad = 28f
-        // Logo — the launcher icon, clipped to a rounded rect like iOS.
-        val logoSide = footerHeight - pad * 2
+        // Logo — the launcher icon, clipped to a rounded rect like iOS
+        // (fixed 134 px, matching the iOS footer regardless of its height).
+        val logoSide = 134f
         val logoRect = RectF(pad, top + pad, pad + logoSide, top + pad + logoSide)
         try {
             val icon = context.packageManager.getApplicationIcon(context.applicationInfo)
@@ -544,5 +766,26 @@ object RideMapRenderer {
             SOURCE_URL, top + pad + 96 + 27 * 0.85f, 27f,
             Color.rgb(115, 204, 255), Typeface.MONOSPACE,
         )
+
+        // Activity legend in the footer's right third (iOS drawLegend).
+        val legendW = 330f
+        val lx = width - legendW - pad
+        fun legendText(s: String, x: Float, yTop: Float, size: Float, color: Int, tf: Typeface) {
+            canvas.drawText(s, x, yTop + size * 0.85f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                this.color = color; textSize = size; typeface = tf
+            })
+        }
+        legendText(
+            "Activity", lx, top + pad - 4, 24f, Color.rgb(217, 217, 217),
+            Typeface.create(Typeface.DEFAULT, Typeface.BOLD),
+        )
+        var ly = top + pad + 4 + 40
+        val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        for (m in legendModes) {
+            dot.color = m.argb
+            canvas.drawCircle(lx + 11f, ly + 4 + 11f, 11f, dot)
+            legendText(m.label, lx + 32f, ly, 26f, Color.WHITE, Typeface.DEFAULT)
+            ly += 40
+        }
     }
 }
