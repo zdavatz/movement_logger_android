@@ -186,6 +186,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         usbManager = ctx.getSystemService(Context.USB_SERVICE) as UsbManager
         reader = UbloxGpsReader(usbManager!!, this)
         publicMirror = PublicMirror(ctx.applicationContext)
+        RaceUplink.init(ctx)
         registerPermissionReceiver()
         refreshDevice()
         refreshRecordings()
@@ -464,6 +465,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         }
         pendingRmc = fix
         maybeFlushCsvRow()
+        RaceUplink.maybeSend(_state.value)
     }
 
     override fun onGga(fix: GgaFix, monoNanos: Long) {
@@ -484,6 +486,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         }
         pendingGga = fix
         maybeFlushCsvRow()
+        RaceUplink.maybeSend(_state.value)
     }
 
     override fun onLog(message: String) {

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -32,10 +33,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -61,6 +64,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ch.ywesee.movementlogger.usb.GpsRecording
+import ch.ywesee.movementlogger.usb.RaceUplink
 import ch.ywesee.movementlogger.usb.UbloxGpsCore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -137,7 +141,96 @@ fun UsbGpsScreen() {
             }
 
             Spacer(Modifier.height(12.dp))
+            RaceCard()
+
+            Spacer(Modifier.height(12.dp))
             RecordingsCard(state)
+        }
+    }
+}
+
+/**
+ * Race mode — stream this phone's dongle fixes to the desktop app's
+ * Race tab (UDP, 2 Hz; see `RaceUplink`). The desktop shows the
+ * `ip:port` to enter here when it starts listening.
+ */
+@Composable
+private fun RaceCard() {
+    val race by RaceUplink.state.collectAsStateWithLifecycle()
+    var rider by remember(race.rider) { mutableStateOf(race.rider) }
+    var host by remember(race.host) { mutableStateOf(race.host) }
+    var port by remember(race.port) { mutableStateOf(race.port.toString()) }
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Race mode", style = MaterialTheme.typography.titleSmall)
+                Spacer(Modifier.weight(1f))
+                Switch(
+                    checked = race.enabled,
+                    onCheckedChange = { on ->
+                        if (on) {
+                            RaceUplink.configure(
+                                rider.trim(),
+                                host.trim(),
+                                port.trim().toIntOrNull() ?: RaceUplink.DEFAULT_PORT,
+                            )
+                        }
+                        RaceUplink.setEnabled(on)
+                    },
+                    // Sending without a target/name is pointless.
+                    enabled = race.enabled || (rider.isNotBlank() && host.isNotBlank()),
+                )
+            }
+            Text(
+                "Streams live positions to the desktop Race map (same WiFi).",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = rider,
+                onValueChange = { rider = it },
+                label = { Text("Rider name") },
+                singleLine = true,
+                enabled = !race.enabled,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            Row {
+                OutlinedTextField(
+                    value = host,
+                    onValueChange = { host = it },
+                    label = { Text("Desktop IP") },
+                    singleLine = true,
+                    enabled = !race.enabled,
+                    modifier = Modifier.weight(2f),
+                )
+                Spacer(Modifier.width(8.dp))
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { port = it.filter { c -> c.isDigit() } },
+                    label = { Text("Port") },
+                    singleLine = true,
+                    enabled = !race.enabled,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            if (race.enabled) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Sending — ${race.sent} fixes to ${race.host}:${race.port}" +
+                        if (race.sent == 0L) " (waiting for a GPS fix)" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                race.lastError?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
         }
     }
 }
