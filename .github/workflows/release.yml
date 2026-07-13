@@ -31,6 +31,10 @@ on:
       version:
         description: 'Version to build, without the v (e.g. 0.0.54). Builds + uploads artifacts only — does NOT publish to Play.'
         required: true
+      play_upload_only:
+        description: 'Also push the bundle to Play with NO release (clears a blocked declaration: Play only shows the form once it has seen the permission in a bundle). Spends the version code.'
+        type: boolean
+        default: false
 
 jobs:
   release:
@@ -120,6 +124,14 @@ jobs:
           path: |
             app/build/outputs/bundle/release/app-release.aab
             app/build/outputs/apk/release/app-release.apk
+
+      - name: Upload bundle to Play with no release (clear a declaration block)
+        if: github.event_name == 'workflow_dispatch' && inputs.play_upload_only
+        run: |
+          python3 scripts/publish_to_play.py \
+            --aab app/build/outputs/bundle/release/app-release.aab \
+            --version-name ${{ steps.ver.outputs.name }} \
+            --upload-only
 
       - name: Publish to Play Store (production track + listing + screenshots)
         if: github.event_name == 'push'

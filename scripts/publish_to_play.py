@@ -132,6 +132,23 @@ def publish(args: argparse.Namespace) -> None:
         version_code = upload_result["versionCode"]
         print(f"Uploaded AAB: versionCode={version_code} sha={upload_result.get('sha1')}")
 
+        # 2b. --upload-only: commit the bundle WITHOUT a track or a release, and
+        # stop. This is the escape hatch for Play's declaration deadlock: Play
+        # refuses `commit` on a RELEASE whose bundle uses an undeclared
+        # foreground-service permission ("You must let us know whether your app
+        # uses any Foreground Service permissions"), but the Console won't show
+        # the declaration form until it has DETECTED that permission in a bundle
+        # it actually received. An edit that only uploads gets the bundle into
+        # the App Bundle Explorer — enough for the detection — without asking for
+        # a release, so the gate has nothing to reject. Declare in the Console,
+        # then publish the next version code normally (this one is now spent).
+        if args.upload_only:
+            api_call(token, "POST", f"/edits/{edit}:commit", args.package)
+            print(f"COMMITTED bundle-only edit — versionCode {version_code} is now "
+                  "in Play. Declare the permissions in the Console, then release "
+                  "the NEXT version code.")
+            return
+
         # 3. Assign to track with release notes.
         release_notes_text = read_text(release_notes_path) if os.path.exists(release_notes_path) else ""
         release_payload = {
@@ -336,6 +353,15 @@ def main() -> None:
     p.add_argument("--contact-website", default="https://ywesee.com/MovementLogger/MovementLogger",
                    help="Public-facing website URL on the Play listing.")
     p.add_argument("--play-dir", default="app/src/main/play")
+    p.add_argument(
+        "--upload-only", action="store_true",
+        help="Upload the AAB and commit WITHOUT creating a release or touching "
+             "the listing. Use to get a bundle into Play when a Console-only "
+             "declaration (e.g. a new foreground-service permission) is blocking "
+             "the release commit — Play can't show the declaration form until it "
+             "has seen the permission in an uploaded bundle. Spends the version "
+             "code: release the next one.",
+    )
     p.add_argument(
         "--release-status",
         default="completed",
