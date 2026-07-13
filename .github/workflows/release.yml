@@ -36,8 +36,11 @@ on:
         type: boolean
         default: false
       play_assign_code:
-        description: 'Assign an ALREADY-uploaded version code to a DRAFT internal-test release (no upload, no rollout) so Play scans it for undeclared permissions. E.g. 54.'
+        description: 'Assign an ALREADY-uploaded version code to an internal-test release (no upload) so Play scans it for undeclared permissions. E.g. 54.'
         default: ''
+      play_assign_status:
+        description: "Release status for play_assign_code: draft (staged only) or completed (rolled out to internal testers — Play processes it, which is what triggers the permission scan)."
+        default: 'draft'
 
 jobs:
   release:
@@ -143,7 +146,7 @@ jobs:
             --version-name ${{ steps.ver.outputs.name }} \
             --assign-version-code ${{ inputs.play_assign_code }} \
             --track internal \
-            --release-status draft
+            --release-status ${{ inputs.play_assign_status }}
 
       - name: Publish to Play Store (production track + listing + screenshots)
         if: github.event_name == 'push'
