@@ -18,6 +18,19 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Build + publish the signed artifacts WITHOUT touching Play. Needed whenever
+  # Play blocks `edits.commit` behind a Console-only declaration (a new
+  # foreground-service permission, say): the Console won't show the declaration
+  # form until it has DETECTED the permission in an uploaded bundle, and the API
+  # can't upload one while the declaration is missing. Breaking that deadlock
+  # means uploading this AAB to a Console draft by hand — so CI has to hand it
+  # over. Consumes the version code in Play once you upload it, so publish the
+  # next patch version afterwards.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, without the v (e.g. 0.0.54). Builds + uploads artifacts only — does NOT publish to Play.'
+        required: true
 
 jobs:
   release:
@@ -46,8 +59,12 @@ jobs:
       - name: Extract version from tag
         id: ver
         run: |
-          TAG=${GITHUB_REF#refs/tags/}
-          VERSION=${TAG#v}
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            TAG=${GITHUB_REF#refs/tags/}
+            VERSION=${TAG#v}
+          fi
           MAJOR=$(echo "$VERSION" | cut -d. -f1)
           MINOR=$(echo "$VERSION" | cut -d. -f2)
           PATCH=$(echo "$VERSION" | cut -d. -f3)
@@ -89,7 +106,23 @@ jobs:
       - name: Install Python deps for Play API client
         run: pip install --quiet cryptography
 
+      - name: Upload signed AAB + APK as workflow artifacts
+        # BEFORE the Play publish, and never skipped: a rejected publish must not
+        # take the signed build down with it. The "Create GitHub release" step is
+        # the last one in the job, so a Play failure used to leave nothing at all
+        # to download — which is exactly when you most need the AAB (to hand it to
+        # the Console by hand and clear a declaration gate).
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: movementlogger-${{ steps.ver.outputs.name }}
+          if-no-files-found: warn
+          path: |
+            app/build/outputs/bundle/release/app-release.aab
+            app/build/outputs/apk/release/app-release.apk
+
       - name: Publish to Play Store (production track + listing + screenshots)
+        if: github.event_name == 'push'
         # Direct API call — bypasses Gradle Play Publisher; see
         # scripts/publish_to_play.py. Targets the production track with
         # status=completed (100% rollout once Google approves). Falls back
@@ -105,6 +138,7 @@ jobs:
             --release-status completed
 
       - name: Create GitHub release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
