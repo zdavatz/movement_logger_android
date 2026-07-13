@@ -35,6 +35,9 @@ on:
         description: 'Also push the bundle to Play with NO release (clears a blocked declaration: Play only shows the form once it has seen the permission in a bundle). Spends the version code.'
         type: boolean
         default: false
+      play_assign_code:
+        description: 'Assign an ALREADY-uploaded version code to a DRAFT internal-test release (no upload, no rollout) so Play scans it for undeclared permissions. E.g. 54.'
+        default: ''
 
 jobs:
   release:
@@ -132,6 +135,15 @@ jobs:
             --aab app/build/outputs/bundle/release/app-release.aab \
             --version-name ${{ steps.ver.outputs.name }} \
             --upload-only
+
+      - name: Assign an existing bundle to a draft internal release (force a permission scan)
+        if: github.event_name == 'workflow_dispatch' && inputs.play_assign_code != ''
+        run: |
+          python3 scripts/publish_to_play.py \
+            --version-name ${{ steps.ver.outputs.name }} \
+            --assign-version-code ${{ inputs.play_assign_code }} \
+            --track internal \
+            --release-status draft
 
       - name: Publish to Play Store (production track + listing + screenshots)
         if: github.event_name == 'push'

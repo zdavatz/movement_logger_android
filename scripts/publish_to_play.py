@@ -119,6 +119,26 @@ def publish(args: argparse.Namespace) -> None:
     print(f"Opened edit: {edit}")
 
     try:
+        # 1b. --assign-version-code: put a bundle Play ALREADY has into a track,
+        # without uploading anything. Second lever on the declaration deadlock:
+        # a bundle-only upload lands in the library, but Play may not scan it for
+        # foreground-service permissions until it belongs to a release. Assigning
+        # an existing code to a draft internal release forces the scan while
+        # asking for the smallest possible release. If Play rejects this commit
+        # too, the declaration gate covers every track and only the Console can
+        # break it.
+        if args.assign_version_code:
+            api_call(token, "PUT", f"/edits/{edit}/tracks/{args.track}", args.package,
+                     body={"track": args.track, "releases": [{
+                         "name": args.version_name,
+                         "versionCodes": [str(args.assign_version_code)],
+                         "status": args.release_status,
+                     }]})
+            api_call(token, "POST", f"/edits/{edit}:commit", args.package)
+            print(f"COMMITTED: versionCode {args.assign_version_code} → track "
+                  f"'{args.track}' (status={args.release_status})")
+            return
+
         # 2. Upload the AAB.
         aab_bytes = open(args.aab, "rb").read()
         upload_result = api_call(
@@ -344,7 +364,7 @@ def publish(args: argparse.Namespace) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--aab", required=True, help="Path to signed AAB")
+    p.add_argument("--aab", help="Path to signed AAB (not needed with --assign-version-code)")
     p.add_argument("--version-name", required=True, help="Release name, e.g. 0.0.9")
     p.add_argument("--sa-key-file", default="play-service-account.json")
     p.add_argument("--package", default="ch.ywesee.movementlogger")
@@ -353,6 +373,13 @@ def main() -> None:
     p.add_argument("--contact-website", default="https://ywesee.com/MovementLogger/MovementLogger",
                    help="Public-facing website URL on the Play listing.")
     p.add_argument("--play-dir", default="app/src/main/play")
+    p.add_argument(
+        "--assign-version-code", type=int, default=0,
+        help="Assign an ALREADY-uploaded version code to --track instead of "
+             "uploading a new AAB. Use with --track internal --release-status "
+             "draft to make Play scan a library bundle for undeclared "
+             "foreground-service permissions.",
+    )
     p.add_argument(
         "--upload-only", action="store_true",
         help="Upload the AAB and commit WITHOUT creating a release or touching "
