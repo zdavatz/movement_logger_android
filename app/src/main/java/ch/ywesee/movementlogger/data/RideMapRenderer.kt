@@ -38,18 +38,45 @@ import kotlin.math.tan
  * android.* types) so `RideMapMathTest` can cover them.
  */
 /**
- * Inferred activity for a stretch of the ride. Colours and labels are the
- * iOS `RideMode` values verbatim (swim 0.20/0.55/0.95, board 0.16/0.78/0.42,
- * land 0.95/0.55/0.13 in sRGB) so both apps' maps read identically.
+ * Inferred activity for a stretch of the ride. Labels and colours are the iOS
+ * `RideMode` / `RideMode.color(dark:)` values verbatim, so both apps' maps read
+ * identically.
+ *
+ * The colour depends on the MAP's appearance, not the app theme's: the original
+ * fixed blue/green/orange was picked for meaning, not legibility — green sat on
+ * a light map's pale-blue sea at barely any contrast, and blue "in water" was
+ * near-invisible on the water it named. So swim and board each take opposite
+ * ends of their scale depending on the tiles; amber (land) reads on both. See
+ * [RideMapRenderer.TILES_DARK] for which pair this app uses.
  */
-enum class RideMode(val label: String, val argb: Int) {
-    SWIM("In water", 0xFF338CF2.toInt()),   // blue
-    BOARD("On board", 0xFF29C76B.toInt()),  // green
-    LAND("On land", 0xFFF28C21.toInt()),    // orange
+enum class RideMode(val label: String) {
+    SWIM("In water"),
+    BOARD("On board"),
+    LAND("On land");
+
+    fun argb(dark: Boolean): Int = when (this) {
+        SWIM -> if (dark) 0xFF21D4ED.toInt() else 0xFF0A3D99.toInt()   // light blue / dark blue
+        BOARD -> if (dark) 0xFFED1C4F.toInt() else 0xFF0A733D.toInt()  // crimson    / dark green
+        LAND -> 0xFFFFA600.toInt()                                     // amber (both)
+    }
 }
 
 object RideMapRenderer {
     const val SOURCE_URL = "github.com/zdavatz/movement_logger_android"
+
+    /**
+     * Whether the map tiles this app draws on are dark — which is what the
+     * track palette has to contrast against ([RideMode.argb]).
+     *
+     * It is deliberately NOT the app's theme. Unlike iOS (Apple Maps ships dark
+     * tiles, so its map follows the phone), osmdroid draws OpenStreetMap raster
+     * tiles, which have no key-less dark source — and the water mask below reads
+     * those tiles' PIXEL COLOURS to decide land vs water, so recolouring them
+     * would break the classifier, not just the look. The map is therefore light
+     * in both themes, and the track takes the light pair in both. Flip this the
+     * day a dark tile source lands; the dark pair is already in [RideMode].
+     */
+    const val TILES_DARK = false
 
     private const val TILE_SIZE = 256
     private const val MAX_ZOOM = 19
@@ -630,7 +657,7 @@ object RideMapRenderer {
             off = 0
             for (s in segments) {
                 for (i in 1 until s.size) {
-                    seg.color = modes[off + i].argb
+                    seg.color = modes[off + i].argb(TILES_DARK)
                     canvas.drawLine(px[off + i - 1], py[off + i - 1], px[off + i], py[off + i], seg)
                 }
                 off += s.size
@@ -644,7 +671,7 @@ object RideMapRenderer {
             val conn = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 style = Paint.Style.STROKE
                 strokeWidth = 5f
-                color = RideMode.SWIM.argb
+                color = RideMode.SWIM.argb(TILES_DARK)
                 pathEffect = dash
             }
             off = 0
@@ -813,7 +840,7 @@ object RideMapRenderer {
         var ly = top + pad + 34
         val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         for (m in legendModes) {
-            dot.color = m.argb
+            dot.color = m.argb(TILES_DARK)
             canvas.drawCircle(lx + 9f, ly + 3 + 9f, 9f, dot)
             legendText(m.label, lx + 27f, ly, 22f, Color.WHITE, Typeface.DEFAULT)
             ly += 34

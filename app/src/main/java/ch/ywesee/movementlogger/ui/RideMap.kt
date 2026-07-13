@@ -214,7 +214,7 @@ private fun ActivityLegend(modes: List<RideMode>, modifier: Modifier = Modifier)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         Modifier.size(11.dp)
-                            .background(ComposeColor(m.argb), CircleShape),
+                            .background(ComposeColor(m.argb(RideMapRenderer.TILES_DARK)), CircleShape),
                     )
                     Text(
                         m.label,
@@ -327,12 +327,12 @@ private fun TrackMapView(segments: List<List<GpsRow>>, modes: List<RideMode>?, p
                             if (m == curMode) {
                                 cur.add(idx[t])
                             } else {
-                                addRun(seg, cur, curMode.argb)
+                                addRun(seg, cur, curMode.argb(RideMapRenderer.TILES_DARK))
                                 cur = arrayListOf(idx[t - 1], idx[t])
                                 curMode = m
                             }
                         }
-                        addRun(seg, cur, curMode.argb)
+                        addRun(seg, cur, curMode.argb(RideMapRenderer.TILES_DARK))
                     }
                     off += seg.size
                 }
@@ -347,7 +347,7 @@ private fun TrackMapView(segments: List<List<GpsRow>>, modes: List<RideMode>?, p
                         RideMapRenderer.HOLE_BRIDGE_MAX_M
                     ) continue
                     val line = Polyline(map).apply {
-                        outlinePaint.color = RideMode.SWIM.argb
+                        outlinePaint.color = RideMode.SWIM.argb(RideMapRenderer.TILES_DARK)
                         outlinePaint.strokeWidth = 9f
                         outlinePaint.pathEffect =
                             android.graphics.DashPathEffect(floatArrayOf(24f, 16f), 0f)

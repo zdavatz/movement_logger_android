@@ -280,9 +280,22 @@ the rules that now guard it:
 - Shared ride-map PNGs are additionally published to
   `Download/MovementLogger/` via `PublicMirror` (`png → image/png` MIME).
 - **Track is activity-coloured (swim / board / land), same colours as
-  iOS.** `RideMode` (blue `0xFF338CF2` In water / green `0xFF29C76B` On
-  board / orange `0xFFF28C21` On land — the iOS `RideMode` sRGB values
-  verbatim) + `RideMapRenderer.rideModes(rows, pts, onWater)`. The
+  iOS.** `RideMode.argb(dark)` + `RideMapRenderer.rideModes(rows, pts,
+  onWater)`. The colour depends on the MAP's appearance, not the app
+  theme's — the iOS `RideMode.color(dark:)` values verbatim: on light
+  tiles dark blue `0xFF0A3D99` (In water) / dark green `0xFF0A733D` (On
+  board), on dark tiles light blue `0xFF21D4ED` / crimson `0xFFED1C4F`;
+  amber `0xFFFFA600` (On land) reads on both. The old fixed
+  blue/green/orange was picked for meaning, not legibility — green sat on
+  a light map's pale-blue sea at barely any contrast, and blue "in water"
+  was near-invisible on the water it named.
+  **`RideMapRenderer.TILES_DARK` selects the pair, and is `false`.**
+  Unlike iOS (Apple Maps ships dark tiles, so its map follows the phone),
+  osmdroid draws OSM raster tiles, which have no key-less dark source —
+  and `waterMask` reads those tiles' PIXEL COLOURS, so recolouring them
+  would break the classifier, not just the look. The map is light in both
+  themes and the track takes the light pair in both. Flip the flag the day
+  a dark tile source lands; the dark pair is already there. The
   Android substitute for the watch's submersion sensor is **geography**:
   `waterMask(pts)` samples the OSM z16 tile pixel under each track point
   (3×3 majority of carto water `#AAD3DF` ± 10/channel, verified on the
