@@ -1,1 +1,1 @@
-Race Mode braucht keinen externen Empfänger mehr: neue Quellen-Auswahl "u-blox USB" oder "Telefon-GPS" — das eingebaute GPS streamt deine Position an die Desktop-Race-Karte, auch bei ausgeschaltetem Bildschirm. Dazu: Genauigkeitskreis, Satelliten- und Batterie-Anzeige pro Fahrer.
+Firmware-Update über BLE deutlich zuverlässiger: Während des Uploads verhandelt die App jetzt das schnelle Verbindungsintervall (wie iOS) — Abbrüche mitten im Update sind behoben. Das Update läuft auch bei ausgeschaltetem Bildschirm im Hintergrund weiter.

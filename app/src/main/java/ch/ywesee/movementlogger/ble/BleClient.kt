@@ -1211,6 +1211,14 @@ class BleClient(private val context: Context) {
             emit(BleEvent.FwUploadDone(false, "internal: SHA-256 digest must be 32 bytes"))
             return
         }
+        // OTA standard practice (Nordic DFU does the same): renegotiate to
+        // the 7.5–15 ms connection interval with zero slave latency for the
+        // upload. At Android's default ~50 ms interval a flash-busy box
+        // misses whole connection events, ACKs take seconds, and the
+        // supervision timeout kills the link (the status-8 drops at ~40 %).
+        // More link events = faster ACKs and a far more forgiving timeout
+        // budget. Restored to BALANCED in finishUpload.
+        gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
         // FW_DATA payload per chunk: min(244, mtu-3) - 5 (the 4-byte offset
         // header + opcode share the ATT write). Clamp to ≥1 so a tiny MTU
         // still makes (slow) progress.
@@ -1342,6 +1350,8 @@ class BleClient(private val context: Context) {
 
     /** Terminate the upload op and emit the final result. */
     private fun finishUpload(success: Boolean, message: String) {
+        // Give the radio back its power budget once the upload ends.
+        gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
         op = CurrentOp.Idle
         emit(BleEvent.FwUploadDone(success, message))
     }

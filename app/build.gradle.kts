@@ -29,8 +29,8 @@ android {
         applicationId = "ch.ywesee.movementlogger"
         minSdk = 26
         targetSdk = 35
-        versionCode = cliVersionCode ?: 55
-        versionName = cliVersionName ?: "0.0.55"
+        versionCode = cliVersionCode ?: 56
+        versionName = cliVersionName ?: "0.0.56"
     }
 
     if (signingProps != null) {
