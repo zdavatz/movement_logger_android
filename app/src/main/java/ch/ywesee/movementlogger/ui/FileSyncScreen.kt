@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -156,80 +157,100 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
             modifier = Modifier.fillMaxSize().padding(padding),
             color = MaterialTheme.colorScheme.background,
         ) {
-            Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                state.sessionRunning?.let {
-                    SessionBanner(it, onCleared = vm::clearSession)
-                    Spacer(Modifier.height(12.dp))
-                }
+            // One LazyColumn for the WHOLE tab: a swipe anywhere scrolls the
+            // full page (connection card, banners, file rows, log footer as
+            // one surface), not just the file list under a fixed header.
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(16.dp),
+            ) {
+                item(key = "header") {
+                    Column {
+                        state.sessionRunning?.let {
+                            SessionBanner(it, onCleared = vm::clearSession)
+                            Spacer(Modifier.height(12.dp))
+                        }
 
-                ConnectionBar(
-                    state = state,
-                    permsGranted = permsGranted,
-                    onRequestPerms = { permLauncher.launch(requiredPerms) },
-                    onEnableBt = {
-                        enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
-                    },
-                    onScan = vm::scan,
-                    onDisconnect = vm::disconnect,
-                    onList = vm::listFiles,
-                    onSyncNow = vm::syncNow,
-                    onSetKeepSynced = vm::setKeepSynced,
-                    onStopLog = vm::stopLog,
-                    onSetDuration = vm::setSessionDuration,
-                    onStartSession = vm::startSession,
-                    onSetLogMode = vm::setLogMode,
-                    onSetGpsPower = vm::setGpsPower,
-                    onPickFirmware = {
-                        // application/octet-stream is the canonical .bin MIME;
-                        // */* is the catch-all for managers that report none.
-                        fwPickerLauncher.launch(arrayOf("application/octet-stream", "*/*"))
-                    },
-                    onCancelFirmware = vm::abortFirmwareUpload,
-                )
-
-                state.fwUploadResult?.let { res ->
-                    Spacer(Modifier.height(8.dp))
-                    FwUploadResultBanner(res) { vm.dismissFwUploadResult() }
-                }
-
-                // "New box firmware" banner — shown when connected and the box
-                // is behind the latest GitHub release (or legacy/unknown).
-                // "Update box" downloads the .bin and runs the FOTA flow.
-                state.firmwareUpdateAvailable?.let { (version, _) ->
-                    if (state.connection == Connection.Connected) {
-                        Spacer(Modifier.height(8.dp))
-                        FirmwareUpdateBanner(
-                            version = version,
-                            busy = state.fwUpload != null,
-                            onUpdate = vm::applyFirmwareUpdate,
-                            onDismiss = vm::dismissFirmwareUpdate,
+                        ConnectionBar(
+                            state = state,
+                            permsGranted = permsGranted,
+                            onRequestPerms = { permLauncher.launch(requiredPerms) },
+                            onEnableBt = {
+                                enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                            },
+                            onScan = vm::scan,
+                            onDisconnect = vm::disconnect,
+                            onList = vm::listFiles,
+                            onSyncNow = vm::syncNow,
+                            onSetKeepSynced = vm::setKeepSynced,
+                            onStopLog = vm::stopLog,
+                            onSetDuration = vm::setSessionDuration,
+                            onStartSession = vm::startSession,
+                            onSetLogMode = vm::setLogMode,
+                            onSetGpsPower = vm::setGpsPower,
+                            onPickFirmware = {
+                                // application/octet-stream is the canonical .bin MIME;
+                                // */* is the catch-all for managers that report none.
+                                fwPickerLauncher.launch(arrayOf("application/octet-stream", "*/*"))
+                            },
+                            onCancelFirmware = vm::abortFirmwareUpload,
                         )
+
+                        state.fwUploadResult?.let { res ->
+                            Spacer(Modifier.height(8.dp))
+                            FwUploadResultBanner(res) { vm.dismissFwUploadResult() }
+                        }
+
+                        // "New box firmware" banner — shown when connected and the box
+                        // is behind the latest GitHub release (or legacy/unknown).
+                        // "Update box" downloads the .bin and runs the FOTA flow.
+                        state.firmwareUpdateAvailable?.let { (version, _) ->
+                            if (state.connection == Connection.Connected) {
+                                Spacer(Modifier.height(8.dp))
+                                FirmwareUpdateBanner(
+                                    version = version,
+                                    busy = state.fwUpload != null,
+                                    onUpdate = vm::applyFirmwareUpdate,
+                                    onDismiss = vm::dismissFirmwareUpdate,
+                                )
+                            }
+                        }
+
+                        if (state.transferInterrupted && state.connection != Connection.Connected) {
+                            Spacer(Modifier.height(8.dp))
+                            TransferInterruptedBanner()
+                        }
+
+                        Spacer(Modifier.height(12.dp))
                     }
                 }
-
-                if (state.transferInterrupted && state.connection != Connection.Connected) {
-                    Spacer(Modifier.height(8.dp))
-                    TransferInterruptedBanner()
-                }
-
-                Spacer(Modifier.height(12.dp))
 
                 when (state.connection) {
-                    Connection.Disconnected -> DiscoveredList(state, vm::connect)
-                    Connection.Connecting -> CenteredSpinner(label = "connecting…")
+                    Connection.Disconnected -> discoveredItems(state, vm::connect)
+                    Connection.Connecting -> item(key = "connecting") {
+                        CenteredSpinner(label = "connecting…")
+                    }
                     Connection.Connected -> {
                         state.deleteError?.let { err ->
-                            DeleteErrorBanner(err) { vm.dismissDeleteError() }
-                            Spacer(Modifier.height(8.dp))
+                            item(key = "delete-error") {
+                                Column {
+                                    DeleteErrorBanner(err) { vm.dismissDeleteError() }
+                                    Spacer(Modifier.height(8.dp))
+                                }
+                            }
                         }
-                        FilesPanel(state, vm::download, vm::delete)
+                        filesItems(state, vm::download, vm::delete)
                     }
                 }
 
-                Spacer(Modifier.height(12.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(8.dp))
-                LogSection(vm.logFilePath())
+                item(key = "log-footer") {
+                    Column {
+                        Spacer(Modifier.height(12.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(8.dp))
+                        LogSection(vm.logFilePath())
+                    }
+                }
             }
         }
     }
@@ -695,58 +716,61 @@ private fun formatRemaining(secs: Int): String {
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
 }
 
-@Composable
-private fun DiscoveredList(state: FileSyncUiState, onConnect: (String) -> Unit) {
+/** Discovered-boxes rows, emitted into the tab's single LazyColumn. */
+private fun LazyListScope.discoveredItems(state: FileSyncUiState, onConnect: (String) -> Unit) {
     if (state.discovered.isEmpty()) {
-        Text(
-            if (state.scanning) "Scanning for PumpTsueri…"
-            else "Tap Scan to look for the box.",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        item(key = "no-discovered") {
+            Text(
+                if (state.scanning) "Scanning for PumpTsueri…"
+                else "Tap Scan to look for the box.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         return
     }
-    LazyColumn {
-        items(state.discovered, key = { it.address }) { d ->
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
+    items(state.discovered, key = { it.address }) { d ->
+        Card(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            ),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(d.name, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            "${d.address}  ·  ${d.rssi} dBm",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Button(onClick = { onConnect(d.address) }) { Text("Connect") }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(d.name, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "${d.address}  ·  ${d.rssi} dBm",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
+                Button(onClick = { onConnect(d.address) }) { Text("Connect") }
             }
         }
     }
 }
 
-@Composable
-private fun FilesPanel(
+/** File-list rows (Sensor + Debug groups), emitted into the tab's single LazyColumn. */
+private fun LazyListScope.filesItems(
     state: FileSyncUiState,
     onDownload: (RemoteFile) -> Unit,
     onDelete: (RemoteFile) -> Unit,
 ) {
     if (state.files.isEmpty() && !state.listing) {
-        Text(
-            "Connected. Tap List files to see SD-card contents.",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        item(key = "no-files") {
+            Text(
+                "Connected. Tap List files to see SD-card contents.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         return
     }
     if (state.listing && state.files.isEmpty()) {
-        CenteredSpinner(label = "listing files…"); return
+        item(key = "listing-spinner") { CenteredSpinner(label = "listing files…") }
+        return
     }
     // Match the desktop GUI: sensor-data files (per-session recordings) on top,
     // everything else under a "Debug" section the user usually ignores.
@@ -756,15 +780,13 @@ private fun FilesPanel(
         .sortedByDescending { recencyKey(it.name) }
     val debug = state.files.filterNot { isSensorData(it.name) }
         .sortedByDescending { recencyKey(it.name) }
-    LazyColumn {
-        if (sensor.isNotEmpty()) {
-            item(key = "header-sensor") { GroupHeader("Sensor", sensor.size) }
-            items(sensor, key = { "s-${it.name}" }) { f -> FileRow(f, state, onDownload, onDelete) }
-        }
-        if (debug.isNotEmpty()) {
-            item(key = "header-debug") { GroupHeader("Debug", debug.size) }
-            items(debug, key = { "d-${it.name}" }) { f -> FileRow(f, state, onDownload, onDelete) }
-        }
+    if (sensor.isNotEmpty()) {
+        item(key = "header-sensor") { GroupHeader("Sensor", sensor.size) }
+        items(sensor, key = { "s-${it.name}" }) { f -> FileRow(f, state, onDownload, onDelete) }
+    }
+    if (debug.isNotEmpty()) {
+        item(key = "header-debug") { GroupHeader("Debug", debug.size) }
+        items(debug, key = { "d-${it.name}" }) { f -> FileRow(f, state, onDownload, onDelete) }
     }
 }
 
