@@ -1,1 +1,1 @@
-Firmware-Update über BLE deutlich zuverlässiger: Während des Uploads verhandelt die App jetzt das schnelle Verbindungsintervall (wie iOS) — Abbrüche mitten im Update sind behoben. Das Update läuft auch bei ausgeschaltetem Bildschirm im Hintergrund weiter.
+Box-Firmware-Update über BLE jetzt schnell und zuverlässig: schnelles Verbindungsintervall plus zügige Chunk-Wiederholung — Abbrüche mitten im Update sind behoben, der Upload läuft in rund einer Minute durch (auch im Hintergrund). Dazu: Der Sync-Tab scrollt jetzt als ganze Seite, nicht nur die Dateiliste.
