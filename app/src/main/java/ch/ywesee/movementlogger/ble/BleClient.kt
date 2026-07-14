@@ -1811,12 +1811,17 @@ class BleClient(private val context: Context) {
         private const val MTU_REQUEST = 247
         /** ATT MTU before negotiation completes (BLE spec minimum). */
         private const val DEFAULT_ATT_MTU = 23
-        // Firmware-upload timeouts. Chunk ACKs come fast (~ms) over BLE, so a
-        // 4 s gap means a lost packet → resend. Bank erase (~1 s) and the
+        // Firmware-upload timeouts. Chunk ACKs come fast (~ms) over BLE when
+        // they come at all — the box gives a congested ACK notify only a
+        // 200 ms retry budget (ble_notify_try in the firmware's FW_DATA
+        // handler) and then discards it forever, so an ACK missing after 1 s
+        // is never arriving and waiting longer just burns wall-clock on a
+        // lossy link. Resends are safe: the firmware re-ACKs any offset below
+        // its cursor without reprogramming. Bank erase (~1 s) and the
         // verify+swap commit get longer grace windows.
-        private const val FW_CHUNK_TIMEOUT_MS = 4_000L
+        private const val FW_CHUNK_TIMEOUT_MS = 1_000L
         private const val FW_BEGIN_TIMEOUT_MS = 8_000L
         private const val FW_COMMIT_TIMEOUT_MS = 10_000L
-        private const val FW_MAX_RETRIES = 5
+        private const val FW_MAX_RETRIES = 10
     }
 }
