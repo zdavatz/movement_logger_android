@@ -12,7 +12,8 @@ internal val NAV_DOP = 0x01 to 0x04
 internal val NAV_SAT = 0x01 to 0x35
 internal val NAV_SIG = 0x01 to 0x43
 internal val MON_RF = 0x0A to 0x38
-internal val POLLS = listOf(NAV_PVT, NAV_DOP, NAV_SAT, NAV_SIG, MON_RF)
+internal val MON_SPAN = 0x0A to 0x31
+internal val POLLS = listOf(NAV_PVT, NAV_DOP, NAV_SAT, NAV_SIG, MON_RF, MON_SPAN)
 
 /** 8-bit Fletcher checksum over class..payload-end (UBX spec). */
 internal fun ubxChecksum(body: ByteArray): Pair<Int, Int> {
@@ -118,12 +119,33 @@ internal data class MonRf(
     var antStatus: Int = 0, var antPower: Int = 0, var noisePerMs: Int = 0,
     var agcCnt: Int = 0, var jamInd: Int = 0, var jammingState: Int = 0,
 )
+/**
+ * One RF block of a UBX-MON-SPAN reply — the receiver's coarse spectrum
+ * snapshot: 256 amplitude bins (uncalibrated) covering [spanHz] around
+ * [centerHz]. Single-band MAX-M10S reports one block (L1). Not supported on
+ * M8 receivers — those simply never answer the poll.
+ */
+internal class SpanBlock(
+    val spectrum: IntArray,
+    val spanHz: Long, val resHz: Long, val centerHz: Long, val pgaDb: Int,
+) {
+    /** Frequency of bin [i] in Hz (bin 0 = center - span/2). */
+    fun binFreqHz(i: Int): Double = centerHz.toDouble() - spanHz / 2.0 + i.toDouble() * resHz
+    /** (bin index, amplitude) of the strongest bin. */
+    fun peak(): Pair<Int, Int> {
+        var pi = 0; var pa = 0
+        for (i in spectrum.indices) if (spectrum[i] > pa) { pa = spectrum[i]; pi = i }
+        return pi to pa
+    }
+}
+
 internal data class Epoch(
     var pvt: NavPvt? = null,
     var dop: NavDop? = null,
     var sats: List<SatInfo> = emptyList(),
     var sigs: List<SigInfo> = emptyList(),
     var rf: MonRf? = null,
+    var span: List<SpanBlock> = emptyList(),
 )
 
 internal fun parseNavPvt(p: ByteArray): NavPvt? {
@@ -184,6 +206,24 @@ internal fun parseMonRf(p: ByteArray): MonRf? {
         noisePerMs = u16(p, o + 12), agcCnt = u16(p, o + 14),
         jamInd = u8(p, o + 16), jammingState = u8(p, o + 1) and 0x03,
     )
+}
+
+/**
+ * UBX-MON-SPAN: version U1, numRfBlocks U1, reserved U1[2], then per block
+ * spectrum U1[256] + span U4 + res U4 + center U4 + pga U1 + reserved U1[3]
+ * (272 B/block).
+ */
+internal fun parseMonSpan(p: ByteArray): List<SpanBlock> {
+    val v = ArrayList<SpanBlock>()
+    if (p.size < 4) return v
+    val n = u8(p, 1)
+    for (i in 0 until n) {
+        val o = 4 + i * 272
+        if (o + 272 > p.size) break
+        val spec = IntArray(256) { u8(p, o + it) }
+        v.add(SpanBlock(spec, u32(p, o + 256), u32(p, o + 260), u32(p, o + 264), u8(p, o + 268)))
+    }
+    return v
 }
 
 // ---- enum → text decoders (match the desktop CSV strings) ------------------

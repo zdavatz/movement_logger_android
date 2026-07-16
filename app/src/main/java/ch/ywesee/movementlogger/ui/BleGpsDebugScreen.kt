@@ -157,6 +157,11 @@ fun BleGpsDebugScreen() {
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.labelSmall)
                     }
+                    survey.spectrumCsvPath?.let {
+                        Text(it.substringAfterLast('/'),
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall)
+                    }
                 }
             }
         }

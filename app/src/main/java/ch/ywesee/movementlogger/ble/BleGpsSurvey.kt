@@ -42,6 +42,7 @@ object BleGpsSurvey {
         val log: List<String> = emptyList(),
         val epochCsvPath: String? = null,
         val signalsCsvPath: String? = null,
+        val spectrumCsvPath: String? = null,
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -67,9 +68,15 @@ object BleGpsSurvey {
     private var sigFile: File? = null
     private var epochOut: FileOutputStream? = null
     private var sigOut: FileOutputStream? = null
+    // Spectrum CSV is created lazily on the first MON-SPAN reply — M8
+    // receivers never answer the poll, and an empty spectrum CSV would read
+    // as "no interference" (desktop parity).
+    private var specFile: File? = null
+    private var specOut: FileOutputStream? = null
     private var publicMirror: PublicMirror? = null
     private var epochPubOffset = 0L
     private var sigPubOffset = 0L
+    private var specPubOffset = 0L
 
     private const val MAX_LOG_LINES = 200
     private const val EPOCH_HEADER =
@@ -79,6 +86,9 @@ object BleGpsSurvey {
     private const val SIG_HEADER =
         "label,host_iso,iTOW_ms,gnssId,gnss,svId,sigId,sig,cno_dbhz,elev_deg,azim_deg," +
             "qualityInd,svUsed,prUsed,prRes_m\n"
+    private const val SPEC_HEADER =
+        "label,host_iso,iTOW_ms,block,center_hz,span_hz,res_hz,pga_db," +
+            "peak_bin,peak_amp,peak_freq_hz,bins\n"
 
     private val isoFmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
@@ -134,6 +144,7 @@ object BleGpsSurvey {
         appendLog("stopped after $epochCount epoch(s).")
         runCatching { epochOut?.close() }; epochOut = null
         runCatching { sigOut?.close() }; sigOut = null
+        runCatching { specOut?.close() }; specOut = null
         publishState(running = false)
         onRunningChanged?.invoke(false)
     }
@@ -151,6 +162,7 @@ object BleGpsSurvey {
                     NAV_SAT -> cur.sats = parseNavSat(fr.payload)
                     NAV_SIG -> cur.sigs = parseNavSig(fr.payload)
                     MON_RF -> cur.rf = parseMonRf(fr.payload)
+                    MON_SPAN -> cur.span = parseMonSpan(fr.payload)
                 }
             }
         }
@@ -167,6 +179,7 @@ object BleGpsSurvey {
         val snapshot: Epoch
         synchronized(lock) { snapshot = cur.copy() }
         writeEpochRows(host, snapshot)
+        writeSpectrumRows(host, snapshot)
         appendLog(liveSummary(snapshot))
         epochCount += 1
         publishState(running = isRunning)
@@ -227,18 +240,70 @@ object BleGpsSurvey {
         }
     }
 
+    /**
+     * Spectrum rows: one per RF block per epoch. `bins` is the raw 256-value
+     * amplitude vector, space-separated inside one CSV field; peak_* pre-computes
+     * the strongest bin. The CSV (and its log line) appear on the first MON-SPAN
+     * reply only.
+     */
+    private fun writeSpectrumRows(host: String, ep: Epoch) {
+        if (ep.span.isEmpty()) return
+        if (specOut == null) {
+            val sf = specFile ?: return
+            runCatching { publicMirror?.delete(sf.name) }
+            specPubOffset = 0L
+            specOut = runCatching {
+                FileOutputStream(sf, false).also { it.write(SPEC_HEADER.toByteArray()); it.flush() }
+            }.getOrNull() ?: return
+            runCatching { publicMirror?.appendAt(sf.name, 0L, SPEC_HEADER.toByteArray()) }
+            specPubOffset = SPEC_HEADER.toByteArray().size.toLong()
+            appendLog("spectrum-> ${sf.absolutePath}")
+        }
+        val itow = ep.pvt?.itow ?: 0L
+        for ((bi, b) in ep.span.withIndex()) {
+            val (pi, pa) = b.peak()
+            val bins = b.spectrum.joinToString(" ")
+            val row = "$label,$host,$itow,$bi,${b.centerHz},${b.spanHz},${b.resHz},${b.pgaDb}," +
+                "$pi,$pa,%.0f,$bins\n".format(b.binFreqHz(pi))
+            val bytes = row.toByteArray(Charsets.UTF_8)
+            runCatching { specOut?.write(bytes); specOut?.flush() }
+            specFile?.name?.let { name ->
+                runCatching { publicMirror?.appendAt(name, specPubOffset, bytes) }
+                specPubOffset += bytes.size
+            }
+        }
+    }
+
+    /**
+     * `top4` (mean C/N0 of the 4 strongest signals) and `n35` (signals at
+     * ≥ 35 dB-Hz) are the two EMI-experiment metrics: both collapse within a
+     * second of closing the case / powering a noisy subsystem, long before
+     * the fix itself reacts. Matches the desktop live line.
+     */
     private fun liveSummary(ep: Epoch): String {
         val p = ep.pvt
             ?: return "(no NAV-PVT reply — receiver may be NMEA-only, or the box firmware lacks the GPS bridge)"
-        val maxCno = maxOf(ep.sigs.maxOfOrNull { it.cno } ?: 0, ep.sats.maxOfOrNull { it.cno } ?: 0)
+        val cnos = if (ep.sigs.isNotEmpty()) ep.sigs.map { it.cno } else ep.sats.map { it.cno }
+        val maxCno = cnos.maxOrNull() ?: 0
+        val top = cnos.sortedDescending().take(4)
+        val top4 = if (top.isEmpty()) 0.0 else top.sum().toDouble() / top.size
+        val n35 = cnos.count { it >= 35 }
         val used = maxOf(ep.sigs.count { it.prUsed }, ep.sats.count { it.svUsed })
         val rf = ep.rf
-        val astat = rf?.let { antStatusName(it.antStatus) } ?: "?"
-        val apow = rf?.let { antPowerName(it.antPower) } ?: "?"
-        val jam = rf?.let { jammingName(it.jammingState) } ?: "?"
-        return "%02d:%02d:%02d fix=%d ok=%d sv=%2d used=%2d maxCN0=%2d hAcc=%.1fm pDOP=%.1f | ant=%s/%s jam=%s"
+        val rfs = if (rf != null) {
+            "ant=%s/%s jam=%d(%s) noise=%d agc=%d".format(
+                antStatusName(rf.antStatus), antPowerName(rf.antPower),
+                rf.jamInd, jammingName(rf.jammingState), rf.noisePerMs, rf.agcCnt)
+        } else {
+            "ant=?/? jam=? noise=? agc=?"
+        }
+        val spanS = ep.span.firstOrNull()?.let { b ->
+            val (pi, pa) = b.peak()
+            " | peak %.1fMHz a=%d".format(b.binFreqHz(pi) / 1e6, pa)
+        } ?: ""
+        return "%02d:%02d:%02d fix=%d ok=%d sv=%2d used=%2d maxCN0=%2d top4=%2.0f n35=%2d hAcc=%.1fm pDOP=%.1f | %s%s"
             .format(p.hour, p.min, p.sec, p.fixType, if (p.gnssFixOk) 1 else 0,
-                p.numSv, used, maxCno, p.haccM, p.pdop, astat, apow, jam)
+                p.numSv, used, maxCno, top4, n35, p.haccM, p.pdop, rfs, spanS)
     }
 
     // ---- CSV files ---------------------------------------------------------
@@ -250,10 +315,17 @@ object BleGpsSurvey {
         val ef = File(dir, "${safe}_gnss_epoch.csv")
         val sf = File(dir, "${safe}_gnss_signals.csv")
         epochFile = ef; sigFile = sf
+        // Spectrum CSV path is fixed now, but the file is only created on the
+        // first MON-SPAN reply (writeSpectrumRows). Drop any stale copy from a
+        // previous run so it can't be mistaken for this run's data.
+        val xf = File(dir, "${safe}_gnss_spectrum.csv")
+        specFile = xf; specOut = null; specPubOffset = 0L
+        runCatching { xf.delete() }
         publicMirror = PublicMirror(context.applicationContext)
         // Fresh files each run (truncate), matching the desktop's File::create.
         runCatching { publicMirror?.delete(ef.name) }
         runCatching { publicMirror?.delete(sf.name) }
+        runCatching { publicMirror?.delete(xf.name) }
         epochPubOffset = 0L; sigPubOffset = 0L
         epochOut = FileOutputStream(ef, false).also { it.write(EPOCH_HEADER.toByteArray()); it.flush() }
         sigOut = FileOutputStream(sf, false).also { it.write(SIG_HEADER.toByteArray()); it.flush() }
@@ -276,6 +348,8 @@ object BleGpsSurvey {
             log = ArrayList(logLines),
             epochCsvPath = epochFile?.absolutePath,
             signalsCsvPath = sigFile?.absolutePath,
+            // Only surfaced once the receiver actually answered MON-SPAN.
+            spectrumCsvPath = if (specOut != null) specFile?.absolutePath else null,
         )
     }
 
