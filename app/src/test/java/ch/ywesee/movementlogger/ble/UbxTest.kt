@@ -15,6 +15,32 @@ class UbxTest {
     }
 
     @Test
+    fun gpsGalTop6Metrics() {
+        fun sat(gnss: Int, sv: Int, cno: Int) = SatInfo(gnss, sv, cno, 0, 0, 0.0, 0, true)
+        val sats = listOf(
+            sat(0, 1, 45), sat(0, 2, 40), sat(2, 3, 42),   // GPS + Galileo
+            sat(3, 4, 50), sat(6, 5, 49),                  // BeiDou/GLONASS — excluded
+            sat(0, 6, 0),                                  // searched, not tracked — excluded
+            sat(2, 7, 38), sat(0, 8, 33), sat(0, 9, 30),
+            sat(2, 10, 28),                                // 7th-strongest GPS+GAL — outside top6
+        )
+        val cnos = gpsGalSatCnos(sats, emptyList())
+        assertEquals(listOf(45, 42, 40, 38, 33, 30, 28), cnos)
+        val top6 = cnos.take(6)
+        assertEquals(45, top6.first())
+        assertEquals(30, top6.last())
+
+        // NAV-SIG fallback folds dual-band rows to one per satellite.
+        fun sig(gnss: Int, sv: Int, sigId: Int, cno: Int) = SigInfo(gnss, sv, sigId, cno, 0.0, 0, true)
+        val sigs = listOf(sig(2, 3, 0, 41), sig(2, 3, 1, 44), sig(0, 1, 0, 39), sig(3, 9, 0, 50))
+        assertEquals(listOf(44, 39), gpsGalSatCnos(emptyList(), sigs))
+
+        assertEquals("3D", fixTypeName(3))
+        assertEquals("none", fixTypeName(0))
+        assertEquals("2D", fixTypeName(2))
+    }
+
+    @Test
     fun monSpanOffsets() {
         val pl = ByteArray(4 + 272)
         pl[0] = 0                                  // version

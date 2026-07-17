@@ -275,19 +275,21 @@ object BleGpsSurvey {
     }
 
     /**
-     * `top4` (mean C/N0 of the 4 strongest signals) and `n35` (signals at
-     * ≥ 35 dB-Hz) are the two EMI-experiment metrics: both collapse within a
-     * second of closing the case / powering a noisy subsystem, long before
-     * the fix itself reacts. Matches the desktop live line.
+     * Peter's EMI assembly metrics (2026-07-17): `avg6`/`min6`/`max6` are the
+     * mean/weakest/strongest of the 6 strongest **GPS + Galileo** satellites
+     * (other constellations excluded), plus `used` (sats in the nav
+     * solution), `jam` (narrowband jamming), `noise` (broadband noise floor)
+     * and `agc` (antenna-signal gain). All collapse within a second of
+     * closing the case / powering a noisy subsystem, long before the fix
+     * itself reacts. Matches the desktop live line.
      */
     private fun liveSummary(ep: Epoch): String {
         val p = ep.pvt
             ?: return "(no NAV-PVT reply — receiver may be NMEA-only, or the box firmware lacks the GPS bridge)"
-        val cnos = if (ep.sigs.isNotEmpty()) ep.sigs.map { it.cno } else ep.sats.map { it.cno }
-        val maxCno = cnos.maxOrNull() ?: 0
-        val top = cnos.sortedDescending().take(4)
-        val top4 = if (top.isEmpty()) 0.0 else top.sum().toDouble() / top.size
-        val n35 = cnos.count { it >= 35 }
+        val top6 = gpsGalSatCnos(ep.sats, ep.sigs).take(6)
+        val avg6 = if (top6.isEmpty()) 0.0 else top6.sum().toDouble() / top6.size
+        val max6 = top6.firstOrNull() ?: 0
+        val min6 = top6.lastOrNull() ?: 0
         val used = maxOf(ep.sigs.count { it.prUsed }, ep.sats.count { it.svUsed })
         val rf = ep.rf
         val rfs = if (rf != null) {
@@ -301,9 +303,9 @@ object BleGpsSurvey {
             val (pi, pa) = b.peak()
             " | peak %.1fMHz a=%d".format(b.binFreqHz(pi) / 1e6, pa)
         } ?: ""
-        return "%02d:%02d:%02d fix=%d ok=%d sv=%2d used=%2d maxCN0=%2d top4=%2.0f n35=%2d hAcc=%.1fm pDOP=%.1f | %s%s"
-            .format(p.hour, p.min, p.sec, p.fixType, if (p.gnssFixOk) 1 else 0,
-                p.numSv, used, maxCno, top4, n35, p.haccM, p.pdop, rfs, spanS)
+        return "%02d:%02d:%02d fix=%s ok=%d sv=%2d used=%2d avg6=%4.1f min6=%2d max6=%2d hAcc=%.1fm pDOP=%.1f | %s%s"
+            .format(p.hour, p.min, p.sec, fixTypeName(p.fixType), if (p.gnssFixOk) 1 else 0,
+                p.numSv, used, avg6, min6, max6, p.haccM, p.pdop, rfs, spanS)
     }
 
     // ---- CSV files ---------------------------------------------------------

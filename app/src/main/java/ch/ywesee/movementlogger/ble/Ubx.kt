@@ -148,6 +148,33 @@ internal data class Epoch(
     var span: List<SpanBlock> = emptyList(),
 )
 
+/**
+ * Per-satellite C/N0 of GPS (gnssId 0) + Galileo (gnssId 2) only, strongest
+ * first — the live line picks the 6 strongest of these (Peter's EMI assembly
+ * metrics). NAV-SAT already reports one best-signal C/N0 per satellite; the
+ * NAV-SIG fallback folds per-signal rows to max-per-satellite so a dual-band
+ * sat isn't counted twice. cno == 0 (searched, not tracked) is skipped.
+ */
+internal fun gpsGalSatCnos(sats: List<SatInfo>, sigs: List<SigInfo>): List<Int> {
+    val per = if (sats.isNotEmpty())
+        sats.filter { (it.gnss == 0 || it.gnss == 2) && it.cno > 0 }.map { it.cno }
+    else
+        sigs.filter { (it.gnss == 0 || it.gnss == 2) && it.cno > 0 }
+            .groupBy { it.gnss to it.sv }.map { (_, v) -> v.maxOf { it.cno } }
+    return per.sortedDescending()
+}
+
+/** UBX fixType rendered the way Peter reads it (0/2D/3D…), not a raw enum. */
+internal fun fixTypeName(t: Int): String = when (t) {
+    0 -> "none"
+    1 -> "DR"
+    2 -> "2D"
+    3 -> "3D"
+    4 -> "3D+DR"
+    5 -> "time"
+    else -> "?"
+}
+
 internal fun parseNavPvt(p: ByteArray): NavPvt? {
     if (p.size < 78) return null
     return NavPvt(
