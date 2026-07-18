@@ -170,7 +170,8 @@ object VideoExporter {
         savedUri
     }
 
-    private suspend fun runTransformerCoroutine(
+    /** Shared with [VideoMerger] — runs a composition to `outFile` with progress polling. */
+    internal suspend fun runTransformerCoroutine(
         context: Context,
         composition: Composition,
         outFile: File,
@@ -214,7 +215,8 @@ object VideoExporter {
         }
     }
 
-    private fun saveToMoviesCollection(context: Context, src: File, displayName: String): Uri {
+    /** Shared with [VideoMerger] — copies `src` into MediaStore Movies/MovementLogger. */
+    internal fun saveToMoviesCollection(context: Context, src: File, displayName: String): Uri {
         val resolver = context.contentResolver
         val collection = if (Build.VERSION.SDK_INT >= 29) {
             MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)

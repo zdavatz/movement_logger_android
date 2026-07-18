@@ -7,6 +7,7 @@ import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -27,13 +28,16 @@ private sealed class Dest(val route: String, val label: String, val icon: ImageV
     data object Gps : Dest("gps", "GPS", Icons.Filled.LocationOn)
     data object Sync : Dest("sync", "Sync", Icons.Filled.CloudDownload)
     data object Replay : Dest("replay", "Replay", Icons.Filled.PlayCircle)
+    data object Merge : Dest("merge", "Merge", Icons.Filled.VideoLibrary)
     data object GpsDebug : Dest("gpsdebug", "GPS Debug", Icons.Filled.Settings)
 }
 
-/** Live → GPS → Sync → Replay → GPS Debug. GPS sits next to Live because both
- *  are realtime-display tabs (BLE SensorStream vs USB GNSS); GPS Debug is the
- *  BLE-bridged u-blox antenna survey. */
-private val destinations = listOf(Dest.Live, Dest.Gps, Dest.Sync, Dest.Replay, Dest.GpsDebug)
+/** Live → GPS → Sync → Replay → Merge → GPS Debug. GPS sits next to Live
+ *  because both are realtime-display tabs (BLE SensorStream vs USB GNSS);
+ *  Merge sits next to Replay since both are video-post-processing tabs;
+ *  GPS Debug is the BLE-bridged u-blox antenna survey. */
+private val destinations =
+    listOf(Dest.Live, Dest.Gps, Dest.Sync, Dest.Replay, Dest.Merge, Dest.GpsDebug)
 
 @Composable
 fun MainNav() {
@@ -80,6 +84,7 @@ fun MainNav() {
             composable(Dest.Gps.route) { UsbGpsScreen() }
             composable(Dest.Sync.route) { FileSyncScreen() }
             composable(Dest.Replay.route) { ReplayScreen() }
+            composable(Dest.Merge.route) { MergeScreen() }
             composable(Dest.GpsDebug.route) { BleGpsDebugScreen() }
         }
     }

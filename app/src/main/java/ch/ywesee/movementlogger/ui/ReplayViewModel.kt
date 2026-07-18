@@ -14,6 +14,7 @@ import ch.ywesee.movementlogger.data.GpsTime
 import ch.ywesee.movementlogger.data.ReplayTrim
 import ch.ywesee.movementlogger.data.SensorRow
 import ch.ywesee.movementlogger.data.SyncAnchor
+import ch.ywesee.movementlogger.data.SyncTimeAlign
 import ch.ywesee.movementlogger.data.VideoExporter
 import ch.ywesee.movementlogger.data.VideoMetadata
 import ch.ywesee.movementlogger.data.VideoMetadataReader
@@ -319,37 +320,11 @@ class ReplayViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Map row ticks → absolute epoch ms through the firmware's host-clock
-     * `# SYNC` anchors. Piecewise-linear between anchors (drift-free when
-     * several connects produced markers across the session); constant
-     * 10 ms/tick extrapolation before the first / after the last anchor.
-     * A single anchor degenerates to a fixed 10 ms/tick offset from that one
-     * connect. `anchors` must be tick-sorted + deduped (as
-     * [CsvParsers.parseSyncAnchors] returns). Mirrors the iOS
-     * `ReplayViewModel.absTimesFromSyncAnchors`.
+     * `# SYNC` anchors. Shared with the Merge screen — see
+     * [SyncTimeAlign.absTimesFromSyncAnchors] for the semantics.
      */
-    private fun absTimesFromSyncAnchors(ticks: DoubleArray, anchors: List<SyncAnchor>): LongArray {
-        val n = ticks.size
-        if (n == 0 || anchors.isEmpty()) return LongArray(0)
-        val first = anchors.first()
-        val last = anchors.last()
-        val out = LongArray(n)
-        var j = 0
-        for (i in 0 until n) {
-            val t = ticks[i]
-            out[i] = when {
-                t <= first.ticks -> first.epochMs + ((t - first.ticks) * 10.0).toLong()
-                t >= last.ticks -> last.epochMs + ((t - last.ticks) * 10.0).toLong()
-                else -> {
-                    while (j + 1 < anchors.size && anchors[j + 1].ticks <= t) j++
-                    val a = anchors[j]
-                    val b = anchors[j + 1]
-                    val frac = (t - a.ticks) / (b.ticks - a.ticks)
-                    (a.epochMs + (b.epochMs - a.epochMs) * frac).toLong()
-                }
-            }
-        }
-        return out
-    }
+    private fun absTimesFromSyncAnchors(ticks: DoubleArray, anchors: List<SyncAnchor>): LongArray =
+        SyncTimeAlign.absTimesFromSyncAnchors(ticks, anchors)
 
     /** Human-readable alignment-source label for the Alignment block. */
     private fun alignmentLabel(sensorAnchors: List<SyncAnchor>, gpsAnchors: List<SyncAnchor>): String =
