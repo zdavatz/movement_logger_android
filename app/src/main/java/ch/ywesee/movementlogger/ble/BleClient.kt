@@ -1183,6 +1183,12 @@ class BleClient(private val context: Context) {
      * a made-up version. Mirrors the desktop `GettingVersion` demux.
      */
     private fun handleVersionNotify(value: ByteArray) {
+        // A 1-byte payload here is a stale single-byte reply (GET_MODE /
+        // GPS_POWER / status) the stack delivered after its own op already
+        // timed out — a real version is >=5 ASCII chars ("0.0.x"). Decoding
+        // it would yield an unparseable "version" -> spurious update banner.
+        // Ignore it; the real reply or the watchdog follows.
+        if (value.size < 2) return
         val v = String(value, Charsets.UTF_8).trim()
         emit(BleEvent.FirmwareVersion(if (v.isEmpty()) null else v))
         op = CurrentOp.Idle
@@ -1481,7 +1487,7 @@ class BleClient(private val context: Context) {
             is CurrentOp.ModeReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.GpsPwrReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.CalReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
-            is CurrentOp.VersionReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
+            is CurrentOp.VersionReq -> now - o.lastProgress > VERSION_REQ_TIMEOUT_MS
             // Uploading is handled by tickUploadWatchdog above (early return),
             // so it never reaches here — branch present only for exhaustiveness.
             is CurrentOp.Uploading -> false
@@ -1772,6 +1778,12 @@ class BleClient(private val context: Context) {
         private const val SCAN_DURATION_MS = 5_000L
         private const val WATCHDOG_TICK_MS = 200L
         private const val OP_IDLE_TIMEOUT_MS = 20_000L
+        /** GET_VERSION answers within one connection interval or never (the
+         *  firmware's reply notify is best-effort — `ble_notify_try` gives up
+         *  after 500 ms when the stack is busy), so waiting the full
+         *  OP_IDLE_TIMEOUT_MS just delays the legacy-box verdict and starves
+         *  the fw-check's retry budget. Mirrors iOS's 4 s modeReqTimeoutMs. */
+        private const val VERSION_REQ_TIMEOUT_MS = 4_000L
         private const val LIST_INACTIVITY_DONE_MS = 500L
         /** How long the box stays busy after SET_TIME (0x08) before it can
          *  service the next FileCmd. Measured ≥1.8 s works, ~0.5 s fails;

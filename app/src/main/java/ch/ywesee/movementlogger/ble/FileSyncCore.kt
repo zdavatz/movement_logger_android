@@ -127,6 +127,13 @@ object FileSyncCore {
     private var fwBoxVersion: String? = null
     /** The box GET_VERSION query has resolved (reply, timeout, or disconnect). */
     private var fwBoxKnown = false
+    /** GET_VERSION timeouts re-tried before the box version is declared
+     *  unknown. The box's reply notify is best-effort (firmware
+     *  `ble_notify_try` gives up after 500 ms when the stack is busy — most
+     *  likely right after an OTA trial boot), and "unknown" raises the update
+     *  banner, so ONE dropped packet must not read as "legacy box". Genuine
+     *  legacy firmware (<= v0.0.28) simply times out all three attempts. */
+    private var fwVersionRetries = 0
 
     /** Set when the connect-time CAL_GET is scheduled/sent so it's a
      *  strict one-shot per connect (a later user-driven push+reply
@@ -679,6 +686,7 @@ object FileSyncCore {
         fwLatestKnown = false
         fwBoxVersion = null
         fwBoxKnown = false
+        fwVersionRetries = 0
         _state.update { it.copy(firmwareUpdateAvailable = null) }
         log("fw-check: querying box version + latest release")
         // GitHub half — independent of BLE.
@@ -692,7 +700,16 @@ object FileSyncCore {
         }
         // Box half — GET_VERSION over BLE, but only once the worker is idle so
         // it can't collide with the connect-time queries / initial sync.
+        queryBoxVersionWhenIdle()
+    }
+
+    /** The box half of the firmware check: wait for an idle worker (bounded),
+     *  then send GET_VERSION. Split out of [checkFirmwareUpdate] so the
+     *  no-reply retry path in the [BleEvent.FirmwareVersion] handler can
+     *  re-issue the query without restarting the whole check. */
+    private fun queryBoxVersionWhenIdle(startDelayMs: Long = 0) {
         scope.launch {
+            if (startDelayMs > 0) kotlinx.coroutines.delay(startDelayMs)
             val deadline = System.currentTimeMillis() + FW_VERSION_QUERY_WINDOW_MS
             while (System.currentTimeMillis() < deadline) {
                 val s = _state.value
@@ -1101,10 +1118,25 @@ object FileSyncCore {
                 // Release the brief-op guard like GET_MODE, record the box
                 // side, and re-run the compare-against-latest decision.
                 briefOpInFlight = false
-                fwBoxVersion = e.version
-                fwBoxKnown = true
-                log("box firmware version: ${e.version ?: "unknown (legacy / no reply)"}")
-                decideFirmwareUpdate()
+                if (e.version == null && !fwBoxKnown && fwVersionRetries < 2 &&
+                    _state.value.connection == Connection.Connected
+                ) {
+                    // No reply is EITHER legacy firmware OR one dropped
+                    // notify — and "unknown" raises the update banner, which
+                    // on an up-to-date box claims an update it already runs
+                    // (seen on iOS right after an OTA: the box answers from a
+                    // fresh trial boot, exactly when its best-effort notify
+                    // is most likely dropped). Retry before concluding; a
+                    // legacy box times out every attempt.
+                    fwVersionRetries += 1
+                    log("fw-check: no version reply — retry $fwVersionRetries/2")
+                    queryBoxVersionWhenIdle(startDelayMs = 1_000)
+                } else {
+                    fwBoxVersion = e.version
+                    fwBoxKnown = true
+                    log("box firmware version: ${e.version ?: "unknown (legacy / no reply)"}")
+                    decideFirmwareUpdate()
+                }
                 pumpManualQueue()
             }
             is BleEvent.GpsPower -> {
