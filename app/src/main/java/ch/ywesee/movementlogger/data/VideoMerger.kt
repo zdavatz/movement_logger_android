@@ -2,10 +2,12 @@ package ch.ywesee.movementlogger.data
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.net.Uri
 import androidx.annotation.OptIn
@@ -23,6 +25,7 @@ import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
+import ch.ywesee.movementlogger.R
 import com.google.common.collect.ImmutableList
 import java.io.File
 import java.io.FileOutputStream
@@ -51,11 +54,16 @@ import kotlinx.coroutines.withContext
  * time window and aligned via its `creation_time` (which the `# SYNC`
  * anchors put in the same clock domain as the CSV rows).
  *
+ * The film closes with a single 5 s Pump Tsüri logo outro — ONCE at the
+ * very end (after the last clip's fade-out), not per clip: the foil logo
+ * (`R.drawable.pump_logo`, transparent background) centered at ~45 % of
+ * the output height on black.
+ *
  * Everything is one `EditedMediaItemSequence` (title card, clip, title
- * card, clip, …) so Media3 Transformer concatenates natively. The title
- * cards are silent images, so the composition forces an audio track —
- * Transformer generates silence under the cards and passes each clip's
- * own audio through.
+ * card, clip, …, outro) so Media3 Transformer concatenates natively. The
+ * title cards and the outro are silent images, so the composition forces
+ * an audio track — Transformer generates silence under them and passes
+ * each clip's own audio through.
  */
 @OptIn(UnstableApi::class)
 object VideoMerger {
@@ -65,6 +73,9 @@ object VideoMerger {
 
     /** Fade-to-black length at each clip's end. */
     private const val FADE_US = 3_000_000L
+
+    /** Pump Tsüri logo outro at the very end of the film. */
+    private const val OUTRO_US = 5_000_000L
 
     private const val CARD_FPS = 30
 
@@ -125,18 +136,24 @@ object VideoMerger {
             )
         }
 
-        // Title cards land as cache PNGs so Media3's image asset loader can
-        // pick them up by URI (mime set explicitly, no extension sniffing).
+        // Title cards + logo outro land as cache PNGs so Media3's image
+        // asset loader can pick them up by URI (mime set explicitly, no
+        // extension sniffing).
         val cardDir = File(context.cacheDir, "exports/cards").apply { mkdirs() }
         val stamp = System.currentTimeMillis()
-        val cardFiles = withContext(Dispatchers.IO) {
-            clips.mapIndexed { i, clip ->
+        val (cardFiles, outroFile) = withContext(Dispatchers.IO) {
+            val cards = clips.mapIndexed { i, clip ->
                 val f = File(cardDir, "card_${stamp}_$i.png")
                 val bmp = renderTitleCard(plan.outWidth, plan.outHeight, clip.creationTimeMillis)
                 FileOutputStream(f).use { out -> bmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
                 bmp.recycle()
                 f
             }
+            val outro = File(cardDir, "outro_$stamp.png")
+            val outroBmp = renderOutroCard(context, plan.outWidth, plan.outHeight)
+            FileOutputStream(outro).use { out -> outroBmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
+            outroBmp.recycle()
+            cards to outro
         }
 
         val outDir = File(context.cacheDir, "exports").apply { mkdirs() }
@@ -149,7 +166,7 @@ object VideoMerger {
             // duration), so each clip's overlays carry the clip's global
             // start offset to recover clip-local time.
             val items = withContext(Dispatchers.Default) {
-                buildSequenceItems(clips, cardFiles, session, plan)
+                buildSequenceItems(clips, cardFiles, outroFile, session, plan)
             }
 
             val composition = Composition.Builder(EditedMediaItemSequence(items))
@@ -172,12 +189,14 @@ object VideoMerger {
         } finally {
             outFile.delete()
             cardFiles.forEach { it.delete() }
+            outroFile.delete()
         }
     }
 
     private fun buildSequenceItems(
         clips: List<Clip>,
         cardFiles: List<File>,
+        outroFile: File,
         session: SensorSession?,
         plan: VideoExporter.OutputPlan,
     ): List<EditedMediaItem> {
@@ -186,7 +205,7 @@ object VideoMerger {
             .apply { eraseColor(Color.BLACK) }
         val shiftNdc = plan.panelsHeightTotal.toFloat() / plan.outHeight.toFloat()
 
-        val items = ArrayList<EditedMediaItem>(clips.size * 2)
+        val items = ArrayList<EditedMediaItem>(clips.size * 2 + 1)
         var cursorUs = 0L
         for ((i, clip) in clips.withIndex()) {
             // (1) Title card — a 2.5 s still image.
@@ -237,6 +256,28 @@ object VideoMerger {
                 .build()
             cursorUs += clipDurationUs
         }
+
+        // (4) Pump Tsüri logo outro — ONCE at the very end of the film,
+        // after the last clip's fade-out.
+        items += EditedMediaItem.Builder(
+            MediaItem.Builder()
+                .setUri(Uri.fromFile(outroFile))
+                .setMimeType(MimeTypes.IMAGE_PNG)
+                .build(),
+        )
+            .setDurationUs(OUTRO_US)
+            .setFrameRate(CARD_FPS)
+            .setEffects(
+                Effects(
+                    /* audioProcessors = */ emptyList(),
+                    /* videoEffects = */ listOf<Effect>(
+                        Presentation.createForWidthAndHeight(
+                            plan.outWidth, plan.outHeight, Presentation.LAYOUT_SCALE_TO_FIT,
+                        ),
+                    ),
+                ),
+            )
+            .build()
         return items
     }
 
@@ -273,6 +314,28 @@ object VideoMerger {
             panelHeight = plan.panelHeightEach,
         )
         return ClipPanelsOverlay(renderer, clipStartUs, windowStartMs)
+    }
+
+    /**
+     * Outro card: black background at the output resolution with the Pump
+     * Tsüri foil logo (transparent PNG) drawn centered at ~45 % of the
+     * output height, aspect preserved, alpha respected.
+     */
+    private fun renderOutroCard(context: Context, w: Int, h: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(Color.BLACK)
+        val logo = BitmapFactory.decodeResource(context.resources, R.drawable.pump_logo)
+        if (logo != null) {
+            val targetH = h * 0.45f
+            val targetW = targetH * logo.width.toFloat() / logo.height.toFloat()
+            val left = (w - targetW) / 2f
+            val top = (h - targetH) / 2f
+            val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply { isAntiAlias = true }
+            canvas.drawBitmap(logo, null, RectF(left, top, left + targetW, top + targetH), paint)
+            logo.recycle()
+        }
+        return bmp
     }
 
     /** Black card, date (dd.MM.yyyy) above start time (HH:mm:ss), local tz. */
