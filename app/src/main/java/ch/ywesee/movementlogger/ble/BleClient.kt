@@ -964,18 +964,20 @@ class BleClient(private val context: Context) {
      * SensorStream notification handler. Two transport modes per
      * DESIGN.md §3:
      *
-     *   - **Single-notify** (negotiated MTU ≥ 50): one 46-byte payload
-     *     per snapshot, parsed in one shot.
+     *   - **Single-notify** (negotiated MTU ≥ 50): one 46-byte (legacy) or
+     *     58-byte (v0.0.55+ GPS RF extension) payload per snapshot, parsed
+     *     in one shot.
      *   - **3-chunk fallback** (default MTU ≈ 23): three sequential
      *     ~20-byte notifies, first byte is the sequence index
      *     (0x00 / 0x01 / 0x02). Out-of-order chunks reset the asm
-     *     buffer and wait for the next 0x00.
+     *     buffer and wait for the next 0x00. Legacy-46 only — RF-capable
+     *     firmware always sends the 58-byte single notify.
      *
      * Malformed packets drop silently — the stream auto-resyncs on the
      * next 0x00 start, and at 0.5 Hz a lost frame is barely a blip.
      */
     private fun handleStreamNotify(bytes: ByteArray) {
-        if (bytes.size == LiveSample.WIRE_SIZE) {
+        if (bytes.size == LiveSample.WIRE_SIZE || bytes.size == LiveSample.WIRE_SIZE_RF) {
             // Single-notify path. Reset any in-flight chunked frame so a
             // mid-frame MTU upgrade doesn't leave the asm in a bad state.
             streamAsm.clear()

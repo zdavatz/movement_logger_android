@@ -10,9 +10,42 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
+ * GPS RF extension carried in the 58-byte SensorStream (firmware v0.0.55+,
+ * bytes 46..57): Peter's assembly metrics — same values as the GPS-Debug
+ * survey live line and the firmware's `gps_rf:` errlog line — over the
+ * normal BLE link, no survey bridge needed. Mirrors desktop `ble.rs`
+ * `LiveRf`.
+ */
+data class GpsRfLive(
+    /** Raw NAV-PVT fixType (0 none, 2 = 2D, 3 = 3D, 4 = 3D+DR, 5 = time). */
+    val fixType: Int,
+    /** Satellites used in the solution (NAV-PVT numSV). */
+    val usedSv: Int,
+    /** Mean of the 6 strongest GPS+Galileo C/N0s, ×10 (dB-Hz). 0 = no data. */
+    val avg6X10: Int,
+    /** Weakest / strongest of that top-6 (dB-Hz). */
+    val min6: Int,
+    val max6: Int,
+    /** MON-RF noisePerMS (broadband noise floor). */
+    val noisePerMs: Int,
+    /** MON-RF agcCnt (0..8191). */
+    val agcCnt: Int,
+    /** MON-RF jamInd (narrowband CW, 0..255). */
+    val jamInd: Int,
+    /** MON-RF jammingState (0 unk, 1 ok, 2 warn, 3 crit). */
+    val jamState: Int,
+    /** MON-RF antStatus (0 init, 2 ok, 3 SHORT, 4 OPEN). */
+    val antStatus: Int,
+    /** Flags bit 3: MON-RF values seen within the last 15 s. */
+    val fresh: Boolean,
+)
+
+/**
  * One decoded SensorStream snapshot. Mirrors the 46-byte packed layout from
  * the PumpLogger firmware (DESIGN.md §3 in fp-sns-stbox1), scaled into
  * convenient SI-ish units so the UI doesn't need to know the wire encoding.
+ * Firmware v0.0.55+ appends the 12-byte GPS RF extension (58 bytes total);
+ * both sizes are accepted — legacy packets just leave [rf] null.
  *
  * Authoritative spec: `stbox-viz-gui/src/ble.rs` LiveSample (desktop port).
  */
@@ -50,6 +83,8 @@ data class LiveSample(
     val gpsValid: Boolean,
     val loggingActive: Boolean,
     val lowBattery: Boolean,
+    /** GPS RF/signal health extension (v0.0.55+). Null on legacy 46-byte packets. */
+    val rf: GpsRfLive? = null,
 ) {
     /** Lat/lon in float degrees if the fix is valid, else null. */
     fun latLonDeg(): Pair<Double, Double>? =
@@ -113,15 +148,36 @@ data class LiveSample(
     }
 
     companion object {
-        /** Wire-layout size, in bytes. */
+        /** Legacy wire-layout size, in bytes. */
         const val WIRE_SIZE = 46
 
-        /** Decode the 46-byte little-endian wire layout. Returns null on bad length. */
+        /** v0.0.55+ wire size with the GPS RF extension (bytes 46..57). */
+        const val WIRE_SIZE_RF = 58
+
+        /**
+         * Decode the little-endian wire layout — 46 bytes (legacy) or
+         * 58 bytes (v0.0.55+ GPS RF extension). Returns null on bad length.
+         */
         fun parse(bytes: ByteArray): LiveSample? {
-            if (bytes.size != WIRE_SIZE) return null
+            if (bytes.size != WIRE_SIZE && bytes.size != WIRE_SIZE_RF) return null
             val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
             val ts = bb.getInt(0).toLong() and 0xFFFF_FFFFL
             val flags = bytes[44].toInt() and 0xFF
+            val rf = if (bytes.size >= WIRE_SIZE_RF) {
+                GpsRfLive(
+                    fixType = bytes[46].toInt() and 0xFF,
+                    usedSv = bytes[47].toInt() and 0xFF,
+                    avg6X10 = bb.getShort(48).toInt() and 0xFFFF,
+                    min6 = bytes[50].toInt() and 0xFF,
+                    max6 = bytes[51].toInt() and 0xFF,
+                    noisePerMs = bb.getShort(52).toInt() and 0xFFFF,
+                    agcCnt = bb.getShort(54).toInt() and 0xFFFF,
+                    jamInd = bytes[56].toInt() and 0xFF,
+                    jamState = bytes[57].toInt() and 0x0F,
+                    antStatus = (bytes[57].toInt() and 0xFF) shr 4,
+                    fresh = flags and 0x08 != 0,
+                )
+            } else null
             return LiveSample(
                 timestampMs = ts,
                 accMg = shortArrayOf(bb.getShort(4), bb.getShort(6), bb.getShort(8)),
@@ -140,6 +196,7 @@ data class LiveSample(
                 gpsValid = flags and 0x01 != 0,
                 lowBattery = flags and 0x02 != 0,
                 loggingActive = flags and 0x04 != 0,
+                rf = rf,
             )
         }
     }
