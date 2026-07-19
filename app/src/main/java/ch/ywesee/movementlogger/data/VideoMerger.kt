@@ -9,6 +9,7 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.media3.common.Effect
@@ -36,48 +37,76 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * Merges multiple rider clips into one film. Per clip, in chronological
- * order (sorted by container `creation_time` before this is called):
+ * Merges multiple rider clips into one film.
+ *
+ * The film opens with a 3 s black intro card — "MovementLogger" centered
+ * at ~86 % of the output width, each letter colored along the logo
+ * gradient (orange → teal → blue → purple, linearly interpolated per
+ * letter). Then, per clip in chronological order (sorted by container
+ * `creation_time` before this is called):
  *
  *   1. A black title card (~2.5 s) with the clip's recording date
  *      (dd.MM.yyyy) above its start time (HH:mm:ss), local timezone.
- *   2. The clip COMPLETE — never trimmed. Hard product rule from the
- *      owner: "never cut a video!". There is no
+ *   2. The clip COMPLETE and UNFADED — never trimmed, never dimmed while
+ *      footage still plays. Hard product rules from the owner: "never
+ *      cut a video!" and "play every movie till the end and then add
+ *      phase out over 3 seconds". There is no
  *      `MediaItem.ClippingConfiguration` anywhere in this pipeline and
- *      none may ever be added; every source frame ships.
- *   3. A 3-second fade-to-black at the clip's end (full-frame black
- *      overlay whose alpha ramps 0 → 1).
+ *      none may ever be added; every source frame ships at full
+ *      brightness.
+ *   3. A 3-second FREEZE of the clip's last frame (extracted via
+ *      MediaMetadataRetriever, inserted as an image item) over which the
+ *      full-frame black overlay's alpha ramps 0 → 1 — the fade lives
+ *      entirely on the frozen still, mirroring the desktop pipeline.
  *
  * When a sensor session (Sens + Gps CSVs, fusion complete) is supplied,
  * each clip is additionally composited with the same four-panel animation
  * as the single-clip Replay export — per clip trimmed to that clip's own
  * time window and aligned via its `creation_time` (which the `# SYNC`
- * anchors put in the same clock domain as the CSV rows).
+ * anchors put in the same clock domain as the CSV rows). The freeze
+ * segment keeps the panels (cursor pinned at the clip's end) under its
+ * fade.
  *
  * The film closes with a single 5 s Pump Tsüri logo outro — ONCE at the
- * very end (after the last clip's fade-out), not per clip: the foil logo
- * (`R.drawable.pump_logo`, transparent background) centered at ~45 % of
- * the output height on black.
+ * very end (after the last freeze's fade-out), not per clip: the foil
+ * logo (`R.drawable.pump_logo`, transparent background) centered at
+ * ~45 % of the output height on black.
  *
- * Everything is one `EditedMediaItemSequence` (title card, clip, title
- * card, clip, …, outro) so Media3 Transformer concatenates natively. The
- * title cards and the outro are silent images, so the composition forces
- * an audio track — Transformer generates silence under them and passes
- * each clip's own audio through.
+ * Everything is one `EditedMediaItemSequence` (intro, card, clip, freeze,
+ * card, clip, freeze, …, outro) so Media3 Transformer concatenates
+ * natively. The intro/title/freeze/outro stills are silent images, so the
+ * composition forces an audio track — Transformer generates silence under
+ * them and passes each clip's own audio through.
  */
 @OptIn(UnstableApi::class)
 object VideoMerger {
 
+    /** "MovementLogger" gradient intro card at the very start of the film. */
+    private const val INTRO_US = 3_000_000L
+
     /** Title-card hold, per product spec (~2.5 s). */
     private const val TITLE_CARD_US = 2_500_000L
 
-    /** Fade-to-black length at each clip's end. */
-    private const val FADE_US = 3_000_000L
+    /**
+     * Last-frame freeze after each clip; the 3 s fade-to-black ramps
+     * across this frozen still — the clip itself plays complete, unfaded.
+     */
+    private const val FREEZE_US = 3_000_000L
 
     /** Pump Tsüri logo outro at the very end of the film. */
     private const val OUTRO_US = 5_000_000L
 
     private const val CARD_FPS = 30
+
+    private const val INTRO_TEXT = "MovementLogger"
+
+    /** Logo gradient stops for the intro letters: orange → teal → blue → purple. */
+    private val INTRO_GRADIENT = arrayOf(
+        intArrayOf(247, 154, 51),
+        intArrayOf(36, 195, 188),
+        intArrayOf(62, 141, 243),
+        intArrayOf(125, 77, 240),
+    )
 
     /** One source clip with its probed size/duration + capture time. */
     data class Clip(
@@ -136,37 +165,44 @@ object VideoMerger {
             )
         }
 
-        // Title cards + logo outro land as cache PNGs so Media3's image
-        // asset loader can pick them up by URI (mime set explicitly, no
-        // extension sniffing).
+        // Intro, title cards, per-clip last-frame freezes and the logo
+        // outro land as cache PNGs so Media3's image asset loader can pick
+        // them up by URI (mime set explicitly, no extension sniffing).
         val cardDir = File(context.cacheDir, "exports/cards").apply { mkdirs() }
         val stamp = System.currentTimeMillis()
-        val (cardFiles, outroFile) = withContext(Dispatchers.IO) {
-            val cards = clips.mapIndexed { i, clip ->
-                val f = File(cardDir, "card_${stamp}_$i.png")
-                val bmp = renderTitleCard(plan.outWidth, plan.outHeight, clip.creationTimeMillis)
+        val stills = withContext(Dispatchers.IO) {
+            fun writePng(name: String, bmp: Bitmap): File {
+                val f = File(cardDir, name)
                 FileOutputStream(f).use { out -> bmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
                 bmp.recycle()
-                f
+                return f
             }
-            val outro = File(cardDir, "outro_$stamp.png")
-            val outroBmp = renderOutroCard(context, plan.outWidth, plan.outHeight)
-            FileOutputStream(outro).use { out -> outroBmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
-            outroBmp.recycle()
-            cards to outro
+            Stills(
+                intro = writePng("intro_$stamp.png", renderIntroCard(plan.outWidth, plan.outHeight)),
+                cards = clips.mapIndexed { i, clip ->
+                    writePng(
+                        "card_${stamp}_$i.png",
+                        renderTitleCard(plan.outWidth, plan.outHeight, clip.creationTimeMillis),
+                    )
+                },
+                freezes = clips.mapIndexed { i, clip ->
+                    writePng("freeze_${stamp}_$i.png", extractLastFrame(context, clip))
+                },
+                outro = writePng("outro_$stamp.png", renderOutroCard(context, plan.outWidth, plan.outHeight)),
+            )
         }
 
         val outDir = File(context.cacheDir, "exports").apply { mkdirs() }
         val outFile = File(outDir, "merged_$stamp.mp4")
 
         try {
-            // Build the sequence: [card 0, clip 0, card 1, clip 1, …].
+            // Build the sequence: [intro, card 0, clip 0, freeze 0, …].
             // Per-item overlays receive SEQUENCE-GLOBAL presentation
             // timestamps (Media3 offsets each item by the elapsed sequence
             // duration), so each clip's overlays carry the clip's global
             // start offset to recover clip-local time.
             val items = withContext(Dispatchers.Default) {
-                buildSequenceItems(clips, cardFiles, outroFile, session, plan)
+                buildSequenceItems(clips, stills, session, plan)
             }
 
             val composition = Composition.Builder(EditedMediaItemSequence(items))
@@ -188,15 +224,28 @@ object VideoMerger {
             }
         } finally {
             outFile.delete()
-            cardFiles.forEach { it.delete() }
-            outroFile.delete()
+            stills.allFiles().forEach { it.delete() }
+        }
+    }
+
+    /** Cache-PNG stills that frame the clips in the sequence. */
+    private class Stills(
+        val intro: File,
+        val cards: List<File>,
+        val freezes: List<File>,
+        val outro: File,
+    ) {
+        fun allFiles(): List<File> = buildList {
+            add(intro)
+            addAll(cards)
+            addAll(freezes)
+            add(outro)
         }
     }
 
     private fun buildSequenceItems(
         clips: List<Clip>,
-        cardFiles: List<File>,
-        outroFile: File,
+        stills: Stills,
         session: SensorSession?,
         plan: VideoExporter.OutputPlan,
     ): List<EditedMediaItem> {
@@ -204,95 +253,115 @@ object VideoMerger {
         val black = Bitmap.createBitmap(plan.outWidth, plan.outHeight, Bitmap.Config.ARGB_8888)
             .apply { eraseColor(Color.BLACK) }
         val shiftNdc = plan.panelsHeightTotal.toFloat() / plan.outHeight.toFloat()
+        val presentation = Presentation.createForWidthAndHeight(
+            plan.outWidth, plan.outHeight, Presentation.LAYOUT_SCALE_TO_FIT,
+        )
 
-        val items = ArrayList<EditedMediaItem>(clips.size * 2 + 1)
-        var cursorUs = 0L
-        for ((i, clip) in clips.withIndex()) {
-            // (1) Title card — a 2.5 s still image.
-            items += EditedMediaItem.Builder(
+        /** A silent still with just the scale-to-fit Presentation. */
+        fun stillItem(file: File, durationUs: Long): EditedMediaItem =
+            EditedMediaItem.Builder(
                 MediaItem.Builder()
-                    .setUri(Uri.fromFile(cardFiles[i]))
+                    .setUri(Uri.fromFile(file))
                     .setMimeType(MimeTypes.IMAGE_PNG)
                     .build(),
             )
-                .setDurationUs(TITLE_CARD_US)
+                .setDurationUs(durationUs)
                 .setFrameRate(CARD_FPS)
                 .setEffects(
-                    Effects(
-                        /* audioProcessors = */ emptyList(),
-                        /* videoEffects = */ listOf<Effect>(
-                            Presentation.createForWidthAndHeight(
-                                plan.outWidth, plan.outHeight, Presentation.LAYOUT_SCALE_TO_FIT,
-                            ),
-                        ),
-                    ),
+                    Effects(/* audioProcessors = */ emptyList(), listOf<Effect>(presentation)),
                 )
                 .build()
+
+        val items = ArrayList<EditedMediaItem>(clips.size * 3 + 2)
+        var cursorUs = 0L
+
+        // (0) "MovementLogger" gradient intro — 3 s, once, before the first
+        // date card.
+        items += stillItem(stills.intro, INTRO_US)
+        cursorUs += INTRO_US
+
+        for ((i, clip) in clips.withIndex()) {
+            // (1) Title card — a 2.5 s still image.
+            items += stillItem(stills.cards[i], TITLE_CARD_US)
             cursorUs += TITLE_CARD_US
 
-            // (2) The clip, complete — NO clipping configuration, ever.
+            // (2) The clip, complete and UNFADED — NO clipping
+            // configuration, ever, and no dimming while footage plays.
             val clipStartUs = cursorUs
             val clipDurationUs = clip.size.durationMs * 1000L
+            val panels = if (session != null) buildClipPanels(session, clip, plan) else null
 
-            val videoEffects = ArrayList<Effect>()
-            videoEffects += Presentation.createForWidthAndHeight(
-                plan.outWidth, plan.outHeight, Presentation.LAYOUT_SCALE_TO_FIT,
-            )
-            val overlays = ArrayList<TextureOverlay>()
-            if (session != null) {
+            val clipEffects = ArrayList<Effect>()
+            clipEffects += presentation
+            if (panels != null) {
                 // Rider sits flush with the top, panels fill the bottom —
                 // same NDC shift as the single-clip export.
-                videoEffects += MatrixTransformation { _ ->
+                clipEffects += MatrixTransformation { _ ->
                     Matrix().apply { postTranslate(0f, shiftNdc) }
                 }
-                overlays += buildPanelsOverlay(session, clip, clipStartUs, plan)
+                clipEffects += OverlayEffect(
+                    ImmutableList.of<TextureOverlay>(
+                        ClipPanelsOverlay(panels.renderer, clipStartUs, panels.windowStartMs),
+                    ),
+                )
             }
-            // (3) Fade-out last so it covers panels too.
-            overlays += FadeToBlackOverlay(black, clipStartUs, clipDurationUs)
-            videoEffects += OverlayEffect(ImmutableList.copyOf(overlays))
-
             items += EditedMediaItem.Builder(MediaItem.fromUri(clip.uri))
-                .setEffects(Effects(/* audioProcessors = */ emptyList(), videoEffects))
+                .setEffects(Effects(/* audioProcessors = */ emptyList(), clipEffects))
                 .build()
             cursorUs += clipDurationUs
+
+            // (3) Freeze of the clip's last frame, fading to black over
+            // 3 s. The panels ride along (cursor pinned at clip end —
+            // ClipPanelsOverlay keeps the clip's own start offset, so the
+            // freeze's global timestamps land past the window and the
+            // renderer clamps to the last row); the fade overlays them.
+            val freezeStartUs = cursorUs
+            val freezeEffects = ArrayList<Effect>()
+            freezeEffects += presentation
+            val freezeOverlays = ArrayList<TextureOverlay>()
+            if (panels != null) {
+                freezeEffects += MatrixTransformation { _ ->
+                    Matrix().apply { postTranslate(0f, shiftNdc) }
+                }
+                freezeOverlays += ClipPanelsOverlay(panels.renderer, clipStartUs, panels.windowStartMs)
+            }
+            freezeOverlays += FadeToBlackOverlay(black, freezeStartUs, FREEZE_US)
+            freezeEffects += OverlayEffect(ImmutableList.copyOf(freezeOverlays))
+
+            items += EditedMediaItem.Builder(
+                MediaItem.Builder()
+                    .setUri(Uri.fromFile(stills.freezes[i]))
+                    .setMimeType(MimeTypes.IMAGE_PNG)
+                    .build(),
+            )
+                .setDurationUs(FREEZE_US)
+                .setFrameRate(CARD_FPS)
+                .setEffects(Effects(/* audioProcessors = */ emptyList(), freezeEffects))
+                .build()
+            cursorUs += FREEZE_US
         }
 
         // (4) Pump Tsüri logo outro — ONCE at the very end of the film,
-        // after the last clip's fade-out.
-        items += EditedMediaItem.Builder(
-            MediaItem.Builder()
-                .setUri(Uri.fromFile(outroFile))
-                .setMimeType(MimeTypes.IMAGE_PNG)
-                .build(),
-        )
-            .setDurationUs(OUTRO_US)
-            .setFrameRate(CARD_FPS)
-            .setEffects(
-                Effects(
-                    /* audioProcessors = */ emptyList(),
-                    /* videoEffects = */ listOf<Effect>(
-                        Presentation.createForWidthAndHeight(
-                            plan.outWidth, plan.outHeight, Presentation.LAYOUT_SCALE_TO_FIT,
-                        ),
-                    ),
-                ),
-            )
-            .build()
+        // after the last freeze's fade-out.
+        items += stillItem(stills.outro, OUTRO_US)
         return items
     }
 
+    /** Per-clip panels renderer + the clip's absolute-time window start. */
+    private class ClipPanels(val renderer: ExportPanelRenderer, val windowStartMs: Long)
+
     /**
-     * Panels overlay for one clip: trim the session to the clip's own
+     * Panels renderer for one clip: trim the session to the clip's own
      * absolute-time window and render the four-panel stack against it. A
      * clip without `creation_time` (or with no overlapping rows) gets
-     * empty panels rather than failing the whole merge.
+     * empty panels rather than failing the whole merge. The renderer is
+     * shared by the clip item's overlay and the freeze item's overlay.
      */
-    private fun buildPanelsOverlay(
+    private fun buildClipPanels(
         session: SensorSession,
         clip: Clip,
-        clipStartUs: Long,
         plan: VideoExporter.OutputPlan,
-    ): BitmapOverlay {
+    ): ClipPanels {
         val windowStartMs = clip.creationTimeMillis ?: 0L
         val windowEndMs = windowStartMs + clip.size.durationMs
         val trimmed = ReplayTrim.trimToWindow(
@@ -313,7 +382,76 @@ object VideoMerger {
             outWidth = plan.outWidth,
             panelHeight = plan.panelHeightEach,
         )
-        return ClipPanelsOverlay(renderer, clipStartUs, windowStartMs)
+        return ClipPanels(renderer, windowStartMs)
+    }
+
+    /**
+     * The clip's last frame for the freeze segment, in display
+     * orientation (getFrameAtTime applies container rotation). Falls back
+     * to a representative frame, then plain black — the fade still works
+     * either way.
+     */
+    private fun extractLastFrame(context: Context, clip: Clip): Bitmap {
+        val mmr = MediaMetadataRetriever()
+        try {
+            mmr.setDataSource(context, clip.uri)
+            val frame = mmr.getFrameAtTime(
+                clip.size.durationMs * 1000L,
+                MediaMetadataRetriever.OPTION_CLOSEST,
+            ) ?: mmr.getFrameAtTime(-1)
+            if (frame != null) return frame
+        } catch (_: Exception) {
+            // fall through to the black fallback
+        } finally {
+            runCatching { mmr.release() }
+        }
+        return Bitmap.createBitmap(
+            clip.size.width.coerceAtLeast(2),
+            clip.size.height.coerceAtLeast(2),
+            Bitmap.Config.ARGB_8888,
+        ).apply { eraseColor(Color.BLACK) }
+    }
+
+    /**
+     * Intro card: "MovementLogger" centered on black, sized so the word
+     * spans ~86 % of the output width, each letter colored along the logo
+     * gradient (linear interpolation across the 14 characters).
+     */
+    private fun renderIntroCard(w: Int, h: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(Color.BLACK)
+        val paint = Paint().apply {
+            isAntiAlias = true
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textSize = 100f
+        }
+        // Scale the text so the full word spans ~86 % of the width.
+        val measured = paint.measureText(INTRO_TEXT)
+        if (measured > 0f) paint.textSize = 100f * (w * 0.86f) / measured
+        val fm = paint.fontMetrics
+        val baseline = h / 2f - (fm.ascent + fm.descent) / 2f
+        var x = (w - paint.measureText(INTRO_TEXT)) / 2f
+        for ((i, ch) in INTRO_TEXT.withIndex()) {
+            paint.color = introLetterColor(i, INTRO_TEXT.length)
+            val s = ch.toString()
+            canvas.drawText(s, x, baseline, paint)
+            x += paint.measureText(s)
+        }
+        return bmp
+    }
+
+    /** Gradient color for intro letter `i` of `n` (piecewise-linear RGB). */
+    private fun introLetterColor(i: Int, n: Int): Int {
+        val t = if (n <= 1) 0f else i.toFloat() / (n - 1).toFloat()
+        val segments = INTRO_GRADIENT.size - 1
+        val x = t * segments
+        val seg = x.toInt().coerceIn(0, segments - 1)
+        val f = x - seg
+        val a = INTRO_GRADIENT[seg]
+        val b = INTRO_GRADIENT[seg + 1]
+        fun lerp(u: Int, v: Int): Int = (u + (v - u) * f).toInt().coerceIn(0, 255)
+        return Color.rgb(lerp(a[0], b[0]), lerp(a[1], b[1]), lerp(a[2], b[2]))
     }
 
     /**
@@ -397,24 +535,25 @@ object VideoMerger {
     }
 
     /**
-     * Full-frame black overlay whose alpha ramps 0 → 1 over the clip's
-     * last 3 s (shorter clips fade over their whole length). The bitmap is
-     * a single shared instance, so it uploads to a GL texture once; only
-     * the per-frame `alphaScale` changes.
+     * Full-frame black overlay whose alpha ramps 0 → 1 across the freeze
+     * segment that follows each clip. Applied ONLY to that frozen still —
+     * never to the clip itself, which must play complete and unfaded
+     * ("play every movie till the end and then add phase out over
+     * 3 seconds"). The bitmap is a single shared instance, so it uploads
+     * to a GL texture once; only the per-frame `alphaScale` changes.
      */
     private class FadeToBlackOverlay(
         private val black: Bitmap,
-        private val clipStartUs: Long,
-        private val clipDurationUs: Long,
+        private val segmentStartUs: Long,
+        private val segmentDurationUs: Long,
     ) : BitmapOverlay() {
 
         override fun getBitmap(presentationTimeUs: Long): Bitmap = black
 
         override fun getOverlaySettings(presentationTimeUs: Long): OverlaySettings {
-            val localUs = (presentationTimeUs - clipStartUs).coerceIn(0L, clipDurationUs)
-            val fadeUs = minOf(FADE_US, clipDurationUs).coerceAtLeast(1L)
-            val fadeStartUs = clipDurationUs - fadeUs
-            val alpha = ((localUs - fadeStartUs).toFloat() / fadeUs.toFloat()).coerceIn(0f, 1f)
+            val localUs = (presentationTimeUs - segmentStartUs).coerceIn(0L, segmentDurationUs)
+            val alpha = (localUs.toFloat() / segmentDurationUs.coerceAtLeast(1L).toFloat())
+                .coerceIn(0f, 1f)
             return OverlaySettings.Builder().setAlphaScale(alpha).build()
         }
     }
