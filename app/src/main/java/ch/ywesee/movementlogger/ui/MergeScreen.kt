@@ -309,17 +309,16 @@ private fun MergeExportBanner(state: ExportState, onDismiss: () -> Unit) {
                 ),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Row(
-                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "Saved to Photos · Movies/MovementLogger",
-                        modifier = Modifier.weight(1f),
-                    )
-                    Button(onClick = { openMergedVideo(context, state.uri) }) { Text("Open video") }
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = onDismiss) { Text("OK") }
+                Column(Modifier.padding(12.dp).fillMaxWidth()) {
+                    Text("Saved to Photos · Movies/MovementLogger")
+                    Spacer(Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Button(onClick = { openMergedVideo(context, state.uri) }) { Text("Open video") }
+                        Spacer(Modifier.width(8.dp))
+                        Button(onClick = { shareMergedVideo(context, state.uri) }) { Text("Share") }
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(onClick = onDismiss) { Text("OK") }
+                    }
                 }
             }
         }
@@ -349,6 +348,16 @@ private fun openMergedVideo(context: android.content.Context, uri: Uri) {
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     context.startActivity(Intent.createChooser(intent, "Open video"))
+}
+
+/** ACTION_SEND the merged film's MediaStore content:// URI to any app. */
+private fun shareMergedVideo(context: android.content.Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "video/mp4"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(Intent.createChooser(intent, "Share video"))
 }
 
 private fun formatClipDuration(ms: Long): String {
