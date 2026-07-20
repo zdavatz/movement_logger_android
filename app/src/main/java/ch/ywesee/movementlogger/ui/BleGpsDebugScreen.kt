@@ -3,6 +3,7 @@ package ch.ywesee.movementlogger.ui
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -27,8 +28,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ch.ywesee.movementlogger.ble.BleGpsSurvey
 import ch.ywesee.movementlogger.ble.FileSyncCore
@@ -71,6 +74,12 @@ fun BleGpsDebugScreen() {
             color = if (connected) MaterialTheme.colorScheme.primary
             else MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        // Live RF health straight from the SensorStream (firmware v0.0.55+;
+        // no survey needed): C/N0 max plus Peter's assembly metrics — fix
+        // type, sats used, top-6 GPS+Galileo C/N0 and the MON-RF EMI set.
+        // Moved here from the Live tab: all GPS debugging lives on this tab.
+        if (connected) LiveRfCard(sync.live.latestSample)
 
         OutlinedTextField(
             value = label,
@@ -166,4 +175,111 @@ fun BleGpsDebugScreen() {
             }
         }
     }
+}
+
+/**
+ * Live RF health from the 0.5 Hz SensorStream (moved from the Live tab):
+ * "GPS C/N0" (strongest single satellite, GSV/NAV-SAT), "GPS RF" (fix type,
+ * sats used, top-6 GPS+Galileo C/N0 avg/min/max) and "GPS EMI" (MON-RF
+ * noise/agc, jamming state, antenna supervisor). Colors follow the desktop:
+ * jam ok green / warn yellow / CRIT red; ant SHORT/OPEN red. `rf == null`
+ * (legacy 46-byte packets, firmware < v0.0.55) hides the two RF rows.
+ */
+@Composable
+private fun LiveRfCard(s: ch.ywesee.movementlogger.ble.LiveSample?) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Live RF (SensorStream)", style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (s == null) {
+                Text("Waiting for first SensorStream notify…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                return@Column
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                RfLabelCell("GPS C/N0")
+                RfText(if (s.gpsCn0Max > 0) "${s.gpsCn0Max} dB-Hz max" else "—", 1f)
+                RfText(
+                    when {
+                        s.gpsCn0Max == 0  -> "no GSV / no data"
+                        s.gpsCn0Max >= 40 -> "good antenna"
+                        s.gpsCn0Max >= 30 -> "ok"
+                        else              -> "weak signal"
+                    },
+                    2f,
+                )
+            }
+            s.rf?.let { rf -> GpsRfRows(rf) }
+        }
+    }
+}
+
+/**
+ * The two GPS RF-extension rows (firmware v0.0.55+): "GPS RF" and "GPS EMI" —
+ * Peter's assembly metrics over the normal BLE link, same values as the
+ * survey's live line, no bridge needed.
+ */
+@Composable
+private fun GpsRfRows(rf: ch.ywesee.movementlogger.ble.GpsRfLive) {
+    val green = Color(0xFF2E7D32)
+    val yellow = Color(0xFFB58B00)
+    val red = Color(0xFFD32F2F)
+    val gray = Color(0xFF888888)
+
+    val fixName = when (rf.fixType) {
+        0 -> "no fix"
+        2 -> "2D"
+        3 -> "3D"
+        4 -> "3D+DR"
+        5 -> "time"
+        else -> "?"
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        RfLabelCell("GPS RF")
+        RfText("fix $fixName · ${rf.usedSv} used", 1f)
+        if (rf.avg6X10 > 0) {
+            RfText("avg6 %.1f / min %d / max %d dB-Hz".format(rf.avg6X10 / 10.0, rf.min6, rf.max6), 2f)
+        } else {
+            RfText("no C/N0 data", 2f, yellow)
+        }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        RfLabelCell("GPS EMI")
+        if (rf.fresh) {
+            RfText("noise ${rf.noisePerMs} · agc ${rf.agcCnt}", 1f)
+            val (jamText, jamColor) = when (rf.jamState) {
+                1 -> "jam ok" to green
+                2 -> "jam warn" to yellow
+                3 -> "jam CRIT" to red
+                else -> "jam ?" to gray
+            }
+            RfText("$jamText (ind ${rf.jamInd})", 1f, jamColor)
+            val (antText, antColor) = when (rf.antStatus) {
+                2 -> "ant ok" to green
+                3 -> "ant SHORT" to red
+                4 -> "ant OPEN" to red
+                else -> "ant ?" to gray
+            }
+            RfText(antText, 1f, antColor)
+        } else {
+            RfText("no MON-RF reply (module quiet)", 3f, gray)
+        }
+    }
+}
+
+@Composable
+private fun RowScope.RfText(text: String, weight: Float, color: Color = Color.Unspecified) {
+    Text(
+        text,
+        color = color,
+        modifier = Modifier.weight(weight),
+        fontFamily = FontFamily.Monospace,
+        fontSize = 13.sp,
+    )
+}
+
+@Composable
+private fun RfLabelCell(text: String) {
+    Text(text, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(end = 8.dp))
 }

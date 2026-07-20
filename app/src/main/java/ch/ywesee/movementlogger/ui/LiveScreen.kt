@@ -393,21 +393,9 @@ private fun ReadoutGrid(s: LiveSample) {
                     s.gpsCourseCdeg.toDouble() / 100.0,
                 ),
             )
-            ReadoutRow("GPS C/N0",
-                if (s.gpsCn0Max > 0) "${s.gpsCn0Max} dB-Hz max" else "—",
-                when {
-                    s.gpsCn0Max == 0  -> "no GSV / no data"
-                    s.gpsCn0Max >= 40 -> "good antenna"
-                    s.gpsCn0Max >= 30 -> "ok"
-                    else              -> "weak signal"
-                },
-                "",
-            )
-            // GPS RF extension (firmware v0.0.55+): Peter's assembly metrics
-            // over the normal BLE link — same values as the GPS-Debug survey
-            // line, no bridge needed. Legacy 46-byte packets → rows absent.
-            // Mirrors the desktop Live tab (stbox-viz-gui/src/main.rs).
-            s.rf?.let { rf -> GpsRfRows(rf) }
+            // GPS C/N0 + the RF/EMI extension rows moved to the GPS Debug
+            // tab (BleGpsDebugScreen "Live RF" card) — all GPS *debugging*
+            // lives there; Live keeps only the logger's sensor readouts.
             Row(verticalAlignment = Alignment.CenterVertically) {
                 LabelCell("Flags")
                 Row(Modifier.weight(3f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -416,85 +404,6 @@ private fun ReadoutGrid(s: LiveSample) {
                     FlagChip("low_batt", s.lowBattery)
                 }
             }
-        }
-    }
-}
-
-/**
- * The two GPS RF-extension rows (firmware v0.0.55+): "GPS RF" (fix type,
- * sats used, top-6 GPS+Galileo C/N0 avg/min/max) and "GPS EMI" (MON-RF
- * noise/agc, jamming state, antenna supervisor). Colors follow the desktop
- * Live tab: jam ok green / warn yellow / CRIT red; ant SHORT/OPEN red.
- */
-@Composable
-private fun GpsRfRows(rf: ch.ywesee.movementlogger.ble.GpsRfLive) {
-    val green = Color(0xFF2E7D32)
-    val yellow = Color(0xFFB58B00)
-    val red = Color(0xFFD32F2F)
-    val gray = Color(0xFF888888)
-
-    val fixName = when (rf.fixType) {
-        0 -> "no fix"
-        2 -> "2D"
-        3 -> "3D"
-        4 -> "3D+DR"
-        5 -> "time"
-        else -> "?"
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        LabelCell("GPS RF")
-        Text(
-            "fix $fixName · ${rf.usedSv} used",
-            modifier = Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-        )
-        if (rf.avg6X10 > 0) {
-            Text(
-                "avg6 %.1f / min %d / max %d dB-Hz".format(rf.avg6X10 / 10.0, rf.min6, rf.max6),
-                modifier = Modifier.weight(2f), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-            )
-        } else {
-            Text(
-                "no C/N0 data",
-                color = yellow,
-                modifier = Modifier.weight(2f), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-            )
-        }
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        LabelCell("GPS EMI")
-        if (rf.fresh) {
-            Text(
-                "noise ${rf.noisePerMs} · agc ${rf.agcCnt}",
-                modifier = Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-            )
-            val (jamText, jamColor) = when (rf.jamState) {
-                1 -> "jam ok" to green
-                2 -> "jam warn" to yellow
-                3 -> "jam CRIT" to red
-                else -> "jam ?" to gray
-            }
-            Text(
-                "$jamText (ind ${rf.jamInd})",
-                color = jamColor,
-                modifier = Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-            )
-            val (antText, antColor) = when (rf.antStatus) {
-                2 -> "ant ok" to green
-                3 -> "ant SHORT" to red
-                4 -> "ant OPEN" to red
-                else -> "ant ?" to gray
-            }
-            Text(
-                antText,
-                color = antColor,
-                modifier = Modifier.weight(1f), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-            )
-        } else {
-            Text(
-                "no MON-RF reply (module quiet)",
-                color = gray,
-                modifier = Modifier.weight(3f), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
-            )
         }
     }
 }
