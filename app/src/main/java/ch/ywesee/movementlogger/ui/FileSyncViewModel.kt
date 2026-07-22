@@ -56,6 +56,27 @@ data class SessionRunning(
 data class LivePoint(val tSec: Double, val value: Double)
 
 /**
+ * BT-off GPS A/B test lifecycle (BLE_QUIET 0x15 / 0x16, firmware v0.0.57+),
+ * driven by [ch.ywesee.movementlogger.ble.FileSyncCore] and rendered in the
+ * GPS Debug tab: Arming (0x15 sent) → Running (box goes radio-silent for
+ * `durS`, phone auto-reconnects after) → Fetching (0x16 in flight) →
+ * Done (samples for the verdict card) / Failed (message; the box ERRLOG
+ * `gps_rfq:` lines still carry the data, and "Fetch last result" retries).
+ */
+sealed class QuietTestState {
+    data object Idle : QuietTestState()
+    data class Arming(val durS: Int) : QuietTestState()
+    data class Running(val durS: Int, val sinceMs: Long) : QuietTestState()
+    data class Fetching(val durS: Int) : QuietTestState()
+    data class Done(
+        val durS: Int,
+        val samples: List<ch.ywesee.movementlogger.ble.QuietSample>,
+        val atMs: Long,
+    ) : QuietTestState()
+    data class Failed(val message: String) : QuietTestState()
+}
+
+/**
  * Live SensorStream state. Cleared on disconnect.
  *
  * `latestSample` is the most recent 46-byte snapshot decoded into typed
@@ -171,6 +192,8 @@ data class FileSyncUiState(
      * button; null hides it. Cleared on tap, dismiss, and disconnect.
      */
     val firmwareUpdateAvailable: Pair<String, String>? = null,
+    /** BT-off GPS A/B test lifecycle — see [QuietTestState]. */
+    val quietTest: QuietTestState = QuietTestState.Idle,
 ) {
     /** Live cumulative bytes pulled in the current sync pass: completed
      *  files' final sizes + the in-flight file's `bytesDone`. Use this
@@ -226,6 +249,19 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
     fun logFilePath(): String? = FileSyncCore.logFilePath()
     fun setLogMode(manual: Boolean) = FileSyncCore.setLogMode(manual)
     fun setGpsPower(on: Boolean) = FileSyncCore.setGpsPower(on)
+
+    /** Start the BT-off GPS A/B test (box goes radio-silent for `durS`
+     *  seconds while logging RF samples; result lands in the GPS Debug
+     *  tab). Keeps the foreground service alive across the disconnect +
+     *  auto-reconnect like every other long BLE op. */
+    fun startQuietTest(durS: Int) {
+        BleSyncService.start(getApplication())
+        FileSyncCore.startQuietTest(durS)
+    }
+
+    /** Re-fetch the most recent BT-off recording (0x16) — retry path after
+     *  a Failed state; the box keeps the buffer until the next test. */
+    fun fetchQuietResult() = FileSyncCore.fetchQuietResultNow()
 
     /**
      * Upload a firmware `.bin` chosen via the SAF picker. Reads the exact

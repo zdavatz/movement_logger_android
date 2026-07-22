@@ -12,6 +12,7 @@ import ch.ywesee.movementlogger.ui.DownloadProgress
 import ch.ywesee.movementlogger.ui.FileSyncUiState
 import ch.ywesee.movementlogger.ui.LivePoint
 import ch.ywesee.movementlogger.ui.LiveState
+import ch.ywesee.movementlogger.ui.QuietTestState
 import ch.ywesee.movementlogger.ui.RemoteFile
 import ch.ywesee.movementlogger.ui.SessionRunning
 import kotlinx.coroutines.CoroutineScope
@@ -923,6 +924,10 @@ object FileSyncCore {
                 // Reflect the box's GPS on/off state in the toggle. Self-defers
                 // until the worker is idle, same as the version query above.
                 queryGpsPower()
+                // If a BT-off window was running, this connect is the
+                // post-window reconnect — fetch the recording once the box's
+                // post phase is over and the worker is idle.
+                maybeFetchQuietResult()
                 // Resume after an interrupted transfer (desktop v0.0.9):
                 // the aborted partial is already in the mirror, so a
                 // fresh sync pass skips every complete file and re-pulls
@@ -1007,6 +1012,20 @@ object FileSyncCore {
                         live = LiveState(),
                         deleteError = null,
                         firmwareUpdateAvailable = null,
+                        // A hard Disconnected during a BT-off test means the
+                        // auto-reconnect gave up (or the user disconnected) —
+                        // resolve the test. The box ERRLOG still carries the
+                        // gps_rfq lines, and "Fetch last result" works on the
+                        // next connect.
+                        quietTest = when (it.quietTest) {
+                            is QuietTestState.Arming,
+                            is QuietTestState.Running,
+                            is QuietTestState.Fetching,
+                            -> QuietTestState.Failed(
+                                "link lost — reconnect and tap \"Fetch last result\""
+                            )
+                            else -> it.quietTest
+                        },
                     )
                 }
                 liveT0Ms = null
@@ -1206,8 +1225,113 @@ object FileSyncCore {
                 log("FW upload ${if (e.success) "OK" else "FAILED"}: ${e.message}")
             }
             is BleEvent.UbxFrame -> BleGpsSurvey.feed(e.data)
+            is BleEvent.QuietArmed -> {
+                briefOpInFlight = false
+                _state.update {
+                    it.copy(quietTest = QuietTestState.Running(
+                        e.durationSeconds, System.currentTimeMillis()))
+                }
+                log("BT-off window armed (${e.durationSeconds} s) — box goes radio-silent, auto-reconnect follows")
+            }
+            is BleEvent.QuietResult -> {
+                briefOpInFlight = false
+                val samples = e.samples
+                _state.update {
+                    it.copy(quietTest = if (samples == null) {
+                        // Only fail a test that was actually in progress — a
+                        // stray null result (e.g. busy-guard rejection during
+                        // an unrelated op) must not clobber a Done state.
+                        when (it.quietTest) {
+                            is QuietTestState.Arming,
+                            is QuietTestState.Running,
+                            is QuietTestState.Fetching,
+                            -> QuietTestState.Failed("no result — see log; the box ERRLOG gps_rfq lines carry the data")
+                            else -> it.quietTest
+                        }
+                    } else {
+                        QuietTestState.Done(e.durationSeconds, samples, System.currentTimeMillis())
+                    })
+                }
+                if (samples != null) {
+                    log("BT-off result: ${samples.size} samples (window ${e.durationSeconds} s)")
+                }
+            }
         }
         listener?.onStateChanged(_state.value)
+    }
+
+    /**
+     * Start the BT-off GPS A/B test (BLE_QUIET 0x15, firmware v0.0.57+).
+     * The box records ~3 s of BT-on baseline, goes radio-silent for [durS]
+     * seconds while sampling its GPS RF metrics at 1 Hz (also written to the
+     * box ERRLOG as `gps_rfq:` lines), then re-inits its radio; the client
+     * auto-reconnects and [maybeFetchQuietResult] pulls the recording for
+     * the GPS Debug tab.
+     */
+    fun startQuietTest(durS: Int) {
+        val s = _state.value
+        if (s.connection != Connection.Connected) {
+            log("BT-off test: not connected")
+            return
+        }
+        if (!workerIdleForBriefOp(s)) {
+            log("BT-off test: box is busy — wait for the sync/transfer to finish")
+            return
+        }
+        briefOpInFlight = true
+        _state.update { it.copy(quietTest = QuietTestState.Arming(durS)) }
+        log("BLE_QUIET ${durS}s")
+        ble?.send(BleCmd.BleQuiet(durS))
+    }
+
+    /**
+     * Fetch the recording of the most recent BT-off window (0x16) — used
+     * automatically after the post-window reconnect and manually via the
+     * GPS Debug "Fetch last result" button (e.g. after a Failed state; the
+     * box keeps the buffer until the next test).
+     */
+    fun fetchQuietResultNow() {
+        val s = _state.value
+        if (s.connection != Connection.Connected) {
+            log("BT-off result: not connected")
+            return
+        }
+        if (!workerIdleForBriefOp(s)) {
+            log("BT-off result: box is busy — try again in a moment")
+            return
+        }
+        briefOpInFlight = true
+        _state.update { it.copy(quietTest = QuietTestState.Fetching(0)) }
+        log("BLE_QUIET_RESULT (manual)")
+        ble?.send(BleCmd.FetchQuietResult)
+    }
+
+    /**
+     * Post-reconnect half of the BT-off test: if a window was running when
+     * the link came back, wait out the box's ~5 s post phase (0x16 answers
+     * BUSY until it ends) plus the connect-time query burst, then fetch.
+     */
+    private fun maybeFetchQuietResult() {
+        val qt = _state.value.quietTest
+        if (qt !is QuietTestState.Running) return
+        _state.update { it.copy(quietTest = QuietTestState.Fetching(qt.durS)) }
+        scope.launch {
+            kotlinx.coroutines.delay(6_000)
+            val deadline = System.currentTimeMillis() + FW_VERSION_QUERY_WINDOW_MS
+            while (System.currentTimeMillis() < deadline) {
+                val s = _state.value
+                if (s.connection != Connection.Connected) return@launch
+                if (workerIdleForBriefOp(s)) {
+                    briefOpInFlight = true
+                    log("BLE_QUIET_RESULT")
+                    ble?.send(BleCmd.FetchQuietResult)
+                    return@launch
+                }
+                kotlinx.coroutines.delay(500)
+            }
+            log("BT-off result: box stayed busy — tap \"Fetch last result\" in GPS Debug")
+            _state.update { it.copy(quietTest = QuietTestState.Failed("box stayed busy after reconnect")) }
+        }
     }
 
     // ---------------- GPS Debug survey ------------------------------------

@@ -126,6 +126,23 @@ object FileSyncProtocol {
      *  to the u-blox UART. Replies arrive as bridged FileData notifies. */
     const val OP_GPS_UBX: Byte = 0x0E
 
+    // BT-off GPS A/B test (firmware v0.0.57+, issue #10 — "does the BLE radio
+    // degrade GPS reception?"). BLE_QUIET arms a timed window in which the box
+    // records ~3 s of BT-on pre-samples, disconnects, holds its BLE chip in
+    // hardware reset (radio provably silent) for the requested duration while
+    // sampling the GPS RF metrics at 1 Hz, then re-inits + re-advertises and
+    // records ~5 s of post-samples. The phone auto-reconnects and fetches the
+    // recorded buffer — the C/N0 delta BT-on vs BT-off is the verdict.
+    /** BLE_QUIET `[dur_s:u16-LE]` — arm the window (clamped 5–120 s on the
+     *  box). Replies one status byte (0x00 armed / 0xB0 busy), then the box
+     *  disconnects ~3 s later. Legacy firmware (< v0.0.57) never replies. */
+    const val OP_BLE_QUIET: Byte = 0x15
+    /** BLE_QUIET_RESULT (no payload) — fetch the recorded window after the
+     *  reconnect: one 8-byte header ('Q', version, sample_size, count:u16-LE,
+     *  dur_s:u16-LE, reserved), then `count` samples of `sample_size` bytes
+     *  packed into MTU-sized notifies. 0xB0 while the window still runs. */
+    const val OP_BLE_QUIET_RESULT: Byte = 0x16
+
     // Status bytes returned in single-byte FileData notifies.
     const val STATUS_OK: Byte = 0x00
     const val STATUS_BUSY: Byte = 0xB0.toByte()
@@ -266,6 +283,63 @@ sealed class BleCmd {
             other is SetCalibration && blob.contentEquals(other.blob)
         override fun hashCode(): Int = blob.contentHashCode()
     }
+    /**
+     * BLE_QUIET (0x15) — arm the box's BT-off GPS A/B window for
+     * `durationSeconds`. The box ACKs with a status byte (arrives as
+     * [BleEvent.QuietArmed]), then disconnects; the client auto-reconnects
+     * once the box's radio is back and fetches the recording with
+     * [FetchQuietResult]. Legacy firmware (< v0.0.57) never replies → the
+     * op times out and emits `QuietResult(0, null)`.
+     */
+    data class BleQuiet(val durationSeconds: Int) : BleCmd()
+    /**
+     * BLE_QUIET_RESULT (0x16) — fetch the recorded RF samples after the
+     * reconnect. Reply arrives as [BleEvent.QuietResult].
+     */
+    data object FetchQuietResult : BleCmd()
+}
+
+/**
+ * One 1 Hz RF sample from the box's BT-off window (16 B on the wire, field
+ * order pinned in DESIGN.md §"BLE quiet window"). `phase`: 0 = BT on (pre),
+ * 1 = BT off, 2 = BT back on (post). `avg6X10` = mean C/N0 of the 6
+ * strongest GPS+Galileo satellites ×10 (0 = no data); `rfFresh` = the
+ * MON-RF EMI fields (noise/agc/jam/ant) had a reply within 15 s.
+ */
+data class QuietSample(
+    val phase: Int,
+    val tS: Int,
+    val fixType: Int,
+    val usedSv: Int,
+    val avg6X10: Int,
+    val min6: Int,
+    val max6: Int,
+    val noise: Int,
+    val agc: Int,
+    val jamInd: Int,
+    val jamState: Int,
+    val antStatus: Int,
+    val rfFresh: Boolean,
+) {
+    companion object {
+        const val WIRE_SIZE = 16
+
+        /** Parse one sample at `off`; `size` is the box-declared sample size
+         *  (≥ [WIRE_SIZE] — extra trailing bytes from future firmware are
+         *  skipped by the caller's stride, never mis-parsed). */
+        fun parse(b: ByteArray, off: Int): QuietSample? {
+            if (off + WIRE_SIZE > b.size) return null
+            fun u8(i: Int) = b[off + i].toInt() and 0xFF
+            fun u16(i: Int) = u8(i) or (u8(i + 1) shl 8)
+            return QuietSample(
+                phase = u8(0), tS = u8(1), fixType = u8(2), usedSv = u8(3),
+                avg6X10 = u16(4), min6 = u8(6), max6 = u8(7),
+                noise = u16(8), agc = u16(10),
+                jamInd = u8(12), jamState = u8(13), antStatus = u8(14),
+                rfFresh = u8(15) != 0,
+            )
+        }
+    }
 }
 
 sealed class BleEvent {
@@ -369,4 +443,18 @@ sealed class BleEvent {
         override fun equals(other: Any?): Boolean = other is UbxFrame && data.contentEquals(other.data)
         override fun hashCode(): Int = data.contentHashCode()
     }
+    /**
+     * The box accepted BLE_QUIET (0x15) and will go BT-silent for
+     * `durationSeconds` after ~3 s of pre-samples. The disconnect that
+     * follows is expected — the client auto-reconnects once the box's
+     * radio re-inits.
+     */
+    data class QuietArmed(val durationSeconds: Int) : BleEvent()
+    /**
+     * The BT-off window recording, from a BLE_QUIET_RESULT (0x16) reply.
+     * `samples == null` = the fetch failed (op timeout / legacy firmware /
+     * link drop) — the `gps_rfq:` lines in the box ERRLOG still carry the
+     * data. An empty list is a valid "window recorded nothing" reply.
+     */
+    data class QuietResult(val durationSeconds: Int, val samples: List<QuietSample>?) : BleEvent()
 }

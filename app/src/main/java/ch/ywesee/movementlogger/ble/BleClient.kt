@@ -98,6 +98,15 @@ class BleClient(private val context: Context) {
      *  Driven by the 200 ms watchdog tick so it composes with the
      *  single-worker model without new concurrency. null = inactive. */
     private var reconnect: ReconnectState? = null
+    /**
+     * Monotonic deadline until which an unexpected disconnect is EXPECTED —
+     * set when the box ACKs BLE_QUIET (0x15): it goes BT-silent for the
+     * window and re-advertises after its chip re-init. A disconnect inside
+     * this deadline arms the normal auto-reconnect machine (30 × 2 s wait +
+     * pending connect — plenty for the max 120 s window) instead of
+     * surfacing a hard Disconnected. 0 = inactive.
+     */
+    private var quietPendingUntil: Long = 0L
     private data class ReconnectState(
         val address: String,
         var attempt: Int,
@@ -189,6 +198,7 @@ class BleClient(private val context: Context) {
             is BleCmd.Read, is BleCmd.Delete, is BleCmd.SetLogMode,
             is BleCmd.SetGpsPower, BleCmd.GetGpsPower,
             BleCmd.GetCalibration, is BleCmd.SetCalibration,
+            is BleCmd.BleQuiet, BleCmd.FetchQuietResult,
             -> awaitCmdSettle()
             else -> Unit
         }
@@ -200,6 +210,7 @@ class BleClient(private val context: Context) {
                 // the box so a deliberate disconnect doesn't bounce back.
                 reconnect = null
                 lastConnectedAddress = null
+                quietPendingUntil = 0L
                 disconnectInner(emitEvent = true)
             }
             BleCmd.List -> sendList()
@@ -219,6 +230,8 @@ class BleClient(private val context: Context) {
             BleCmd.GetGpsPower -> sendGetGpsPower()
             BleCmd.GetCalibration -> sendGetCalibration()
             is BleCmd.SetCalibration -> sendSetCalibration(cmd.blob)
+            is BleCmd.BleQuiet -> sendBleQuiet(cmd.durationSeconds)
+            BleCmd.FetchQuietResult -> sendFetchQuietResult()
         }
     }
 
@@ -321,6 +334,17 @@ class BleClient(private val context: Context) {
                 // side abort stay silent (the client keeps its optimistic
                 // local update, a re-send later is a normal path).
                 if (!o.isSet) emit(BleEvent.Calibration(null))
+            }
+            is CurrentOp.QuietArm -> {
+                // Deliberate disconnect while awaiting the arm status (the
+                // expected-window case is promoted to Idle + QuietArmed in
+                // the DISCONNECTED handler before this runs). Resolve the
+                // test as failed so the UI stops waiting.
+                emit(BleEvent.QuietResult(0, null))
+            }
+            is CurrentOp.QuietFetch -> {
+                emitErr("BT-off result fetch aborted by disconnect")
+                emit(BleEvent.QuietResult(0, null))
             }
             is CurrentOp.VersionReq -> {
                 // Link dropped mid-query — report "unknown" so the firmware
@@ -621,6 +645,53 @@ class BleClient(private val context: Context) {
     }
 
     /**
+     * BLE_QUIET (0x15 + dur_s u16-LE). Arm the box's BT-off GPS A/B window.
+     * The box replies one status byte (handled by [handleQuietArmNotify]),
+     * then disconnects ~3 s later — [quietPendingUntil] makes that expected
+     * disconnect arm the auto-reconnect machine instead of a hard
+     * Disconnected. Legacy firmware (< v0.0.57) never replies → the 20 s op
+     * watchdog emits `QuietResult(0, null)`.
+     */
+    private fun sendBleQuiet(durS: Int) {
+        if (op !is CurrentOp.Idle) {
+            emitErr("BT-off test rejected — another op in flight")
+            emit(BleEvent.QuietResult(0, null))
+            return
+        }
+        val d = durS.coerceIn(5, 120)
+        val payload = byteArrayOf(
+            FileSyncProtocol.OP_BLE_QUIET,
+            (d and 0xFF).toByte(),
+            ((d shr 8) and 0xFF).toByte(),
+        )
+        if (!writeCmdBytes(payload)) {
+            emit(BleEvent.QuietResult(0, null))
+            return
+        }
+        op = CurrentOp.QuietArm(durS = d, lastProgress = now())
+    }
+
+    /**
+     * BLE_QUIET_RESULT (0x16). Fetch the recorded window after the
+     * reconnect; [handleQuietFetchNotify] reassembles header + samples.
+     */
+    private fun sendFetchQuietResult() {
+        if (op !is CurrentOp.Idle) {
+            emitErr("BT-off result fetch rejected — another op in flight")
+            emit(BleEvent.QuietResult(0, null))
+            return
+        }
+        if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_BLE_QUIET_RESULT))) {
+            emit(BleEvent.QuietResult(0, null))
+            return
+        }
+        op = CurrentOp.QuietFetch(
+            expected = -1, sampleSize = QuietSample.WIRE_SIZE, durS = 0,
+            buf = ArrayList(), lastProgress = now(),
+        )
+    }
+
+    /**
      * SET_TIME `0x08 + epoch_ms(u64-LE)`: hand the box the phone's wall
      * clock so it stamps a `# SYNC` anchor into the open Sens/Gps CSVs.
      * Deliberately *fire-and-forget* — it does NOT occupy a [CurrentOp]
@@ -794,11 +865,24 @@ class BleClient(private val context: Context) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 emitErr("disconnected (status $status)")
             }
+            // BT-off window: a disconnect while the QuietArm op is still
+            // in flight means the box's status notify was eaten by ACL
+            // congestion but the window is evidently running — the
+            // disconnect ~3 s after 0x15 IS the confirmation. Promote it
+            // to an armed window so the reconnect machine takes over.
+            (op as? CurrentOp.QuietArm)?.let { qa ->
+                quietPendingUntil = now() + 3_000L + qa.durS * 1_000L + 30_000L
+                op = CurrentOp.Idle
+                emit(BleEvent.QuietArmed(qa.durS))
+                emit(BleEvent.Status("BT-off window running (status notify lost) — auto-reconnecting after"))
+            }
             val wasTransfer = op is CurrentOp.Reading
-            if (wasTransfer && lastConnectedAddress != null && reconnect == null) {
-                // Mid-READ remote drop: keep the partial (disconnectInner
-                // emits ReadAborted) and auto-reconnect instead of a hard
-                // Disconnected (desktop v0.0.11/12).
+            val quietExpected = now() < quietPendingUntil
+            if ((wasTransfer || quietExpected) && lastConnectedAddress != null && reconnect == null) {
+                // Mid-READ remote drop (keep the partial; disconnectInner
+                // emits ReadAborted) or the expected BT-off disconnect:
+                // auto-reconnect instead of a hard Disconnected
+                // (desktop v0.0.11/12).
                 armReconnect()
             } else if (reconnect == null) {
                 disconnectInner(emitEvent = true)
@@ -957,6 +1041,72 @@ class BleClient(private val context: Context) {
             is CurrentOp.CalReq -> handleCalibrationNotify(current, value)
             is CurrentOp.VersionReq -> handleVersionNotify(value)
             is CurrentOp.Uploading -> handleUploadNotify(current, value)
+            is CurrentOp.QuietArm -> handleQuietArmNotify(current, value)
+            is CurrentOp.QuietFetch -> handleQuietFetchNotify(current, value)
+        }
+    }
+
+    /** BLE_QUIET status reply: 0x00 = window armed (the disconnect that
+     *  follows in ~3 s is expected — extend [quietPendingUntil] so it arms
+     *  the auto-reconnect), anything else = rejected. */
+    private fun handleQuietArmNotify(state: CurrentOp.QuietArm, value: ByteArray) {
+        if (value.isEmpty()) return  // tolerate stray
+        op = CurrentOp.Idle
+        val b = value[0]
+        if (b == FileSyncProtocol.STATUS_OK) {
+            // pre (3 s) + window + chip re-init (~4 s) + generous slack for
+            // the reconnect itself.
+            quietPendingUntil = now() + 3_000L + state.durS * 1_000L + 30_000L
+            emit(BleEvent.QuietArmed(state.durS))
+            emit(BleEvent.Status(
+                "BT-off window armed (${state.durS} s) — box disconnects shortly, auto-reconnecting after"
+            ))
+        } else {
+            emitErr("BT-off test rejected by box: ${FileSyncProtocol.statusMessage(b)}")
+            emit(BleEvent.QuietResult(0, null))
+        }
+    }
+
+    /**
+     * BLE_QUIET_RESULT reassembly: first notify is the 8-byte header
+     * (`'Q'`, version, sample_size, count u16-LE, dur_s u16-LE, reserved) —
+     * or a single 0xB0 BUSY byte while the window still runs. Then samples
+     * accumulate (the box packs as many whole samples per notify as the MTU
+     * allows) until `count × sample_size` bytes arrived. The box-declared
+     * sample_size is the stride, so future firmware may grow the record
+     * without breaking this parser.
+     */
+    private fun handleQuietFetchNotify(state: CurrentOp.QuietFetch, value: ByteArray) {
+        state.lastProgress = now()
+        if (state.expected < 0) {
+            if (value.size == 1 && FileSyncProtocol.isStatusByte(value[0])) {
+                op = CurrentOp.Idle
+                emitErr("BT-off result: box replied ${FileSyncProtocol.statusMessage(value[0])}")
+                emit(BleEvent.QuietResult(0, null))
+                return
+            }
+            if (value.size < 8 || value[0] != 'Q'.code.toByte()) {
+                op = CurrentOp.Idle
+                emitErr("BT-off result: unexpected reply (${value.size} B)")
+                emit(BleEvent.QuietResult(0, null))
+                return
+            }
+            state.sampleSize = (value[2].toInt() and 0xFF).coerceAtLeast(QuietSample.WIRE_SIZE)
+            state.expected = (value[3].toInt() and 0xFF) or ((value[4].toInt() and 0xFF) shl 8)
+            state.durS = (value[5].toInt() and 0xFF) or ((value[6].toInt() and 0xFF) shl 8)
+            for (i in 8 until value.size) state.buf.add(value[i])
+        } else {
+            for (b in value) state.buf.add(b)
+        }
+        if (state.buf.size >= state.expected * state.sampleSize) {
+            val bytes = state.buf.toByteArray()
+            val samples = ArrayList<QuietSample>(state.expected)
+            for (i in 0 until state.expected) {
+                QuietSample.parse(bytes, i * state.sampleSize)?.let { samples.add(it) }
+            }
+            op = CurrentOp.Idle
+            emit(BleEvent.QuietResult(state.durS, samples))
+            emit(BleEvent.Status("BT-off result: ${samples.size} samples (window ${state.durS} s)"))
         }
     }
 
@@ -1489,6 +1639,11 @@ class BleClient(private val context: Context) {
             is CurrentOp.ModeReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.GpsPwrReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.CalReq -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
+            // The arm status comes within one connection interval or never
+            // (legacy firmware < v0.0.57 ignores 0x15) — same regime as
+            // GET_VERSION, so use its short budget for the legacy verdict.
+            is CurrentOp.QuietArm -> now - o.lastProgress > VERSION_REQ_TIMEOUT_MS
+            is CurrentOp.QuietFetch -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
             is CurrentOp.VersionReq -> now - o.lastProgress > VERSION_REQ_TIMEOUT_MS
             // Uploading is handled by tickUploadWatchdog above (early return),
             // so it never reaches here — branch present only for exhaustiveness.
@@ -1524,6 +1679,14 @@ class BleClient(private val context: Context) {
                 // its local AgentConfig. On a SET-side timeout stay silent — the
                 // client keeps its optimistic local update.
                 if (!o.isSet) emit(BleEvent.Calibration(null))
+            }
+            is CurrentOp.QuietArm -> {
+                emitErr("BT-off test: no reply — box firmware may be older than v0.0.57")
+                emit(BleEvent.QuietResult(0, null))
+            }
+            is CurrentOp.QuietFetch -> {
+                emitErr("BT-off result timed out — the gps_rfq lines in the box ERRLOG still carry the data")
+                emit(BleEvent.QuietResult(0, null))
             }
             is CurrentOp.VersionReq -> {
                 // Legacy firmware (≤ v0.0.28) never replies to GET_VERSION.
@@ -1727,6 +1890,23 @@ class BleClient(private val context: Context) {
             override fun hashCode(): Int =
                 31 * (31 * isSet.hashCode() + blob.contentHashCode()) + lastProgress.hashCode()
         }
+        /** BLE_QUIET (0x15) sent, awaiting the 1-byte armed/rejected status. */
+        data class QuietArm(
+            val durS: Int,
+            var lastProgress: Long,
+        ) : CurrentOp()
+        /**
+         * BLE_QUIET_RESULT (0x16) reassembly. `expected` = sample count from
+         * the header (-1 = header not yet received); `sampleSize` = the
+         * box-declared per-sample stride; `buf` accumulates raw sample bytes.
+         */
+        data class QuietFetch(
+            var expected: Int,
+            var sampleSize: Int,
+            var durS: Int,
+            val buf: ArrayList<Byte>,
+            var lastProgress: Long,
+        ) : CurrentOp()
         /**
          * Firmware OTA upload (FW_BEGIN → FW_DATA… → FW_COMMIT). ACK-gated:
          * exactly one FW_* write is in flight at a time and we advance only
