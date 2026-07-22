@@ -5,9 +5,11 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -39,11 +41,13 @@ import kotlinx.coroutines.withContext
 /**
  * Merges multiple rider clips into one film.
  *
- * The film opens with a 3 s black intro card — "MovementLogger" centered
- * at ~86 % of the output width, each letter colored along the logo
- * gradient (orange → teal → blue → purple, linearly interpolated per
- * letter). Then, per clip in chronological order (sorted by container
- * `creation_time` before this is called):
+ * The film opens with a 3 s intro over the FIRST clip's first frame
+ * (aspect-fit into the video region) — "MovementLogger" centered at ~86 %
+ * of the output width, each letter colored along the logo gradient
+ * (orange → teal → blue → purple) and drawn semi-transparently with a soft
+ * shadow so the footage shows through; it falls back to lettering on black
+ * when the frame can't be extracted. Then, per clip in chronological order
+ * (sorted by container `creation_time` before this is called):
  *
  *   1. A black title card (~2.5 s) with the clip's recording date
  *      (dd.MM.yyyy) above its start time (HH:mm:ss), local timezone.
@@ -67,10 +71,12 @@ import kotlinx.coroutines.withContext
  * segment keeps the panels (cursor pinned at the clip's end) under its
  * fade.
  *
- * The film closes with a single 5 s Pump Tsüri logo outro — ONCE at the
- * very end (after the last freeze's fade-out), not per clip: the foil
- * logo (`R.drawable.pump_logo`, transparent background) centered at
- * ~45 % of the output height on black.
+ * The film closes with a single 3 s animated "pumping" outro — ONCE at the
+ * very end (after the last freeze's fade-out), not per clip: the foil logo
+ * (`R.drawable.pump_logo`, transparent) rocks about its wings + a synced
+ * vertical bob + squash (cadence/amplitudes mapped from Ayano's pumping
+ * footage) over a sky→sea gradient, fading in from the black the last
+ * freeze leaves and back out to black.
  *
  * Everything is one `EditedMediaItemSequence` (intro, card, clip, freeze,
  * card, clip, freeze, …, outro) so Media3 Transformer concatenates
@@ -93,8 +99,8 @@ object VideoMerger {
      */
     private const val FREEZE_US = 3_000_000L
 
-    /** Pump Tsüri logo outro at the very end of the film. */
-    private const val OUTRO_US = 5_000_000L
+    /** Animated pumping-foil outro at the very end of the film. */
+    private const val OUTRO_US = 3_000_000L
 
     private const val CARD_FPS = 30
 
@@ -107,6 +113,23 @@ object VideoMerger {
         intArrayOf(62, 141, 243),
         intArrayOf(125, 77, 240),
     )
+
+    // ---- Pumping-foil outro (mapped from Ayano's IMG_5266.MOV pumping
+    // footage): the foil icon rocks about its wings + a synced vertical bob +
+    // squash over a sky→sea gradient, fading in from black and back out.
+    private const val PUMP_FPS = 30
+    private const val PUMP_PERIOD_S = 1.05        // ~3 pumps over 3 s
+    private const val PUMP_PITCH_DEG = 11.0       // rock amplitude (°)
+    private const val PUMP_HEAVE_FRAC = 0.021     // vertical bob (of height)
+    private const val PUMP_SQUASH = 0.035         // compress/extend
+    private const val PUMP_LOGO_FRAC = 0.55f      // foil size (of height)
+    private const val PUMP_PIVOT_FRAC = 0.78f     // wings pivot (down the foil)
+    private const val PUMP_FADE_IN_US = 350_000L
+    private const val PUMP_FADE_OUT_US = 750_000L
+    /** Sky → horizon → sea gradient stops for the outro background. */
+    private val PUMP_SKY = intArrayOf(189, 227, 245)
+    private val PUMP_HORIZON = intArrayOf(107, 184, 212)
+    private val PUMP_SEA = intArrayOf(28, 87, 128)
 
     /** One source clip with its probed size/duration + capture time. */
     data class Clip(
@@ -170,6 +193,12 @@ object VideoMerger {
         // them up by URI (mime set explicitly, no extension sniffing).
         val cardDir = File(context.cacheDir, "exports/cards").apply { mkdirs() }
         val stamp = System.currentTimeMillis()
+        // Video region excludes the panel area (== full canvas for a plain
+        // merge). The intro title floats over the first frame within it.
+        val videoRegionH = plan.outHeight - plan.panelsHeightTotal
+        // The foil logo drives the animated outro; held (not recycled) until
+        // the export finishes since the outro overlay reads it per frame.
+        val pumpLogo: Bitmap? = BitmapFactory.decodeResource(context.resources, R.drawable.pump_logo)
         val stills = withContext(Dispatchers.IO) {
             fun writePng(name: String, bmp: Bitmap): File {
                 val f = File(cardDir, name)
@@ -177,8 +206,12 @@ object VideoMerger {
                 bmp.recycle()
                 return f
             }
-            Stills(
-                intro = writePng("intro_$stamp.png", renderIntroCard(plan.outWidth, plan.outHeight)),
+            val firstFrame = extractFirstFrame(context, clips.first())
+            val s = Stills(
+                intro = writePng(
+                    "intro_$stamp.png",
+                    renderIntroCard(plan.outWidth, plan.outHeight, videoRegionH, firstFrame),
+                ),
                 cards = clips.mapIndexed { i, clip ->
                     writePng(
                         "card_${stamp}_$i.png",
@@ -188,8 +221,12 @@ object VideoMerger {
                 freezes = clips.mapIndexed { i, clip ->
                     writePng("freeze_${stamp}_$i.png", extractLastFrame(context, clip))
                 },
-                outro = writePng("outro_$stamp.png", renderOutroCard(context, plan.outWidth, plan.outHeight)),
+                // The outro base is the sky→sea gradient; the pumping foil +
+                // fade ride on top as overlays (see buildSequenceItems).
+                outro = writePng("outro_$stamp.png", renderSkySeaGradient(plan.outWidth, plan.outHeight)),
             )
+            firstFrame?.recycle()
+            s
         }
 
         val outDir = File(context.cacheDir, "exports").apply { mkdirs() }
@@ -202,7 +239,7 @@ object VideoMerger {
             // duration), so each clip's overlays carry the clip's global
             // start offset to recover clip-local time.
             val items = withContext(Dispatchers.Default) {
-                buildSequenceItems(clips, stills, session, plan)
+                buildSequenceItems(clips, stills, session, plan, pumpLogo)
             }
 
             val composition = Composition.Builder(EditedMediaItemSequence(items))
@@ -225,6 +262,7 @@ object VideoMerger {
         } finally {
             outFile.delete()
             stills.allFiles().forEach { it.delete() }
+            pumpLogo?.recycle()
         }
     }
 
@@ -248,6 +286,7 @@ object VideoMerger {
         stills: Stills,
         session: SensorSession?,
         plan: VideoExporter.OutputPlan,
+        pumpLogo: Bitmap?,
     ): List<EditedMediaItem> {
         // Shared full-frame opaque black bitmap for every fade-out.
         val black = Bitmap.createBitmap(plan.outWidth, plan.outHeight, Bitmap.Config.ARGB_8888)
@@ -341,9 +380,35 @@ object VideoMerger {
             cursorUs += FREEZE_US
         }
 
-        // (4) Pump Tsüri logo outro — ONCE at the very end of the film,
-        // after the last freeze's fade-out.
-        items += stillItem(stills.outro, OUTRO_US)
+        // (4) Pumping-foil outro — ONCE at the very end, after the last
+        // freeze's fade-out. The sky→sea gradient still is the base; the foil
+        // rocks about its wings on top (PumpFoilOverlay), and a two-sided
+        // black fade brings it in from the freeze's black and back out.
+        val outroStartUs = cursorUs
+        val outroOverlays = ArrayList<TextureOverlay>()
+        if (pumpLogo != null) {
+            outroOverlays += PumpFoilOverlay(
+                plan.outWidth, plan.outHeight, pumpLogo, outroStartUs, OUTRO_US,
+            )
+        }
+        outroOverlays += FadeInOutBlackOverlay(
+            black, outroStartUs, OUTRO_US, PUMP_FADE_IN_US, PUMP_FADE_OUT_US,
+        )
+        items += EditedMediaItem.Builder(
+            MediaItem.Builder()
+                .setUri(Uri.fromFile(stills.outro))
+                .setMimeType(MimeTypes.IMAGE_PNG)
+                .build(),
+        )
+            .setDurationUs(OUTRO_US)
+            .setFrameRate(CARD_FPS)
+            .setEffects(
+                Effects(
+                    /* audioProcessors = */ emptyList(),
+                    listOf<Effect>(presentation, OverlayEffect(ImmutableList.copyOf(outroOverlays))),
+                ),
+            )
+            .build()
         return items
     }
 
@@ -386,6 +451,24 @@ object VideoMerger {
     }
 
     /**
+     * The FIRST clip's first frame for the intro background, in display
+     * orientation. Null on failure — the intro then falls back to lettering
+     * on solid black.
+     */
+    private fun extractFirstFrame(context: Context, clip: Clip): Bitmap? {
+        val mmr = MediaMetadataRetriever()
+        return try {
+            mmr.setDataSource(context, clip.uri)
+            mmr.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: mmr.getFrameAtTime(0L)
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { mmr.release() }
+        }
+    }
+
+    /**
      * The clip's last frame for the freeze segment, in display
      * orientation (getFrameAtTime applies container rotation). Falls back
      * to a representative frame, then plain black — the fade still works
@@ -413,14 +496,31 @@ object VideoMerger {
     }
 
     /**
-     * Intro card: "MovementLogger" centered on black, sized so the word
-     * spans ~86 % of the output width, each letter colored along the logo
-     * gradient (linear interpolation across the 14 characters).
+     * Intro card: the first clip's first frame (aspect-fit into the video
+     * region, black letterbox) with "MovementLogger" centered over it, sized
+     * so the word spans ~86 % of the width, each letter colored along the
+     * logo gradient. Over footage the lettering is semi-transparent (0.85 α)
+     * with a soft shadow so the frame shows through; on a null background it
+     * renders fully opaque on solid black (the legacy intro).
      */
-    private fun renderIntroCard(w: Int, h: Int): Bitmap {
+    private fun renderIntroCard(w: Int, h: Int, videoRegionH: Int, background: Bitmap?): Bitmap {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         canvas.drawColor(Color.BLACK)
+        val regionH = if (videoRegionH > 0) videoRegionH else h
+        if (background != null && background.width > 0 && background.height > 0) {
+            val fit = minOf(
+                w.toFloat() / background.width, regionH.toFloat() / background.height,
+            )
+            val fw = background.width * fit
+            val fh = background.height * fit
+            val left = (w - fw) / 2f
+            val top = (regionH - fh) / 2f
+            canvas.drawBitmap(
+                background, null, RectF(left, top, left + fw, top + fh),
+                Paint(Paint.FILTER_BITMAP_FLAG).apply { isAntiAlias = true },
+            )
+        }
         val paint = Paint().apply {
             isAntiAlias = true
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
@@ -429,11 +529,18 @@ object VideoMerger {
         // Scale the text so the full word spans ~86 % of the width.
         val measured = paint.measureText(INTRO_TEXT)
         if (measured > 0f) paint.textSize = 100f * (w * 0.86f) / measured
+        val alpha = if (background != null) 217 else 255   // 0.85 over footage
+        if (background != null) {
+            paint.setShadowLayer(paint.textSize * 0.08f, 0f, 0f, Color.argb(180, 0, 0, 0))
+        }
         val fm = paint.fontMetrics
-        val baseline = h / 2f - (fm.ascent + fm.descent) / 2f
+        // Center the title within the VIDEO region (over the frame), not the
+        // full canvas — matters when panels extend the canvas downward.
+        val baseline = regionH / 2f - (fm.ascent + fm.descent) / 2f
         var x = (w - paint.measureText(INTRO_TEXT)) / 2f
         for ((i, ch) in INTRO_TEXT.withIndex()) {
-            paint.color = introLetterColor(i, INTRO_TEXT.length)
+            val c0 = introLetterColor(i, INTRO_TEXT.length)
+            paint.color = Color.argb(alpha, Color.red(c0), Color.green(c0), Color.blue(c0))
             val s = ch.toString()
             canvas.drawText(s, x, baseline, paint)
             x += paint.measureText(s)
@@ -454,25 +561,52 @@ object VideoMerger {
         return Color.rgb(lerp(a[0], b[0]), lerp(a[1], b[1]), lerp(a[2], b[2]))
     }
 
-    /**
-     * Outro card: black background at the output resolution with the Pump
-     * Tsüri foil logo (transparent PNG) drawn centered at ~45 % of the
-     * output height, aspect preserved, alpha respected.
-     */
-    private fun renderOutroCard(context: Context, w: Int, h: Int): Bitmap {
+    /** Sky → horizon → sea vertical gradient — the pumping outro background. */
+    private fun renderSkySeaGradient(w: Int, h: Int): Bitmap {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
-        canvas.drawColor(Color.BLACK)
-        val logo = BitmapFactory.decodeResource(context.resources, R.drawable.pump_logo)
-        if (logo != null) {
-            val targetH = h * 0.45f
-            val targetW = targetH * logo.width.toFloat() / logo.height.toFloat()
-            val left = (w - targetW) / 2f
-            val top = (h - targetH) / 2f
-            val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply { isAntiAlias = true }
-            canvas.drawBitmap(logo, null, RectF(left, top, left + targetW, top + targetH), paint)
-            logo.recycle()
-        }
+        val grad = LinearGradient(
+            0f, 0f, 0f, h.toFloat(),
+            intArrayOf(
+                Color.rgb(PUMP_SKY[0], PUMP_SKY[1], PUMP_SKY[2]),
+                Color.rgb(PUMP_HORIZON[0], PUMP_HORIZON[1], PUMP_HORIZON[2]),
+                Color.rgb(PUMP_SEA[0], PUMP_SEA[1], PUMP_SEA[2]),
+            ),
+            floatArrayOf(0f, 0.52f, 1f), Shader.TileMode.CLAMP,
+        )
+        canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), Paint().apply { shader = grad })
+        return bmp
+    }
+
+    /**
+     * One frame of the pumping foil (transparent background, full canvas):
+     * the foil rocks ±PUMP_PITCH_DEG about its wings + a synced vertical bob
+     * + squash. Frame `i` of `n`. Composited over the gradient base by
+     * `PumpFoilOverlay`; the fade is a separate overlay.
+     */
+    private fun renderPumpFoilFrame(w: Int, h: Int, logo: Bitmap, i: Int, n: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)   // transparent
+        val canvas = Canvas(bmp)
+        val secs = i.toDouble() / PUMP_FPS
+        val phase = 2.0 * Math.PI / PUMP_PERIOD_S * secs
+        val logoH = h * PUMP_LOGO_FRAC
+        val logoW = logoH * logo.width.toFloat() / logo.height.toFloat()
+        val left = (w - logoW) / 2f
+        val top = (h - logoH) / 2f
+        val pivotX = left + logoW / 2f
+        val pivotY = top + PUMP_PIVOT_FRAC * logoH   // wings, down from the top
+        val thetaDeg = (PUMP_PITCH_DEG * Math.sin(phase)).toFloat()
+        val dyPx = (-PUMP_HEAVE_FRAC * h * Math.sin(phase)).toFloat()   // rise on nose-up
+        val sy = (1.0 - PUMP_SQUASH * Math.cos(phase)).toFloat()        // squash at compress
+        canvas.save()
+        canvas.translate(0f, dyPx)                 // heave
+        canvas.rotate(thetaDeg, pivotX, pivotY)    // rock about the wings
+        canvas.scale(1f, sy, pivotX, pivotY)       // squash about the wings
+        canvas.drawBitmap(
+            logo, null, RectF(left, top, left + logoW, top + logoH),
+            Paint(Paint.FILTER_BITMAP_FLAG).apply { isAntiAlias = true },
+        )
+        canvas.restore()
         return bmp
     }
 
@@ -555,6 +689,64 @@ object VideoMerger {
             val alpha = (localUs.toFloat() / segmentDurationUs.coerceAtLeast(1L).toFloat())
                 .coerceIn(0f, 1f)
             return OverlaySettings.Builder().setAlphaScale(alpha).build()
+        }
+    }
+
+    /**
+     * Full-frame overlay that draws the pumping foil (transformed per frame)
+     * over the outro's gradient base. Mirrors iOS `pumpFrameImage`: the foil
+     * rocks about its wings + bobs + squashes on a sine of the segment-local
+     * time. A fresh bitmap per frame (like `ClipPanelsOverlay`) so Media3
+     * re-uploads the changed texture each output frame.
+     */
+    private class PumpFoilOverlay(
+        private val w: Int,
+        private val h: Int,
+        private val logo: Bitmap,
+        private val segmentStartUs: Long,
+        private val segmentDurationUs: Long,
+    ) : BitmapOverlay() {
+
+        private val settings: OverlaySettings = OverlaySettings.Builder().build()
+        private val frames: Int =
+            (segmentDurationUs * PUMP_FPS / 1_000_000L).toInt().coerceAtLeast(1)
+
+        override fun getBitmap(presentationTimeUs: Long): Bitmap {
+            val localUs = (presentationTimeUs - segmentStartUs).coerceIn(0L, segmentDurationUs)
+            val i = (localUs * PUMP_FPS / 1_000_000L).toInt().coerceIn(0, frames - 1)
+            return renderPumpFoilFrame(w, h, logo, i, frames)
+        }
+
+        override fun getOverlaySettings(presentationTimeUs: Long): OverlaySettings = settings
+    }
+
+    /**
+     * Full-frame black overlay whose alpha fades IN from black over the first
+     * `fadeInUs` and OUT to black over the last `fadeOutUs` of a segment.
+     * Used to bring the pumping outro in from the freeze's black and back out
+     * to end the film. Reuses the single shared `black` bitmap.
+     */
+    private class FadeInOutBlackOverlay(
+        private val black: Bitmap,
+        private val segmentStartUs: Long,
+        private val segmentDurationUs: Long,
+        private val fadeInUs: Long,
+        private val fadeOutUs: Long,
+    ) : BitmapOverlay() {
+
+        override fun getBitmap(presentationTimeUs: Long): Bitmap = black
+
+        override fun getOverlaySettings(presentationTimeUs: Long): OverlaySettings {
+            val localUs = (presentationTimeUs - segmentStartUs).coerceIn(0L, segmentDurationUs)
+            val cover = when {
+                localUs < fadeInUs ->
+                    1f - localUs.toFloat() / fadeInUs.coerceAtLeast(1L).toFloat()
+                localUs > segmentDurationUs - fadeOutUs ->
+                    (localUs - (segmentDurationUs - fadeOutUs)).toFloat() /
+                        fadeOutUs.coerceAtLeast(1L).toFloat()
+                else -> 0f
+            }.coerceIn(0f, 1f)
+            return OverlaySettings.Builder().setAlphaScale(cover).build()
         }
     }
 }
