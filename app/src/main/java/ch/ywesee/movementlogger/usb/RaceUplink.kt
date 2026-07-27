@@ -49,6 +49,9 @@ object RaceUplink {
         val source: String = SOURCE_UBLOX,
         /** Optional shared race token — must match the desktop's. */
         val race: String = "",
+        /** Phone strapped to the board — also stream board pitch/roll/yaw +
+         *  height (from [PhoneMotion]). Only meaningful with the phone source. */
+        val boardMounted: Boolean = false,
         val sent: Long = 0,
         val lastError: String? = null,
     )
@@ -79,8 +82,21 @@ object RaceUplink {
                 port = p.getInt("port", DEFAULT_PORT),
                 source = p.getString("source", SOURCE_UBLOX) ?: SOURCE_UBLOX,
                 race = p.getString("race", "") ?: "",
+                boardMounted = p.getBoolean("board", false),
             )
         }
+    }
+
+    /** Phone-on-board toggle: also stream board angles + height. Starts/stops
+     *  the [PhoneMotion] sensor listener when a phone-source uplink is live. */
+    fun setBoardMounted(on: Boolean) {
+        _state.update { it.copy(boardMounted = on) }
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()
+            ?.putBoolean("board", on)?.apply()
+        val ctx = appContext ?: return
+        val cfg = _state.value
+        if (on && cfg.enabled && cfg.source == SOURCE_PHONE) PhoneMotion.start(ctx)
+        else if (!on) PhoneMotion.stop()
     }
 
     fun configure(
@@ -111,9 +127,11 @@ object RaceUplink {
             // UbloxGpsCore while its reader/service run.
             if (_state.value.source == SOURCE_PHONE && ctx != null) {
                 RaceGpsService.start(ctx)
+                if (_state.value.boardMounted) PhoneMotion.start(ctx)
             }
         } else {
             if (ctx != null) RaceGpsService.stop(ctx)
+            PhoneMotion.stop()
             executor.execute {
                 socket?.close()
                 socket = null
@@ -187,6 +205,7 @@ object RaceUplink {
             sat = sats,
             src = SOURCE_PHONE,
             race = cfg.race,
+            board = if (cfg.boardMounted) PhoneMotion.snapshot() else null,
         )
         executor.execute {
             try {
@@ -202,12 +221,15 @@ object RaceUplink {
         }
     }
 
-    /** JSON wire encoding — pulled out so the unit test locks the format. */
+    /** JSON wire encoding — pulled out so the unit test locks the format.
+     *  When [board] is set the datagram is tagged `typ:"board"` and carries the
+     *  phone's board pitch/roll/yaw + height, so a board-mounted phone plots on
+     *  the race map WITH angles (same wire format as the iOS watch/phone). */
     internal fun encode(
         rider: String, lat: Double, lon: Double,
         kmh: Double?, deg: Double?, ts: Long, batt: Int,
         accM: Double? = null, sat: Int = -1, src: String = SOURCE_UBLOX,
-        race: String = "",
+        race: String = "", board: BoardSnapshot? = null,
     ): ByteArray {
         val o = JSONObject()
         o.put("v", 1)
@@ -222,6 +244,22 @@ object RaceUplink {
         if (accM != null && accM.isFinite() && accM > 0) o.put("acc", accM)
         if (sat > 0) o.put("sat", sat)
         if (race.isNotBlank()) o.put("race", race)
+        if (board != null) {
+            o.put("typ", "board")
+            o.put("run", 1)
+            o.put("z", if (board.zeroed) 1 else 0)
+            if (board.pitch.isFinite()) o.put("p", board.pitch)
+            if (board.roll.isFinite()) o.put("r", board.roll)
+            if (board.yaw.isFinite()) o.put("y", board.yaw)
+            if (board.altM.isFinite()) o.put("alt", board.altM)
+            if (board.pressureHPa.isFinite()) o.put("hpa", board.pressureHPa)
+        }
         return o.toString().toByteArray(Charsets.UTF_8)
     }
+
+    /** Board attitude + height folded into a phone rider's datagram. */
+    data class BoardSnapshot(
+        val pitch: Double, val roll: Double, val yaw: Double,
+        val altM: Double, val pressureHPa: Double, val zeroed: Boolean,
+    )
 }

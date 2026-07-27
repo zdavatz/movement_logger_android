@@ -379,6 +379,40 @@ the Race card requests it on enable; the manifest permission is now
 uncapped (it was `maxSdkVersion=30` for legacy BLE) but the BLE flow on
 31+ still never asks for location.
 
+## Race map tab — live multi-rider map (v0.0.66+, ported from iOS)
+
+The **Race** tab (`ui/RaceMapScreen.kt`, `MainNav` `Dest.Race`) is the
+port of the iOS Race tab: an interactive **osmdroid** map (MAPNIK tiles,
+the same lib as the ride map) with a heading-rotated marker + trail per
+rider and a bottom **data panel** — speed + board pitch/roll/yaw + water
+temp + height + accuracy + battery. Fed by **`usb/RaceViewer.kt`**, a
+relay *viewer* (`object`, `StateFlow<Map<String,RaceRider>>`) that
+`DatagramSocket`-subscribes to the relay (`{"sub":true,"race":token}` every
+8 s on a daemon thread) and merges position-only race fixes with
+`typ:"board"` snapshots by rider name; trail shaping mirrors `race.rs`
+(1500 pts / 3 m dead-band / 20 m accuracy gate / >12 s greys out). Because
+the relay + wire format are shared, **iOS, Android and desktop riders all
+appear on the same map**.
+
+- **Phone as a rider + board mode.** The Race tab's settings dialog has a
+  "Track this phone" switch (enables `RaceUplink` with `source=phone` → the
+  existing `RaceGpsService` streams GPS to the relay) and a "Board-mounted"
+  switch that also streams **pitch/roll/yaw + height** via
+  `usb/PhoneMotion.kt` (`SensorManager` `TYPE_ROTATION_VECTOR` tared
+  attitude + `TYPE_PRESSURE`, the Android twin of iOS `PhoneMotion`), folded
+  into `RaceUplink.encode(board=…)` as a `typ:"board"` datagram. "Zero here"
+  tares the mount. **Barometer is optional on Android** — height just stays
+  absent (angles still stream) on phones without `TYPE_PRESSURE`; neither
+  sensor needs a runtime permission.
+- **Rider name defaults to the device's own name** (`Settings.Global
+  device_name` → `bluetooth_name` → `Build.MODEL`), editable. The settings
+  dialog also edits the **relay host/port + race token** (persisted in the
+  `movement_logger_race` prefs via `RaceUplink.configure`), so the same
+  config drives the uplink and the viewer. Default relay `ml.ywesee.com:47777`.
+- **Excluded (Apple-Watch-only, no Wear module here):** water-temperature /
+  submersion, watch board-angle live, watch IMU logging, WatchConnectivity.
+  The map still *shows* `wt` when a watch rider (iOS) streams it.
+
 ## GPS Debug tab — u-blox UBX survey over BLE
 
 Live u-blox diagnostics for antenna selection/mounting, bridged over the box's
