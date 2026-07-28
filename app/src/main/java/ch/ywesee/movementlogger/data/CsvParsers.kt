@@ -172,6 +172,9 @@ object CsvParsers {
             val line = reader.readLine() ?: break
             lineNo++
             if (line.isBlank()) continue
+            // `# SYNC …` markers (firmware SET_TIME / PhoneLoggerCore) — this
+            // parser is strict per-row, so comments must be skipped explicitly.
+            if (line.startsWith("#")) continue
             val r = splitTrim(line)
             try {
                 out.add(
@@ -270,6 +273,7 @@ object CsvParsers {
             val line = reader.readLine() ?: break
             lineNo++
             if (line.isBlank()) continue
+            if (line.startsWith("#")) continue
             val r = splitTrim(line)
             try {
                 out.add(

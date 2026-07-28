@@ -322,8 +322,17 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         val dir = appContext?.getExternalFilesDir(null) ?: appContext?.filesDir ?: return
         val activeName = if (_state.value.isLogging) csvFile?.name else null
         scope.launch {
+            // GpsPhone_* recordings come from PhoneLoggerCore (same schema);
+            // its in-flight file is excluded — the size changes every second,
+            // which would defeat the (name, size) stats cache and re-parse a
+            // growing file on every pass (the 11.7.2026 OOM lesson).
+            val phoneActive = PhoneLoggerCore.activeGpsName
             val files = dir.listFiles()
-                ?.filter { it.isFile && it.name.startsWith("UbloxGps_") && it.name.endsWith(".csv") }
+                ?.filter {
+                    it.isFile && it.name.endsWith(".csv") &&
+                        (it.name.startsWith("UbloxGps_") || it.name.startsWith("GpsPhone_")) &&
+                        it.name != phoneActive
+                }
                 .orEmpty()
             val list = files.map { f ->
                 val s = statsFor(f, isActive = f.name == activeName)
@@ -364,6 +373,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      */
     fun deleteRecording(name: String) {
         if (_state.value.isLogging && name == csvFile?.name) return
+        if (name == PhoneLoggerCore.activeGpsName) return
         scope.launch {
             val dir = appContext?.getExternalFilesDir(null) ?: appContext?.filesDir
             runCatching { dir?.let { File(it, name).delete() } }

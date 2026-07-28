@@ -67,6 +67,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ch.ywesee.movementlogger.usb.GpsRecording
+import ch.ywesee.movementlogger.usb.PhoneLoggerCore
 import ch.ywesee.movementlogger.usb.RaceUplink
 import ch.ywesee.movementlogger.usb.UbloxGpsCore
 import kotlinx.coroutines.Dispatchers
@@ -142,6 +143,9 @@ fun UsbGpsScreen() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+
+            Spacer(Modifier.height(12.dp))
+            PhoneLoggerCard()
 
             Spacer(Modifier.height(12.dp))
             RaceCard()
@@ -288,6 +292,93 @@ private fun RaceCard() {
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Phone logger — record this phone's GPS + accel/gyro/mag/baro into a
+ * box-schema `SensPhone_*` + `GpsPhone_*` CSV pair (no receiver, no box
+ * needed). The pair shows up in the Replay tab's pickers and the finished
+ * GPS file in the recordings list below.
+ */
+@Composable
+private fun PhoneLoggerCard() {
+    val ctx = LocalContext.current
+    val st by PhoneLoggerCore.state.collectAsStateWithLifecycle()
+    val locPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted -> if (granted) PhoneLoggerCore.start(ctx) }
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Phone logger",
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                if (!st.running) {
+                    Button(onClick = {
+                        if (ctx.checkSelfPermission(
+                                android.Manifest.permission.ACCESS_FINE_LOCATION,
+                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        ) {
+                            PhoneLoggerCore.start(ctx)
+                        } else {
+                            locPermLauncher.launch(
+                                android.Manifest.permission.ACCESS_FINE_LOCATION,
+                            )
+                        }
+                    }) { Text("Start recording") }
+                } else {
+                    Button(onClick = { PhoneLoggerCore.stop() }) { Text("Stop recording") }
+                }
+            }
+            if (st.running) {
+                Text(
+                    "● Recording — sens ${st.sensRows} rows · gps ${st.gpsRows} rows",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFC62828),
+                )
+                val fixLine = buildString {
+                    append(if (st.fixQuality > 0) "Fix" else "Waiting for GPS fix…")
+                    if (st.fixQuality > 0) {
+                        append(" · ${st.numSat} sats")
+                        st.speedKmh?.let { append(" · %.1f km/h".format(Locale.US, it)) }
+                        st.accuracyM?.let { append(" · ±%.0f m".format(Locale.US, it)) }
+                    }
+                }
+                Text(fixLine, fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+                Text(
+                    "${st.sensName.orEmpty()} + ${st.gpsName.orEmpty()}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (!st.hasBaro) {
+                    Text(
+                        "No barometer on this phone — height panels will stay flat.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFB58B00),
+                    )
+                }
+            } else {
+                Text(
+                    "No receiver needed: records this phone's GPS + motion sensors " +
+                        "(accel/gyro/mag/baro) as a box-style Sens + Gps CSV pair, " +
+                        "ready for the Replay tab. Mount the phone flat on the " +
+                        "board, top edge toward the nose.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            st.error?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
         }
     }
@@ -650,7 +741,7 @@ private fun shareGpsCsv(context: Context, path: String) {
 
 // --- recording-row formatting helpers ---
 
-private val STAMP_RE = Regex("""UbloxGps_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.csv""")
+private val STAMP_RE = Regex("""(?:UbloxGps|GpsPhone)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.csv""")
 
 /** `UbloxGps_20260706_142025.csv` → `14:20:25`; falls back to the name. */
 private fun recordingTime(name: String): String {

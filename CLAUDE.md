@@ -243,6 +243,45 @@ recordings-list stat.
 ".dev"` + `versionNameSuffix "-dev"` on the debug build type (the phone's
 Play-signed install used to block `installDebug` entirely).
 
+## Phone logger — box-replacement CSV recording (`usb/PhoneLoggerCore.kt`)
+
+"Phone logger" card in the GPS tab (built when the u-blox USB dongle died,
+28.7.2026): records the phone's own GPS **plus accel/gyro/mag/baro** into a
+box-schema CSV pair — `SensPhone_<stamp>.csv` + `GpsPhone_<stamp>.csv` in
+the app-private external dir, mirrored to `Download/MovementLogger/`. The
+names start with `Sens`/`Gps` so the Replay tab's local pickers list them
+directly; the finished `GpsPhone_*` also appears in the GPS tab recordings
+list (map / share / stats — `UbloxGpsCore.refreshRecordings` scans both
+prefixes but excludes the in-flight phone file, which would otherwise
+defeat the (name,size) stats cache every second).
+
+- **Timebase**: both files share one `Time [10ms]` tick clock derived from
+  `elapsedRealtimeNanos` (SensorEvent timestamps and
+  `Location.elapsedRealtimeNanos` are the same CLOCK_BOOTTIME domain). A
+  `# SYNC epoch_ms=… tick_ms=0` anchor after each header — the same marker
+  the firmware writes on SET_TIME — gives Replay drift-free "Phone-clock
+  sync" alignment. NB the anchor's `tick_ms` is in the *Time-column unit*:
+  spaced headers parse with tickDiv=1, so tick 0 = start, exact.
+- **Units converted to the box CSV's**: acc m/s²→mg, gyro rad/s→mdps, mag
+  µT→mgauss (×10), pressure hPa=mB. `T ['C]` is a constant 20 °C (phones
+  have no ambient thermometer; `Baro` only needs a plausible Kelvin).
+- **`parseSensorStream` is STRICT** (one blank field fails the whole file),
+  so no sens row is written until gyro + mag (+ baro if present) have each
+  delivered a first sample; a phone without barometer logs a constant
+  1013.25 mB instead of a blank.
+- IMU at ~100 Hz (`samplingPeriodUs=10_000`, under the 200 Hz
+  HIGH_SAMPLING_RATE_SENSORS threshold), baro ~10 Hz, GPS ~1 Hz. All file
+  IO on one `HandlerThread`; the 100 Hz public-mirror bytes are batched
+  (16 KB) because MediaStore opens a stream per append.
+- `PhoneLoggerService` — location-type foreground service (notification
+  id 4, twin of `RaceGpsService`, both can run at once) owns
+  LocationManager + GnssStatus and keeps the process unfrozen so the
+  sensor listeners survive screen-off. START_NOT_STICKY + `isRunning`
+  guard: a restart after process death has no open writers to log into.
+- Mount guidance (shown in the card): phone flat on the board, top edge
+  toward the nose — phone axes then match the box's Y-nose convention, so
+  Madgwick/nose-angle work unchanged.
+
 ## USB GPS tab (`usb/`) — reliability hardening (v0.0.48–50)
 
 Post-mortem of the 11.7.2026 water test (33-min recording died at 15:49:52,

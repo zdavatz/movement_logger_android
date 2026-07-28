@@ -116,6 +116,14 @@
             android:exported="false"
             android:foregroundServiceType="location" />
 
+        <!-- Phone logger (box replacement): keeps LocationManager + the
+             100 Hz sensor listeners alive with the screen off while
+             recording the SensPhone/GpsPhone CSV pair. -->
+        <service
+            android:name=".usb.PhoneLoggerService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+
         <!-- WorkManager's internal SystemForegroundService is what carries
              SyncWorker's setForeground(...) notification. Lint flags
              SyncWorker.kt's FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE unless

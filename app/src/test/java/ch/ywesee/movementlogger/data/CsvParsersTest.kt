@@ -41,6 +41,23 @@ class CsvParsersTest {
     }
 
     @Test
+    fun sensorParserSkipsSyncCommentLines() {
+        // Firmware SET_TIME / PhoneLoggerCore write `# SYNC …` markers into
+        // Sens CSVs; the strict per-row parser must skip them, not throw.
+        val csv = """
+            Time [10ms],AccX [mg],AccY [mg],AccZ [mg],GyroX [mdps],GyroY [mdps],GyroZ [mdps],MagX [mgauss],MagY [mgauss],MagZ [mgauss],P [mB],T ['C]
+            # SYNC epoch_ms=1785245604088 tick_ms=0
+            25,-10.7,29.3,998.1,43.7,8.8,-8.8,47.0,244.5,-1114.7,1012.51,20.0
+            # SYNC epoch_ms=1785245704088 tick_ms=10000
+            26,-9.8,28.8,998.6,-26.3,8.8,61.3,49.8,241.6,-1113.4,1012.51,20.0
+        """.trimIndent().toByteArray()
+        val rows = ByteArrayInputStream(csv).use(CsvParsers::parseSensorStream)
+        assertEquals(2, rows.size)
+        assertEquals(25.0, rows[0].ticks, 0.0)
+        assertEquals(998.6, rows[1].accZ, 1e-9)
+    }
+
+    @Test
     fun rejectsMissingColumn() {
         val malformed = """
             Time [10ms], AccX [mg]

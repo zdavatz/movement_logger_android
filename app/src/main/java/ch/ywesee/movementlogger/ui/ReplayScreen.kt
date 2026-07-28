@@ -19,8 +19,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -631,8 +629,11 @@ private fun FileChooserList(
         Text(empty, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
         return
     }
-    LazyColumn(modifier = Modifier.fillMaxWidth().height(96.dp)) {
-        items(files, key = { it.absolutePath }) { f ->
+    // Plain Column, not a fixed-height LazyColumn: the old 96 dp window
+    // showed ~1.4 rows and clipped every list past the first entry. File
+    // counts here are small and the screen scrolls as a whole.
+    Column(modifier = Modifier.fillMaxWidth()) {
+        files.forEach { f ->
             val isSelected = f == selected
             Card(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
