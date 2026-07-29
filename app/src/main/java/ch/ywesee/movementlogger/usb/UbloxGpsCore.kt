@@ -178,6 +178,14 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      *  next [refreshRecordings] pass. */
     private val statsCache = HashMap<String, Pair<Long, GpsStats>>()
 
+    /** One refresh pass at a time — see the guard in [refreshRecordings]. */
+    private val refreshInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** [RideMapRenderer.AccelProfile] per Sens file, keyed by name with the
+     *  size alongside — streaming the 86 MB SensPhone file costs seconds,
+     *  so it must never run more than once per (name, size). */
+    private val accelProfileCache = HashMap<String, Pair<Long, RideMapRenderer.AccelProfile?>>()
+
     private val dateFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
     fun init(ctx: Context) {
@@ -315,40 +323,51 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      * Re-scan the app-private external dir for `UbloxGps_*.csv`, compute
      * each file's overview stats (max speed / distance / duration) on the
      * IO scope, and publish sorted newest-first. The filename timestamp
-     * (`yyyyMMdd_HHmmss`) is lexically chronological, so a descending name
-     * sort == newest-first without parsing dates.
+     * (`yyyyMMdd_HHmmss`) is lexically chronological, so a descending sort
+     * on the part after the prefix == newest-first without parsing dates —
+     * the prefix itself must be stripped or every `UbloxGps_*` outranks
+     * every `GpsPhone_*` (U > G) no matter the date.
      */
     fun refreshRecordings() {
         val dir = appContext?.getExternalFilesDir(null) ?: appContext?.filesDir ?: return
         val activeName = if (_state.value.isLogging) csvFile?.name else null
+        // Single-flight: the 3 s UI tick must never stack a second scan on
+        // top of a running one — with a cold stats cache and a big Sens
+        // sibling to stream, overlapping passes thundering-herd the same
+        // 86 MB file and the list stays empty for minutes (29.7.2026).
+        if (!refreshInFlight.compareAndSet(false, true)) return
         scope.launch {
-            // GpsPhone_* recordings come from PhoneLoggerCore (same schema);
-            // its in-flight file is excluded — the size changes every second,
-            // which would defeat the (name, size) stats cache and re-parse a
-            // growing file on every pass (the 11.7.2026 OOM lesson).
-            val phoneActive = PhoneLoggerCore.activeGpsName
-            val files = dir.listFiles()
-                ?.filter {
-                    it.isFile && it.name.endsWith(".csv") &&
-                        (it.name.startsWith("UbloxGps_") || it.name.startsWith("GpsPhone_")) &&
-                        it.name != phoneActive
-                }
-                .orEmpty()
-            val list = files.map { f ->
-                val s = statsFor(f, isActive = f.name == activeName)
-                GpsRecording(
-                    name = f.name,
-                    path = f.absolutePath,
-                    maxSpeedKmh = s.maxSpeedKmh,
-                    distanceMeters = s.distanceMeters,
-                    durationSec = s.durationSec,
-                    rows = s.rows,
-                    isRecording = f.name == activeName,
-                )
-            }.sortedByDescending { it.name }
-            val names = files.mapTo(HashSet()) { it.name }
-            synchronized(statsCache) { statsCache.keys.retainAll(names) }
-            _recordings.value = list
+            try {
+                // GpsPhone_* recordings come from PhoneLoggerCore (same schema);
+                // its in-flight file is excluded — the size changes every second,
+                // which would defeat the (name, size) stats cache and re-parse a
+                // growing file on every pass (the 11.7.2026 OOM lesson).
+                val phoneActive = PhoneLoggerCore.activeGpsName
+                val files = dir.listFiles()
+                    ?.filter {
+                        it.isFile && it.name.endsWith(".csv") &&
+                            (it.name.startsWith("UbloxGps_") || it.name.startsWith("GpsPhone_")) &&
+                            it.name != phoneActive
+                    }
+                    .orEmpty()
+                val list = files.map { f ->
+                    val s = statsFor(f, isActive = f.name == activeName)
+                    GpsRecording(
+                        name = f.name,
+                        path = f.absolutePath,
+                        maxSpeedKmh = s.maxSpeedKmh,
+                        distanceMeters = s.distanceMeters,
+                        durationSec = s.durationSec,
+                        rows = s.rows,
+                        isRecording = f.name == activeName,
+                    )
+                }.sortedByDescending { it.name.substringAfter('_') }
+                val names = files.mapTo(HashSet()) { it.name }
+                synchronized(statsCache) { statsCache.keys.retainAll(names) }
+                _recordings.value = list
+            } finally {
+                refreshInFlight.set(false)
+            }
         }
     }
 
@@ -416,7 +435,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
     private fun computeStats(file: File): GpsStats {
         val rows = file.inputStream().use { CsvParsers.parseGpsStream(it) }
         if (rows.isEmpty()) return GpsStats.EMPTY
-        val maxSpeed = RideMapRenderer.robustTopSpeed(rows)
+        val maxSpeed = RideMapRenderer.robustTopSpeed(rows, accelProfileFor(file))
         // Same blackout-cleaned segments as the drawn track, so the list's
         // distance and the share-PNG footer can never disagree — and the
         // fabricated antenna-under-water positions don't inflate it.
@@ -425,6 +444,32 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
         ) * 1000.0
         val durSec = ((rows.last().ticks - rows.first().ticks) * 10.0 / 1000.0).toLong()
         return GpsStats(maxSpeed, dist, durSec, rows.size)
+    }
+
+    /** IMU cross-check for [RideMapRenderer.robustTopSpeed]: the paired
+     *  `Sens*` file recorded on the same tick clock (`GpsPhone_X` ↔
+     *  `SensPhone_X`, box `Gps001` ↔ `Sens001`; `UbloxGps_*` has no pair).
+     *  Streamed into 1 s bins, so the 86 MB SensPhone file costs ~seconds
+     *  once per (name, size) cache entry, not heap. Best-effort — any
+     *  failure just means the flat acceleration cap applies. */
+    private fun accelProfileFor(gpsFile: File): RideMapRenderer.AccelProfile? {
+        val sensName = gpsFile.name.replaceFirst("Gps", "Sens")
+        if (sensName == gpsFile.name) return null
+        val sens = File(gpsFile.parentFile, sensName)
+        if (!sens.isFile) return null
+        val len = sens.length()
+        synchronized(accelProfileCache) { accelProfileCache[sensName] }
+            ?.let { (size, p) -> if (size == len) return p }
+        val profile = try {
+            RideMapRenderer.accelProfile(
+                sens.inputStream().use { CsvParsers.accBinsFromSensorStream(it) }
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "accel profile from $sensName failed: ${e.message}")
+            null
+        }
+        synchronized(accelProfileCache) { accelProfileCache[sensName] = len to profile }
+        return profile
     }
 
     /** Fold one just-written CSV row into [liveStats] — mirrors

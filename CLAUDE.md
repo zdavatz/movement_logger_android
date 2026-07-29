@@ -389,6 +389,41 @@ the rules that now guard it:
   void (V) sentences during reacquisition used to land in the CSV.
   `computeStats` now parses via `CsvParsers.parseGpsStream` and delegates
   max-speed to `robustTopSpeed` so list + footer can never disagree.
+- **v0.0.68 hardening — the 29.7.2026 SUP paddle (phone in Ayano's
+  pocket, avg 3.3 km/h) fabricated 30.35 km/h and the old three gates all
+  passed it** (2-row multipath kick WITH a matching ~5 m position kick, no
+  blackout nearby). Two new gates in `robustTopSpeed`, plus one tightening:
+  (a) **row quality** — a speed row whose own HDOP column exceeds
+  `MAX_SPEED_ROW_HDOP` (15) never sets the headline; the phone/watch
+  loggers stamp an honest accuracy proxy and the session's half-hour
+  harbour tail logged 12–32 km/h at proxy 16–57. NB `MAX_PLAUSIBLE_HDOP`
+  (validPoints — track/distance/modes) STAYS at 50: tightening it to 15
+  punched visible holes in the drawn track, because 287 mid-paddle rows
+  across 23 min carried an honest 15–50 proxy from the pocket carry —
+  degraded fixes still trace the path, they just can't claim the top
+  speed. (b)
+  **acceleration envelope** — a candidate must be reachable from EVERY
+  finite speed row within ±5 s under a per-second cap (strict minimum, not
+  median/percentile: at 1 Hz each side has exactly one meaningful
+  neighbour and any tolerance discards it; genuine bursts pass because
+  real physics ramps down too). Cap = flat 8 km/h/s (≈2.2 m/s²), or,
+  when the paired `Sens*` file exists (`GpsPhone_X` ↔ `SensPhone_X`,
+  box `Gps001` ↔ `Sens001`), the **IMU-measured allowance**:
+  `CsvParsers.accBinsFromSensorStream` streams the sens CSV into 1 s
+  mean-acc bins (STREAMING — the 86 MB SensPhone file as a parsed list is
+  ~100 MB heap, the 11.7 OOM again), `RideMapRenderer.accelProfile` turns
+  |mean − rolling-median gravity ref| into a per-second km/h/s allowance
+  (orientation-free so pocket carry works; ×2 slack, floor 2, cap 8), and
+  the envelope integrates it. Veto-only: board rocking only ever RAISES
+  the allowance, so IMU noise can't reject a real sprint. Wired in
+  `UbloxGpsCore.accelProfileFor` — best-effort, cached per (name, size)
+  in `accelProfileCache`, ~300 ms for the 86 MB file thanks to a
+  field-walk parse (no `split(',')` — that allocates GBs across 1.1 M
+  rows). `refreshRecordings` is single-flight (`refreshInFlight`): the
+  3 s tick used to stack scans of the same big Sens file on a cold cache
+  and the list stayed empty for minutes. Result on the session: raw
+  31.8 / old-gates 30.35 → **12.28 km/h**, distance 6.32 km, track
+  continuous. Not yet ported to iOS/desktop `robustTopSpeed`.
 
 ## Race mode — live position uplink (`usb/RaceUplink.kt`)
 

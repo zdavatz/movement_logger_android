@@ -70,6 +70,16 @@ data class BatteryRow(
  * to absolute time — and they share the phone's clock domain with the
  * replay video's `creation_time`, eliminating cross-clock skew.
  */
+/** One-second mean-acceleration bin from [CsvParsers.accBinsFromSensorStream];
+ *  `bin` = 10ms-tick ÷ 100, means in mg. */
+data class AccBin(
+    val bin: Int,
+    val n: Int,
+    val meanXMg: Double,
+    val meanYMg: Double,
+    val meanZMg: Double,
+)
+
 data class SyncAnchor(
     /**
      * Box tick in the SAME unit as `SensorRow.ticks` / `GpsRow.ticks`
@@ -198,6 +208,62 @@ object CsvParsers {
             }
         }
         return out
+    }
+
+    /**
+     * Per-second mean-acceleration bins of a `Sens*` CSV, feeding
+     * [RideMapRenderer]'s IMU-informed acceleration gate. STREAMING on
+     * purpose: the 29.7.2026 SUP session's SensPhone file is 86 MB /
+     * 1.1 M rows — a full [parseSensorStream] list would be ~100 MB of
+     * heap on-device (the 11.7.2026 OOM lesson, again). Only the tick +
+     * acc columns are read; malformed rows are skipped, not fatal.
+     * `Time [mS]` (legacy, raw milliseconds) is normalised to 10 ms ticks
+     * so bins line up with [GpsRow.ticks]. Bin key = tick ÷ 100 (1 s).
+     */
+    @Throws(IOException::class)
+    fun accBinsFromSensorStream(input: InputStream): List<AccBin> {
+        val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
+        val header = reader.readLine() ?: throw IOException("sensor csv: empty file")
+        val cols = HeaderMap(header)
+        val iMsLegacy = cols.idxOrNull("Time [mS]")
+        val iT = iMsLegacy ?: cols.idxAny("Time [10ms]")
+        val tickDiv = if (iMsLegacy != null) 10.0 else 1.0
+        val iAx = cols.idxAny("AccX [mg]")
+        val iAy = cols.idxAny("AccY [mg]")
+        val iAz = cols.idxAny("AccZ [mg]")
+        val maxIdx = maxOf(iT, iAx, iAy, iAz)
+        val acc = HashMap<Int, DoubleArray>()
+        // Field walk instead of split(): at 1.1 M rows × 12 columns a full
+        // split allocates gigabytes across a pass — only the four needed
+        // fields are ever substring'd, and the line is abandoned at the
+        // last one.
+        val fields = DoubleArray(maxIdx + 1)
+        while (true) {
+            val line = reader.readLine() ?: break
+            if (line.isEmpty() || line[0] == '#') continue
+            var start = 0
+            var idx = 0
+            var ok = true
+            while (idx <= maxIdx) {
+                val comma = line.indexOf(',', start)
+                val end = if (comma < 0) line.length else comma
+                if (idx == iT || idx == iAx || idx == iAy || idx == iAz) {
+                    val v = fastDoubleOrNull(line.substring(start, end).trim())
+                    if (v == null) { ok = false; break }
+                    fields[idx] = v
+                }
+                if (comma < 0 && idx < maxIdx) { ok = false; break }
+                start = end + 1
+                idx++
+            }
+            if (!ok) continue
+            val bin = ((fields[iT] / tickDiv) / 100.0).toInt()
+            val a = acc.getOrPut(bin) { DoubleArray(4) }
+            a[0] += 1.0; a[1] += fields[iAx]; a[2] += fields[iAy]; a[3] += fields[iAz]
+        }
+        return acc.entries.sortedBy { it.key }.map { (bin, a) ->
+            AccBin(bin, a[0].toInt(), a[1] / a[0], a[2] / a[0], a[3] / a[0])
+        }
     }
 
     @Throws(IOException::class)

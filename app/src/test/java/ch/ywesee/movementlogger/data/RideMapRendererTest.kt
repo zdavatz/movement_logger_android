@@ -292,4 +292,61 @@ class RideMapRendererTest {
         rows.sortBy { it.ticks }
         assertEquals(7.0, RideMapRenderer.robustTopSpeed(rows), 1e-9)
     }
+
+    /** 1 Hz phone-logger rows: every row carries fix + speed + an honest
+     *  hdop proxy — the 29.7.2026 SUP session in miniature. */
+    private fun phoneRow(ticks: Double, meters: Double, v: Double, hdop: Double = 1.0): GpsRow {
+        val mPerDegLon = Math.PI * 6_371_000.0 / 180.0
+        return GpsRow(
+            ticks = ticks, utc = ticks.toString(), lat = 0.0, lon = meters / mPerDegLon,
+            altM = 0.0, speedKmhModule = v, courseDeg = 0.0, fix = 1, numSat = 18, hdop = hdop,
+        )
+    }
+
+    @Test
+    fun robustTopSpeedRejectsMultipathKicksAndBlockedSkyJunk() {
+        val rows = mutableListOf<GpsRow>()
+        var meters = 0.0
+        for (t in 0..60_000 step 100) {
+            // The 29.7.2026 multipath kick: steady paddling, then 30/26 km/h
+            // for exactly two rows WITH a matching ~5 m position kick (so the
+            // chord cross-check alone can't catch it), then steady again.
+            val v = when (t) { 30_000 -> 30.35; 30_100 -> 26.6; else -> 4.0 }
+            if (t == 30_000) meters += 5.0
+            rows.add(phoneRow(t.toDouble(), meters, v))
+            meters += v / 3.6
+        }
+        // Blocked-sky tail: phone at the harbour fabricating 20 km/h wander,
+        // honestly stamped with an 80+ m accuracy proxy.
+        for (t in 61_000..70_000 step 100) {
+            rows.add(phoneRow(t.toDouble(), meters, 20.0, hdop = 30.0))
+        }
+        assertEquals(4.0, RideMapRenderer.robustTopSpeed(rows), 1e-9)
+    }
+
+    @Test
+    fun accelProfileVetoesCalmImuButAllowsActiveImu() {
+        // 4 km/h cruise with one 11 km/h row: reachable under the flat
+        // 8 km/h/s cap, NOT reachable when the IMU proves the second was calm.
+        val rows = mutableListOf<GpsRow>()
+        var meters = 0.0
+        for (t in 0..6_000 step 100) {
+            val v = if (t == 3_000) 11.0 else 4.0
+            rows.add(phoneRow(t.toDouble(), meters, v))
+            meters += v / 3.6
+        }
+        val calm = RideMapRenderer.accelProfile(
+            (0 until 70).map { AccBin(it, 100, 0.0, 0.0, -1000.0) }
+        )!!
+        // Active: a ~300 mg net push around the candidate second.
+        val active = RideMapRenderer.accelProfile(
+            (0 until 70).map {
+                val push = if (it in 29..31) 300.0 else 0.0
+                AccBin(it, 100, 0.0, push, -1000.0)
+            }
+        )!!
+        assertEquals(11.0, RideMapRenderer.robustTopSpeed(rows, null), 1e-9)
+        assertEquals(11.0, RideMapRenderer.robustTopSpeed(rows, active), 1e-9)
+        assertEquals(4.0, RideMapRenderer.robustTopSpeed(rows, calm), 1e-9)
+    }
 }

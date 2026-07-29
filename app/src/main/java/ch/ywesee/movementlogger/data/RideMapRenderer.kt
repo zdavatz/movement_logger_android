@@ -174,8 +174,22 @@ object RideMapRenderer {
      *  fix 70 km away — honestly stamped with a 149 000 m accuracy. The
      *  u-blox HDOP is dimensionless (≤ ~20 with any usable fix) and the
      *  watch column carries metres, but one threshold covers both. NaN
-     *  (column absent) passes. */
+     *  (column absent) passes. DON'T tighten this below ~50 to fight junk:
+     *  on the 29.7.2026 SUP session (phone in a pocket) 287 mid-paddle
+     *  rows across 23 minutes carried an honest 15–50 accuracy proxy —
+     *  a 15 cutoff punched visible holes in the drawn track ("like the
+     *  logging stopped"). Degraded fixes still trace the path; only the
+     *  headline top speed needs the stricter [MAX_SPEED_ROW_HDOP]. */
     internal const val MAX_PLAUSIBLE_HDOP = 50.0
+    /** A speed row worse than this never sets the TOP-SPEED headline (the
+     *  drawn track keeps tolerating up to [MAX_PLAUSIBLE_HDOP]): the
+     *  29.7.2026 session ended with the phone at the harbour under a
+     *  blocked sky, logging half an hour of 12–32 km/h wander at 80–285 m
+     *  claimed accuracy (proxy 16–57) on 3–4 sats. The phone/watch
+     *  loggers stamp an honest accuracy column, so their junk
+     *  disqualifies itself; the u-blox lies while fabricating, which is
+     *  what the blackout gate is for. NaN passes. */
+    internal const val MAX_SPEED_ROW_HDOP = 15.0
 
     /** Keep only plottable fixes: fix>0, finite, not (0,0) null island,
      *  and not flagged wildly-inaccurate (see [MAX_PLAUSIBLE_HDOP]). */
@@ -228,16 +242,147 @@ object RideMapRenderer {
      *  reliable signature — the fabrication episode always brackets the
      *  moment the signal actually died. */
     private const val BLACKOUT_PAD_TICKS = 1_000.0
+    /** Acceleration common sense: nothing paddled, pumped or winged
+     *  accelerates faster than this (8 km/h per second ≈ 2.2 m/s², already
+     *  generous for a wingfoil catching a gust). A top-speed candidate
+     *  must be REACHABLE from its surrounding seconds under this cap —
+     *  the 29.7.2026 SUP spike (steady 3 km/h paddling → 30.35 km/h for
+     *  exactly 2 s → back to 3 km/h; sats 21→12, altitude −3→+23 m, and
+     *  the position kicked ~5 m WITH the speed so the chord cross-check
+     *  passed) is a +27 km/h/s step and dies here. */
+    private const val MAX_ACCEL_KMH_PER_S = 8.0
+    /** The reachability envelope looks this far (5 s) to each side of a
+     *  candidate. Per side, every finite speed row allows the candidate at
+     *  most `v' + MAX_ACCEL × Δt`, and the candidate must stay under the
+     *  MINIMUM allowance on BOTH sides — i.e. it must be reachable from
+     *  every surrounding sample. Anything softer fails at the 1 Hz
+     *  phone/watch rate, where each side has exactly ONE row at Δt = 1 s
+     *  and that row is the whole constraint: a median let the 19.37 km/h
+     *  one-row kick (08:18:02, 29.7.2026 SUP) through, a 25th percentile
+     *  let 16.09 → 4.93 km/h (a −11 km/h/s stop) through. Genuine bursts
+     *  survive the minimum because real physics ramps DOWN too — a wake
+     *  surf decays 16 → 12 → 8, it doesn't teleport back to 5. The cost:
+     *  one corrupted low row vetoes candidates up to ~v/8 s around it,
+     *  which only matters for a short burst that is ALSO glitched — a
+     *  sustained top re-qualifies from rows further out. A side with no
+     *  finite rows imposes no constraint. */
+    private const val ACCEL_WINDOW_TICKS = 500.0
+    /** mg → km/h per second (9.80665 m/s² per g × 3.6). */
+    private const val MG_TO_KMH_PER_S = 9.80665 * 3.6 / 1000.0
+    /** The IMU-informed envelope allows the measured net acceleration
+     *  times this slack — the gravity reference is a rolling median, so a
+     *  genuinely sustained push leaks into its own reference and reads
+     *  ~half strength. */
+    private const val ACCEL_IMU_SLACK = 2.0
+    /** …but never less than this (2 km/h/s): bin quantisation and mount
+     *  rotation noise put a floor under what "calm" proves. */
+    private const val ACCEL_IMU_FLOOR_KMH_PER_S = 2.0
+    /** Gravity reference = component-wise median of the per-second mean
+     *  acc vectors over ±this many bins — long enough to bridge a real
+     *  10 s push, short enough to track slow mount-orientation drift
+     *  (phone in a pocket, board being flipped). */
+    private const val GRAVITY_REF_BINS = 10
 
     /**
-     * Top speed for the footer stat, outlier-hardened. Three gates, each
-     * physical and each verified against the 11.7.2026 Ermioni ride, whose
-     * raw column peaked at a fantasy 27.1 km/h on a ~7 km/h session:
+     * Per-second speed-step allowance derived from the paired `Sens*`
+     * file's accelerometer — the IMU records the truth about acceleration
+     * at 100 Hz while GPS speed is a derived guess. Per 1 s bin: net
+     * dynamic acceleration = |mean acc vector − rolling-median gravity
+     * reference| (orientation-free, so pocket carry works), scaled by
+     * [ACCEL_IMU_SLACK] and clamped to [[ACCEL_IMU_FLOOR_KMH_PER_S],
+     * [MAX_ACCEL_KMH_PER_S]]. The 29.7.2026 SUP spike claimed
+     * 3 → 30 km/h in 1 s (≈ 0.77 g sustained) while the pocketed phone's
+     * mean |acc| sat at 1.00 g the whole minute — no push happened.
+     * Veto-only by construction: a rocking board only ever RAISES the
+     * allowance toward the [MAX_ACCEL_KMH_PER_S] cap, never below the
+     * floor, so IMU noise cannot reject a genuine sprint.
+     */
+    class AccelProfile internal constructor(
+        private val firstBin: Int,
+        /** km/h-per-second allowance per bin; NaN = no sens data. */
+        private val allowed: DoubleArray,
+    ) {
+        /** Integral of the allowance over the tick span, in km/h — the
+         *  most speed the IMU says can have been gained or lost. Bins
+         *  without data fall back to [MAX_ACCEL_KMH_PER_S]. */
+        fun allowanceKmh(tickA: Double, tickB: Double): Double {
+            var s = kotlin.math.min(tickA, tickB) / GpsMath.TICKS_PER_SEC
+            val hi = kotlin.math.max(tickA, tickB) / GpsMath.TICKS_PER_SEC
+            var sum = 0.0
+            while (s < hi) {
+                val e = kotlin.math.min(hi, kotlin.math.floor(s) + 1.0)
+                sum += rate(kotlin.math.floor(s).toInt()) * (e - s)
+                s = e
+            }
+            return sum
+        }
+
+        private fun rate(bin: Int): Double {
+            val i = bin - firstBin
+            val r = if (i in allowed.indices) allowed[i] else Double.NaN
+            return if (r.isNaN()) MAX_ACCEL_KMH_PER_S else r
+        }
+    }
+
+    /** Build the [AccelProfile] from [CsvParsers.accBinsFromSensorStream]
+     *  output; null when there's nothing usable. */
+    fun accelProfile(bins: List<AccBin>): AccelProfile? {
+        if (bins.isEmpty()) return null
+        val first = bins.first().bin
+        val span = bins.last().bin - first + 1
+        // 55 h of 1 s bins — a corrupt tick column shouldn't allocate GBs.
+        if (span <= 0 || span > 200_000) return null
+        val mean = arrayOfNulls<AccBin>(span)
+        for (b in bins) mean[b.bin - first] = b
+        val allowed = DoubleArray(span) { Double.NaN }
+        val bx = ArrayList<Double>(2 * GRAVITY_REF_BINS + 1)
+        val by = ArrayList<Double>(2 * GRAVITY_REF_BINS + 1)
+        val bz = ArrayList<Double>(2 * GRAVITY_REF_BINS + 1)
+        for (i in 0 until span) {
+            val m = mean[i] ?: continue
+            bx.clear(); by.clear(); bz.clear()
+            for (j in maxOf(0, i - GRAVITY_REF_BINS)..minOf(span - 1, i + GRAVITY_REF_BINS)) {
+                val n = mean[j] ?: continue
+                bx.add(n.meanXMg); by.add(n.meanYMg); bz.add(n.meanZMg)
+            }
+            val gx = medianOf(bx)
+            val gy = medianOf(by)
+            val gz = medianOf(bz)
+            val dynMg = kotlin.math.sqrt(
+                (m.meanXMg - gx) * (m.meanXMg - gx) +
+                    (m.meanYMg - gy) * (m.meanYMg - gy) +
+                    (m.meanZMg - gz) * (m.meanZMg - gz)
+            )
+            allowed[i] = (dynMg * MG_TO_KMH_PER_S * ACCEL_IMU_SLACK)
+                .coerceIn(ACCEL_IMU_FLOOR_KMH_PER_S, MAX_ACCEL_KMH_PER_S)
+        }
+        return AccelProfile(first, allowed)
+    }
+
+    private fun medianOf(v: ArrayList<Double>): Double {
+        v.sort()
+        return v[v.size / 2]
+    }
+
+    /**
+     * Top speed for the footer stat, outlier-hardened. Five gates, each
+     * physical, verified against the 11.7.2026 Ermioni ride (raw column
+     * peaked at a fantasy 27.1 km/h on a ~7 km/h session) and the
+     * 29.7.2026 SUP paddle (30.35 km/h multipath spike + half an hour of
+     * blocked-sky junk, both with healthy-looking positions):
      *
      *  1. Hard clip at [MAX_PLAUSIBLE_SPEED_KMH].
-     *  2. Blackout adjacency (see [BLACKOUT_PAD_TICKS]) — kills the
+     *  2. Row quality: the speed row's own HDOP column must not exceed
+     *     [MAX_SPEED_ROW_HDOP] — the phone/watch loggers stamp an honest
+     *     accuracy proxy, so their junk disqualifies itself. NaN (RMC
+     *     half-rows) passes; the remaining gates cover those.
+     *  3. Blackout adjacency (see [BLACKOUT_PAD_TICKS]) — kills the
      *     antenna-under-water fabrication episodes.
-     *  3. Position consistency: the earliest and latest valid fix within
+     *  4. Acceleration envelope (see [MAX_ACCEL_KMH_PER_S]) — kills
+     *     1–2-row multipath kicks that carry matching position error.
+     *     When the paired `Sens*` file's [AccelProfile] is available the
+     *     envelope tightens to what the IMU actually measured.
+     *  5. Position consistency: the earliest and latest valid fix within
      *     ±[FIX_WINDOW_TICKS] must span ≥ [MIN_FIX_SPAN_TICKS], and the row
      *     is accepted iff `v ≤ chordSpeed × [SPEED_VS_TRACK_FACTOR] +
      *     [SPEED_VS_TRACK_FLOOR_KMH]` — kills isolated doppler blips that
@@ -248,18 +393,25 @@ object RideMapRenderer {
      * `UbloxGpsCore.computeStats` delegates here so the footer and the
      * recordings-list stat stay equal.
      */
-    internal fun robustTopSpeed(rows: List<GpsRow>): Double {
+    internal fun robustTopSpeed(rows: List<GpsRow>, accel: AccelProfile? = null): Double {
         val fixes = dedupFixes(validPoints(rows))
         if (fixes.size < 2) return 0.0
         val fixTicks = DoubleArray(fixes.size) { fixes[it].ticks }
         val zones = blackoutZones(fixTicks)
+        // All finite speed rows in tick order, for the acceleration envelope.
+        val speedRows = rows.filter {
+            it.ticks.isFinite() && it.speedKmhModule.isFinite() && it.speedKmhModule >= 0.0
+        }
+        val speedTicks = DoubleArray(speedRows.size) { speedRows[it].ticks }
 
         var top = 0.0
         for (r in rows) {
             val v = r.speedKmhModule
             if (!v.isFinite() || v < 0.0 || v > MAX_PLAUSIBLE_SPEED_KMH) continue
             if (v <= top || !r.ticks.isFinite()) continue
+            if (r.hdop > MAX_SPEED_ROW_HDOP) continue
             if (zones.any { r.ticks >= it[0] && r.ticks <= it[1] }) continue
+            if (!accelReachable(r, speedRows, speedTicks, accel)) continue
             val a = lowerBound(fixTicks, r.ticks - FIX_WINDOW_TICKS)
             val b = lowerBound(fixTicks, r.ticks + FIX_WINDOW_TICKS + 1e-9) - 1
             if (b <= a) continue
@@ -271,6 +423,31 @@ object RideMapRenderer {
             if (v <= chordKmh * SPEED_VS_TRACK_FACTOR + SPEED_VS_TRACK_FLOOR_KMH) top = v
         }
         return top
+    }
+
+    /** Gate 4: can [r]'s speed be reached from EVERY surrounding sample
+     *  within ±[ACCEL_WINDOW_TICKS] under the acceleration cap? Each
+     *  finite speed row allows at most `v' + cap × Δt` — the cap being
+     *  the IMU-measured [AccelProfile.allowanceKmh] when a Sens pair
+     *  exists, else the flat [MAX_ACCEL_KMH_PER_S]. */
+    private fun accelReachable(
+        r: GpsRow,
+        speedRows: List<GpsRow>,
+        speedTicks: DoubleArray,
+        accel: AccelProfile?,
+    ): Boolean {
+        val v = r.speedKmhModule
+        val lo = lowerBound(speedTicks, r.ticks - ACCEL_WINDOW_TICKS)
+        val hi = lowerBound(speedTicks, r.ticks + ACCEL_WINDOW_TICKS + 1e-9)
+        for (i in lo until hi) {
+            val o = speedRows[i]
+            val dt = o.ticks - r.ticks
+            if (dt == 0.0) continue
+            val step = accel?.allowanceKmh(o.ticks, r.ticks)
+                ?: (MAX_ACCEL_KMH_PER_S * kotlin.math.abs(dt) / GpsMath.TICKS_PER_SEC)
+            if (v > o.speedKmhModule + step) return false
+        }
+        return true
     }
 
     /** Blackout exclusion zones as [start, end] tick pairs: before the

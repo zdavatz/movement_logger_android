@@ -185,4 +185,35 @@ class CsvParsersTest {
         assertNotNull(resource("Gps_sample.csv"))
         assertNotNull(resource("Bat_sample.csv"))
     }
+
+    @Test
+    fun accBinsAveragePerSecondSkippingCommentsAndBadRows() {
+        val csv = """
+            Time [10ms],AccX [mg],AccY [mg],AccZ [mg]
+            # SYNC epoch_ms=1785309910876 tick_ms=0
+            10, 100, 0, -1000
+            50, 300, 0, -1000
+            120, 50, 20, -900
+            broken, x, y, z
+        """.trimIndent().toByteArray()
+        val bins = ByteArrayInputStream(csv).use(CsvParsers::accBinsFromSensorStream)
+        assertEquals(2, bins.size)
+        assertEquals(0, bins[0].bin)
+        assertEquals(2, bins[0].n)
+        assertEquals(200.0, bins[0].meanXMg, 1e-9)
+        assertEquals(-1000.0, bins[0].meanZMg, 1e-9)
+        assertEquals(1, bins[1].bin)
+        assertEquals(50.0, bins[1].meanXMg, 1e-9)
+    }
+
+    @Test
+    fun accBinsNormaliseLegacyMillisecondTicks() {
+        val csv = """
+            Time [mS],AccX [mg],AccY [mg],AccZ [mg]
+            1500, 10, 0, -1000
+        """.trimIndent().toByteArray()
+        val bins = ByteArrayInputStream(csv).use(CsvParsers::accBinsFromSensorStream)
+        // 1500 ms = tick 150 = bin 1.
+        assertEquals(1, bins.single().bin)
+    }
 }
