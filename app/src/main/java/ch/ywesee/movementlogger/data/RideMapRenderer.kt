@@ -766,7 +766,12 @@ object RideMapRenderer {
      * app's FileProvider paths). Returns the file, or null when there are
      * fewer than two valid fixes or every tile fetch failed.
      */
-    suspend fun render(context: Context, rows: List<GpsRow>, title: String): File? =
+    suspend fun render(
+        context: Context,
+        rows: List<GpsRow>,
+        title: String,
+        accel: AccelProfile? = null,
+    ): File? =
         withContext(Dispatchers.IO) {
             // Blackout-cleaned segments: no fabricated antenna-under-water
             // positions, no straight connector lines across the fix holes.
@@ -851,6 +856,7 @@ object RideMapRenderer {
                 color = RideMode.SWIM.argb(TILES_DARK)
                 pathEffect = dash
             }
+            var hasBridges = false
             off = 0
             for (k in 0 until segments.size - 1) {
                 off += segments[k].size
@@ -859,6 +865,7 @@ object RideMapRenderer {
                 if (GpsMath.haversineM(a.lat, a.lon, b.lat, b.lon) > HOLE_BRIDGE_MAX_M) continue
                 canvas.drawLine(px[off - 1], py[off - 1], px[off], py[off], connCasing)
                 canvas.drawLine(px[off - 1], py[off - 1], px[off], py[off], conn)
+                hasBridges = true
             }
 
             drawMarker(canvas, px[0], py[0], Color.rgb(52, 199, 89))   // systemGreen
@@ -866,12 +873,13 @@ object RideMapRenderer {
 
             // Over ALL rows (RMC half-rows carry the speed with fix column
             // 0), but gated on a nearby valid fix — see robustTopSpeed.
-            val topSpeed = robustTopSpeed(rows)
+            val topSpeed = robustTopSpeed(rows, accel)
             val distanceKm = segmentsDistanceKm(segments)
             val durMin = (valid.last().ticks - valid.first().ticks) * 0.01 / 60.0
             drawFooter(
                 context, canvas, width, mapHeight, footerHeight, topSpeed, distanceKm, durMin,
                 RideMode.entries.filter { modes.contains(it) },
+                showSignalLost = hasBridges,
             )
 
             val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "RideMaps")
@@ -947,6 +955,7 @@ object RideMapRenderer {
     private fun drawFooter(
         context: Context, canvas: Canvas, width: Int, mapHeight: Int, footerHeight: Int,
         topSpeed: Double, distanceKm: Double, durMin: Double, legendModes: List<RideMode>,
+        showSignalLost: Boolean,
     ) {
         val top = mapHeight.toFloat()
         canvas.drawRect(
@@ -1021,6 +1030,25 @@ object RideMapRenderer {
             canvas.drawCircle(lx + 9f, ly + 3 + 9f, 9f, dot)
             legendText(m.label, lx + 27f, ly, 22f, Color.WHITE, Typeface.DEFAULT)
             ly += 34
+        }
+        // The dashed hole-bridge connector gets its own legend row whenever
+        // the track has one — "the rider got from A to B, exact path
+        // unknown" needs explaining or it reads as a rendering glitch
+        // (Zeno, 29.7.2026: "what are all these white dots?").
+        if (showSignalLost) {
+            val yMid = ly + 3 + 9f
+            val dashFx = android.graphics.DashPathEffect(floatArrayOf(8f, 6f), 0f)
+            val bridgeCasing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE; strokeWidth = 8f; strokeCap = Paint.Cap.ROUND
+                color = Color.argb(230, 255, 255, 255); pathEffect = dashFx
+            }
+            val bridge = Paint(bridgeCasing).apply {
+                strokeWidth = 4f
+                color = RideMode.SWIM.argb(TILES_DARK)
+            }
+            canvas.drawLine(lx, yMid, lx + 18f, yMid, bridgeCasing)
+            canvas.drawLine(lx, yMid, lx + 18f, yMid, bridge)
+            legendText("Signal lost", lx + 27f, ly, 22f, Color.WHITE, Typeface.DEFAULT)
         }
     }
 }

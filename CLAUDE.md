@@ -423,7 +423,17 @@ the rules that now guard it:
   3 s tick used to stack scans of the same big Sens file on a cold cache
   and the list stayed empty for minutes. Result on the session: raw
   31.8 / old-gates 30.35 → **12.28 km/h**, distance 6.32 km, track
-  continuous. Not yet ported to iOS/desktop `robustTopSpeed`.
+  continuous. Ported to iOS (`RideMap.swift` `robustTop`, commit
+  `fef7883`); desktop deliberately not ported (box files' failure mode is
+  already blackout-gated — revisit only if a mismatched stat shows up).
+- **"Signal lost" legend entry (post-v0.0.68).** The dashed hole-bridge
+  connectors read as mystery "white dots" on a shared PNG (Zeno,
+  29.7.2026), so both legends explain them: the PNG footer and the
+  interactive map card append a dashed-swatch "Signal lost" row whenever
+  the track bridges ≥1 hole (same `HOLE_BRIDGE_MAX_M` rule as the
+  drawing). The share path also passes `UbloxGpsCore.accelProfileFor`
+  into `RideMapRenderer.render` so the PNG footer's top speed gets the
+  IMU gate like the recordings list (it previously ran gates 1–4 only).
 
 ## Race mode — live position uplink (`usb/RaceUplink.kt`)
 

@@ -125,8 +125,14 @@ fun RideMapView(name: String, path: String, onDismiss: () -> Unit) {
                                 rendering = true
                                 shareError = null
                                 scope.launch {
+                                    // IMU cross-check for the footer's top speed —
+                                    // (name, size)-cached, so usually instant.
+                                    val accel = withContext(Dispatchers.IO) {
+                                        ch.ywesee.movementlogger.usb.UbloxGpsCore
+                                            .accelProfileFor(File(path))
+                                    }
                                     val png = RideMapRenderer.render(
-                                        ctx, rows.orEmpty(), name.substringBeforeLast('.'),
+                                        ctx, rows.orEmpty(), name.substringBeforeLast('.'), accel,
                                     )
                                     rendering = false
                                     if (png != null) sharePng(ctx, png)
@@ -184,11 +190,20 @@ private fun CenteredNote(text: String) {
 @Composable
 private fun TrackMap(segments: List<List<GpsRow>>, modes: List<RideMode>?) {
     val pts = segments.flatten()
+    // Same rule as the dashed connectors TrackMapView draws: a legend row
+    // is owed whenever at least one hole gets bridged.
+    val hasBridges = (1 until segments.size).any {
+        val a = segments[it - 1].last()
+        val b = segments[it].first()
+        ch.ywesee.movementlogger.data.GpsMath.haversineM(a.lat, a.lon, b.lat, b.lon) <=
+            RideMapRenderer.HOLE_BRIDGE_MAX_M
+    }
     Box(Modifier.fillMaxSize()) {
         TrackMapView(segments, modes, pts)
         if (modes != null) {
             ActivityLegend(
                 RideMode.entries.filter { modes.contains(it) },
+                showSignalLost = hasBridges,
                 // Fixed 36 dp bottom clearance: the full-screen dialog
                 // extends behind the gesture bar and dialog windows don't
                 // dispatch insets, so navigationBarsPadding() is a no-op
@@ -200,10 +215,15 @@ private fun TrackMap(segments: List<List<GpsRow>>, modes: List<RideMode>?) {
     }
 }
 
-/** Small translucent legend card — mode swatch + label (iOS `legendCard`). */
+/** Small translucent legend card — mode swatch + label (iOS `legendCard`),
+ *  plus a dashed "Signal lost" row when the track bridges any fix holes. */
 @Composable
-private fun ActivityLegend(modes: List<RideMode>, modifier: Modifier = Modifier) {
-    if (modes.isEmpty()) return
+private fun ActivityLegend(
+    modes: List<RideMode>,
+    showSignalLost: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    if (modes.isEmpty() && !showSignalLost) return
     Surface(
         modifier = modifier,
         shape = MaterialTheme.shapes.medium,
@@ -218,6 +238,27 @@ private fun ActivityLegend(modes: List<RideMode>, modifier: Modifier = Modifier)
                     )
                     Text(
                         m.label,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(start = 6.dp),
+                    )
+                }
+            }
+            if (showSignalLost) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    androidx.compose.foundation.Canvas(Modifier.size(width = 11.dp, height = 11.dp)) {
+                        drawLine(
+                            color = ComposeColor(RideMode.SWIM.argb(RideMapRenderer.TILES_DARK)),
+                            start = androidx.compose.ui.geometry.Offset(0f, size.height / 2f),
+                            end = androidx.compose.ui.geometry.Offset(size.width, size.height / 2f),
+                            strokeWidth = 3.dp.toPx(),
+                            cap = androidx.compose.ui.graphics.StrokeCap.Round,
+                            pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(
+                                floatArrayOf(3.dp.toPx(), 3.dp.toPx()), 0f,
+                            ),
+                        )
+                    }
+                    Text(
+                        "Signal lost",
                         style = MaterialTheme.typography.labelSmall,
                         modifier = Modifier.padding(start = 6.dp),
                     )

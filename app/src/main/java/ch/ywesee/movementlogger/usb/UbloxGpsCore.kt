@@ -452,7 +452,7 @@ object UbloxGpsCore : UbloxGpsReader.Sink {
      *  Streamed into 1 s bins, so the 86 MB SensPhone file costs ~seconds
      *  once per (name, size) cache entry, not heap. Best-effort — any
      *  failure just means the flat acceleration cap applies. */
-    private fun accelProfileFor(gpsFile: File): RideMapRenderer.AccelProfile? {
+    fun accelProfileFor(gpsFile: File): RideMapRenderer.AccelProfile? {
         val sensName = gpsFile.name.replaceFirst("Gps", "Sens")
         if (sensName == gpsFile.name) return null
         val sens = File(gpsFile.parentFile, sensName)
