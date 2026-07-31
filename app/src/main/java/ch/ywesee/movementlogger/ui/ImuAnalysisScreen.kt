@@ -1,6 +1,7 @@
 package ch.ywesee.movementlogger.ui
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.rememberTransformableState
@@ -48,6 +49,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -184,13 +186,24 @@ private fun AnalysisDetail(rec: ImuRec, onBack: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ResultView(r: ImuAnalysisResult) {
     val bands = remember(r) { computeBands(r) }
     var zoom by remember { mutableFloatStateOf(1f) }
     val hScroll = rememberScrollState()
-    val transformState = rememberTransformableState { zoomChange, _, _ -> zoom = (zoom * zoomChange).coerceIn(1f, 40f) }
     val screenW = LocalConfiguration.current.screenWidthDp
+    val viewportWPx = with(LocalDensity.current) { (screenW - 32).dp.toPx() }
+    val transformState = rememberTransformableState { zoomChange, _, _ ->
+        val old = zoom
+        val new = (old * zoomChange).coerceIn(1f, 40f)
+        if (new != old) {
+            zoom = new
+            // keep the viewport centre anchored while the content rescales under it
+            val centre = hScroll.value + viewportWPx / 2f
+            hScroll.dispatchRawDelta(centre * (new / old - 1f))
+        }
+    }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp)) {
         // header
         Text(r.sourceName, fontWeight = FontWeight.SemiBold, maxLines = 1)
@@ -226,9 +239,12 @@ private fun ResultView(r: ImuAnalysisResult) {
         Spacer(Modifier.height(4.dp))
 
         // Panels live in a (width × zoom) horizontal scroll so a long ride can be
-        // spread out and panned; pinch (transformable) sets the zoom.
+        // spread out and panned; pinch (transformable) sets the zoom. canPan=false
+        // keeps transformable's hands off single-finger drags — it sits inside
+        // horizontalScroll in the pointer chain and would otherwise consume every
+        // drag as an (ignored) pan, leaving the scroll permanently starved.
         val panelW = ((screenW - 32) * zoom).dp
-        Box(Modifier.horizontalScroll(hScroll).transformable(transformState)) {
+        Box(Modifier.horizontalScroll(hScroll).transformable(transformState, canPan = { false })) {
             Column(Modifier.width(panelW)) {
                 if (r.speedKmh.any { it > 0.5 }) {
                     LinePanel("GPS speed", "km/h", r.minutes, r.speedKmh, SPEED_C, hLine = ImuAnalysis.FOIL_KMH,
