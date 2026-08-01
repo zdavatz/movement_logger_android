@@ -152,6 +152,47 @@ The Done banner exposes an **Open video** button that fires `Intent.ACTION_VIEW`
 - **HDR sources trip `OverlayShaderProgram` checkArgument.** HEVC HLG / Ultra-HDR clips (iPhone, Pixel main camera) route through Media3's HDR overlay codepath, which asserts `bitmap.hasGainmap()` on the overlay — our SDR panel bitmap fails. Fix: set `Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL` on the composition. Without it, the Ayano_Pump session crashes with `java.lang.IllegalArgumentException at OverlayShaderProgram.drawFrame:131` on Pixel 8a.
 - **Rotation:** the encoded stream keeps the source's rotation flag (1080×3840 raw bytes for a portrait source) but plays back rotated (3840×1080 displayed → 1080×3840 visible). Don't try to compensate in pixel space; trust the rotation metadata.
 
+## Analyze tab — on-device IMU ride analysis (v0.0.70+)
+
+`data/ImuAnalysis.kt` (engine) + `data/ImuAnalysisCache.kt` (disk cache) +
+`ui/ImuAnalysisScreen.kt` (More-menu tab). Numerically identical twin of the
+iOS `Data/ImuAnalysis.swift` — the pipeline (signed per-axis userAccel → STFT
+cadence → Otsu thresholds → per-second GLIDE/PADDLE/WAIT mode strip + stroke
+rate + board pitch/roll) is documented in depth in the iOS `CLAUDE.md`
+("Analyze tab" section); keep the two ports in lockstep. Android-specific
+hard-won details:
+
+- **Streaming parse, never row objects.** A 127 MB / 1.6 M-row `SensPhone`
+  parsed as `List<SensorRow>` OOMs Android's ~268 MB heap; `parsePhoneSens`
+  does a two-pass count-then-fill into primitive `DoubleArray`s and reuses
+  them in place (ticks→seconds, raw→userAccel).
+- **Result cache (`ImuAnalysisCache`, format v2).** One binary file per
+  recording under `filesDir/analysis-cache/` (`DataOutputStream`, magic
+  `IMUA`), keyed by the sens+gps files' (size, mtime) so a regrown file
+  re-analyzes; any read problem = cache miss; pruned to the 32 newest. Makes
+  re-opening instant and survives app restarts. iOS peer:
+  `ImuAnalysisCache.swift` (binary plist, same key scheme, same version — bump
+  BOTH when `ImuAnalysisResult` changes).
+- **Wall-clock x axis.** `fromPhoneLogger` projects the CSV's `# SYNC
+  epoch_ms` anchor onto the first sample → `ImuAnalysisResult.startEpochMs`;
+  `drawTimeAxis` puts hh:mm:ss gridline ticks on round LOCAL wall-clock values
+  (`axisBaseSec` folds in the timezone offset), elapsed-time fallback when the
+  anchor is missing. Tick step auto-picks from the zoomed pixel width.
+- **Gesture chain (`ResultView`).** `horizontalScroll` + `transformable(state,
+  canPan = { false })` — transformable sits inner in the pointer chain and
+  would otherwise consume every one-finger drag as an (ignored) pan, starving
+  the scroll. Pinch zoom stays centre-anchored by `dispatchRawDelta`-ing the
+  scroll to keep the viewport middle fixed.
+- **Viewport-pinned y labels.** The panel canvases span the full zoomed
+  content width, so the y-scale readouts draw at `scrollX() + 4dp` — the
+  scroll value is read inside the draw phase, which invalidates draw-only on
+  scroll (cheap).
+- **Palette rule.** Pitch = violet, roll = magenta — deliberately NOT the
+  glide-blue / paddle-orange of the activity bands; sharing those hues made
+  the legends read as "double orange / double blue" (Zeno, 1.8.2026). No hue
+  may mean two things on this screen. The board-angle panel header carries its
+  own Pitch/Roll legend chips.
+
 ## Box-sourced board-orientation calibration (v0.0.46+) — `Calibration.kt`
 
 The four calibration fields (`nosePlusY`, `magOffsetMg`, `angleZeroRef`
