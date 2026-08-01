@@ -14,7 +14,7 @@ import java.io.File
  */
 object ImuAnalysisCache {
     private const val MAGIC = 0x494D5541 // "IMUA"
-    private const val VERSION = 1
+    private const val VERSION = 2
     private const val MAX_FILES = 32
 
     private fun dir(ctx: Context) = File(ctx.filesDir, "analysis-cache")
@@ -38,6 +38,7 @@ object ImuAnalysisCache {
                 val fs = s.readDouble()
                 val durationMin = s.readDouble()
                 val sourceName = s.readUTF()
+                val startEpochMs = s.readLong().takeIf { it != Long.MIN_VALUE }
                 val n = s.readInt()
                 if (n < 0 || n > 2_000_000) return null
                 fun arr() = DoubleArray(n) { s.readDouble() }
@@ -49,7 +50,7 @@ object ImuAnalysisCache {
                 ImuAnalysisResult(
                     minutes, speedKmh, strokeEnergy, rhythmicity, strokeRate, pitchDeg, rollDeg,
                     mode, seThreshold, concThreshold, glideSec, paddleSec, waitSec, foilRuns,
-                    medianStrokeRate, fs, durationMin, sourceName,
+                    medianStrokeRate, fs, durationMin, sourceName, startEpochMs,
                 )
             }
         } catch (_: Exception) {
@@ -75,6 +76,7 @@ object ImuAnalysisCache {
                 s.writeInt(r.glideSec); s.writeInt(r.paddleSec); s.writeInt(r.waitSec); s.writeInt(r.foilRuns)
                 s.writeDouble(r.medianStrokeRate); s.writeDouble(r.fs); s.writeDouble(r.durationMin)
                 s.writeUTF(r.sourceName)
+                s.writeLong(r.startEpochMs ?: Long.MIN_VALUE)
                 s.writeInt(n)
                 for (a in arrayOf(r.minutes, r.speedKmh, r.strokeEnergy, r.rhythmicity, r.strokeRate, r.pitchDeg, r.rollDeg)) {
                     for (v in a) s.writeDouble(v)

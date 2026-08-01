@@ -50,8 +50,13 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ch.ywesee.movementlogger.data.ImuAnalysis
@@ -89,6 +94,57 @@ private fun sizeLabel(bytes: Long): String = when {
     bytes >= 1_000_000 -> "%.1f MB".format(bytes / 1_000_000.0)
     bytes >= 1000 -> "%.0f KB".format(bytes / 1000.0)
     else -> "$bytes B"
+}
+
+/**
+ * x-axis base in LOCAL-time seconds so tick marks land on round wall-clock
+ * values (12:15:00, not 12:14:37); 0 when the recording has no epoch anchor,
+ * which degrades the labels to elapsed hh:mm:ss.
+ */
+private fun axisBaseSec(startEpochMs: Long?): Double =
+    if (startEpochMs != null) {
+        (startEpochMs + java.util.TimeZone.getDefault().getOffset(startEpochMs)) / 1000.0
+    } else 0.0
+
+private fun niceStepSec(spanSec: Double, widthPx: Float, minGapPx: Float): Double {
+    for (s in doubleArrayOf(1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0)) {
+        if (widthPx * (s / spanSec) >= minGapPx) return s
+    }
+    return 7200.0
+}
+
+private fun hms(absSec: Double): String {
+    val t = Math.floorMod(Math.round(absSec), 86400L)
+    return "%02d:%02d:%02d".format(t / 3600, (t % 3600) / 60, t % 60)
+}
+
+private fun fmtVal(v: Double): String = when {
+    kotlin.math.abs(v) >= 100 -> "%.0f".format(v)
+    kotlin.math.abs(v) >= 10 -> "%.1f".format(v)
+    else -> "%.2f".format(v)
+}
+
+/** Vertical time gridlines over the plot band + hh:mm:ss labels below it. */
+private fun DrawScope.drawTimeAxis(
+    tm: TextMeasurer, style: TextStyle, gridColor: Color,
+    xminMin: Double, xmaxMin: Double, plotH: Float, startEpochMs: Long?,
+) {
+    val spanSec = ((xmaxMin - xminMin) * 60.0).coerceAtLeast(1e-6)
+    val step = niceStepSec(spanSec, size.width, 72.dp.toPx())
+    val base = axisBaseSec(startEpochMs) + xminMin * 60.0
+    var tick = kotlin.math.ceil(base / step) * step
+    var lastEnd = -Float.MAX_VALUE
+    while (tick <= base + spanSec + 1e-9) {
+        val x = ((tick - base) / spanSec * size.width).toFloat()
+        drawLine(gridColor, Offset(x, 0f), Offset(x, plotH), 1f)
+        val l = tm.measure(AnnotatedString(hms(tick)), style)
+        val lx = (x - l.size.width / 2f).coerceIn(0f, size.width - l.size.width)
+        if (lx > lastEnd + 4f) {
+            drawText(l, topLeft = Offset(lx, plotH + (size.height - plotH - l.size.height) / 2f))
+            lastEnd = lx + l.size.width
+        }
+        tick += step
+    }
 }
 
 /**
@@ -250,13 +306,14 @@ private fun ResultView(r: ImuAnalysisResult) {
         val panelW = ((screenW - 32) * zoom).dp
         Box(Modifier.horizontalScroll(hScroll).transformable(transformState, canPan = { false })) {
             Column(Modifier.width(panelW)) {
+                val scrollX = { hScroll.value.toFloat() }
                 if (r.speedKmh.any { it > 0.5 }) {
-                    LinePanel("GPS speed", "km/h", r.minutes, r.speedKmh, SPEED_C, hLine = ImuAnalysis.FOIL_KMH,
-                        hColor = Color(0xFF0284C7), bands = bands, fill = true)
+                    LinePanel("GPS speed", "km/h", r.minutes, r.speedKmh, SPEED_C, r.startEpochMs, scrollX,
+                        hLine = ImuAnalysis.FOIL_KMH, hColor = Color(0xFF0284C7), bands = bands, fill = true)
                 }
-                LinePanel("Board angle (mount-relative)", "deg", r.minutes, r.pitchDeg, PITCH_C,
+                LinePanel("Board angle (mount-relative)", "deg", r.minutes, r.pitchDeg, PITCH_C, r.startEpochMs, scrollX,
                     bands = bands, symmetric = true, second = r.rollDeg, secondColor = ROLL_C)
-                LinePanel("Stroke energy (0.35–1.3 Hz)", "RMS", r.minutes, r.strokeEnergy, ENERGY_C,
+                LinePanel("Stroke energy (0.35–1.3 Hz)", "RMS", r.minutes, r.strokeEnergy, ENERGY_C, r.startEpochMs, scrollX,
                     hLine = r.seThreshold, hColor = Color(0xFFB45309), bands = bands, fill = true)
                 ModeStrip(r)
             }
@@ -309,19 +366,25 @@ private fun computeBands(r: ImuAnalysisResult): List<BandRun> {
 @Composable
 private fun LinePanel(
     title: String, unit: String, minutes: DoubleArray, ys: DoubleArray, color: Color,
+    startEpochMs: Long?,
+    scrollX: () -> Float = { 0f },
     hLine: Double? = null, hColor: Color = Color.Gray, bands: List<BandRun> = emptyList(),
     symmetric: Boolean = false, fill: Boolean = false,
     second: DoubleArray? = null, secondColor: Color = Color.Gray,
 ) {
     val surface = MaterialTheme.colorScheme.surfaceVariant
+    val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val tm = rememberTextMeasurer()
     Column(Modifier.padding(bottom = 6.dp)) {
         Row(Modifier.fillMaxWidth()) {
             Text(title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.weight(1f))
             Text(unit, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        Canvas(Modifier.fillMaxWidth().height(120.dp).clip(RoundedCornerShape(8.dp)).background(surface)) {
+        // 120 dp plot band + 16 dp time-axis band below it
+        Canvas(Modifier.fillMaxWidth().height(136.dp).clip(RoundedCornerShape(8.dp)).background(surface)) {
             if (minutes.size < 2) return@Canvas
+            val plotH = size.height - 16.dp.toPx()
             val xmin = minutes.first(); val xmax = minutes.last(); val xr = (xmax - xmin).coerceAtLeast(1e-6)
             val all = if (second != null) ys.filter { it.isFinite() } + second.filter { it.isFinite() } else ys.filter { it.isFinite() }
             if (all.isEmpty()) return@Canvas
@@ -331,18 +394,32 @@ private fun LinePanel(
             if (fill) ymin = minOf(ymin, 0.0)
             val yr = (ymax - ymin).coerceAtLeast(1e-6)
             fun px(x: Double) = ((x - xmin) / xr * size.width).toFloat()
-            fun py(y: Double) = (size.height - (y - ymin) / yr * size.height).toFloat()
+            fun py(y: Double) = (plotH - (y - ymin) / yr * plotH).toFloat()
 
             for (b in bands) {
                 drawRect(modeColor(b.mode).copy(alpha = 0.12f),
                     topLeft = Offset(px(b.start.toDouble()), 0f),
-                    size = Size((px(b.end.toDouble()) - px(b.start.toDouble())).coerceAtLeast(1f), size.height))
+                    size = Size((px(b.end.toDouble()) - px(b.start.toDouble())).coerceAtLeast(1f), plotH))
             }
+            val axisStyle = TextStyle(fontSize = 9.sp, color = labelColor)
+            drawTimeAxis(tm, axisStyle, labelColor.copy(alpha = 0.18f), xmin, xmax, plotH, startEpochMs)
             if (symmetric) drawLine(Color.Gray.copy(alpha = 0.4f), Offset(0f, py(0.0)), Offset(size.width, py(0.0)), 1f)
             if (hLine != null) drawLine(hColor.copy(alpha = 0.8f), Offset(0f, py(hLine)), Offset(size.width, py(hLine)), 1.2f)
 
             drawSeries(minutes, ys, color, fill, ymin, ymax, ::px, ::py)
             if (second != null) drawSeries(minutes, second, secondColor, false, ymin, ymax, ::px, ::py)
+
+            // y-scale readout: top-of-axis value (and bottom for symmetric
+            // panels) so the trace has a magnitude, not just a shape. Pinned
+            // to the viewport's left edge via the live scroll offset — the
+            // canvas itself is the full zoomed content width.
+            val labelX = scrollX() + 4.dp.toPx()
+            val top = tm.measure(AnnotatedString("${fmtVal(ymax)} $unit"), axisStyle)
+            drawText(top, topLeft = Offset(labelX, 2.dp.toPx()))
+            if (symmetric) {
+                val bot = tm.measure(AnnotatedString("${fmtVal(ymin)} $unit"), axisStyle)
+                drawText(bot, topLeft = Offset(labelX, plotH - bot.size.height - 2.dp.toPx()))
+            }
         }
     }
 }
@@ -368,6 +445,8 @@ private fun DrawScope.drawSeries(
 
 @Composable
 private fun ModeStrip(r: ImuAnalysisResult) {
+    val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val tm = rememberTextMeasurer()
     Column(Modifier.padding(top = 4.dp)) {
         Text("Mode", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         Canvas(Modifier.fillMaxWidth().height(30.dp).clip(RoundedCornerShape(6.dp))) {
@@ -382,6 +461,14 @@ private fun ModeStrip(r: ImuAnalysisResult) {
                 drawRect(modeColor(r.mode[i]), topLeft = Offset(x0, 0f), size = Size((x1 - x0).coerceAtLeast(1f), size.height))
                 i = j + 1
             }
+        }
+        // time ruler under the strip (label-only pass: plot band height 0)
+        Canvas(Modifier.fillMaxWidth().height(16.dp)) {
+            if (r.minutes.size < 2) return@Canvas
+            drawTimeAxis(
+                tm, TextStyle(fontSize = 9.sp, color = labelColor), Color.Transparent,
+                r.minutes.first(), r.minutes.last(), 0f, r.startEpochMs,
+            )
         }
     }
 }

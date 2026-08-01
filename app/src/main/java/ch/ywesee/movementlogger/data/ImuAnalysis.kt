@@ -45,6 +45,8 @@ data class ImuAnalysisResult(
     val fs: Double,
     val durationMin: Double,
     val sourceName: String,
+    /** Wall-clock epoch ms of the grid's t=0 (from the CSV's `# SYNC` anchor); null for legacy files. */
+    val startEpochMs: Long?,
 )
 
 object ImuAnalysis {
@@ -81,7 +83,14 @@ object ImuAnalysis {
         val gpsSec = DoubleArray(gps.size) { gps[it].ticks * 0.01 }
         val gpsSpd = DoubleArray(gps.size) { clampSpeed(gps[it].speedKmhModule) }
 
-        return core(ux, uy, uz, sec, fs, gx, gy, gz, gpsSec, gpsSpd, sensFile.name)
+        // Wall-clock anchor: the `# SYNC epoch_ms=… tick_ms=…` marker maps the
+        // tick clock to phone epoch; project it onto the first sample so the
+        // graphs can label the x axis with real time-of-day.
+        val startEpochMs = CsvParsers.parseSyncAnchorsFile(sensFile).firstOrNull()?.let { a ->
+            (a.epochMs + (sec[0] - a.ticks * 0.01) * 1000.0).toLong()
+        }
+
+        return core(ux, uy, uz, sec, fs, gx, gy, gz, gpsSec, gpsSpd, sensFile.name, startEpochMs)
     }
 
     private class SensArrays(val ticks: DoubleArray, val ax: DoubleArray, val ay: DoubleArray, val az: DoubleArray)
@@ -122,6 +131,7 @@ object ImuAnalysis {
         ux: DoubleArray, uy: DoubleArray, uz: DoubleArray, sampleSec: DoubleArray, fs: Double,
         gx: DoubleArray, gy: DoubleArray, gz: DoubleArray,
         gpsSec: DoubleArray, gpsSpeed: DoubleArray, sourceName: String,
+        startEpochMs: Long? = null,
     ): ImuAnalysisResult {
         val n = ux.size
         val dur = sampleSec[n - 1] - sampleSec[0]
@@ -234,6 +244,7 @@ object ImuAnalysis {
             glideSec = glide, paddleSec = paddle, waitSec = wait,
             foilRuns = foilRuns, medianStrokeRate = medSr,
             fs = fs, durationMin = dur / 60.0, sourceName = sourceName,
+            startEpochMs = startEpochMs,
         )
     }
 
