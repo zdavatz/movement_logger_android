@@ -71,8 +71,10 @@ private val GLIDE_C = Color(0xFF2563EB)
 private val PADDLE_C = Color(0xFFEA7317)
 private val WAIT_C = Color(0xFF94A3B8)
 private val SPEED_C = Color(0xFF2E7D32)
-private val PITCH_C = Color(0xFF2563EB)
-private val ROLL_C = Color(0xFFEA7317)
+// Deliberately NOT the glide-blue / paddle-orange of the activity bands —
+// pitch/roll shared those hues once and the legend read as "double orange".
+private val PITCH_C = Color(0xFF7C3AED)
+private val ROLL_C = Color(0xFFDB2777)
 private val ENERGY_C = Color(0xFF0D9488)
 
 private fun modeColor(m: ImuMode) = when (m) {
@@ -312,7 +314,8 @@ private fun ResultView(r: ImuAnalysisResult) {
                         hLine = ImuAnalysis.FOIL_KMH, hColor = Color(0xFF0284C7), bands = bands, fill = true)
                 }
                 LinePanel("Board angle (mount-relative)", "deg", r.minutes, r.pitchDeg, PITCH_C, r.startEpochMs, scrollX,
-                    bands = bands, symmetric = true, second = r.rollDeg, secondColor = ROLL_C)
+                    bands = bands, symmetric = true, second = r.rollDeg, secondColor = ROLL_C,
+                    seriesLegend = listOf("Pitch" to PITCH_C, "Roll" to ROLL_C))
                 LinePanel("Stroke energy (0.35–1.3 Hz)", "RMS", r.minutes, r.strokeEnergy, ENERGY_C, r.startEpochMs, scrollX,
                     hLine = r.seThreshold, hColor = Color(0xFFB45309), bands = bands, fill = true)
                 ModeStrip(r)
@@ -371,14 +374,24 @@ private fun LinePanel(
     hLine: Double? = null, hColor: Color = Color.Gray, bands: List<BandRun> = emptyList(),
     symmetric: Boolean = false, fill: Boolean = false,
     second: DoubleArray? = null, secondColor: Color = Color.Gray,
+    seriesLegend: List<Pair<String, Color>> = emptyList(),
 ) {
     val surface = MaterialTheme.colorScheme.surfaceVariant
     val labelColor = MaterialTheme.colorScheme.onSurfaceVariant
     val tm = rememberTextMeasurer()
     Column(Modifier.padding(bottom = 6.dp)) {
-        Row(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.weight(1f))
+            // which line is which, right where the question arises — the
+            // bottom legend row is far away and the line hues double as the
+            // activity-band hues
+            seriesLegend.forEach { (label, c) ->
+                Box(Modifier.size(width = 12.dp, height = 4.dp).clip(RoundedCornerShape(2.dp)).background(c))
+                Spacer(Modifier.width(3.dp))
+                Text(label, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(8.dp))
+            }
             Text(unit, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         // 120 dp plot band + 16 dp time-axis band below it
