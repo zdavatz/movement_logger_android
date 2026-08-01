@@ -55,6 +55,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ch.ywesee.movementlogger.data.ImuAnalysis
+import ch.ywesee.movementlogger.data.ImuAnalysisCache
 import ch.ywesee.movementlogger.data.ImuAnalysisResult
 import ch.ywesee.movementlogger.data.ImuMode
 import kotlinx.coroutines.Dispatchers
@@ -148,6 +149,7 @@ fun ImuAnalysisScreen() {
 
 @Composable
 private fun AnalysisDetail(rec: ImuRec, onBack: () -> Unit) {
+    val ctx = LocalContext.current
     var result by remember { mutableStateOf<ImuAnalysisResult?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(true) }
@@ -155,10 +157,12 @@ private fun AnalysisDetail(rec: ImuRec, onBack: () -> Unit) {
     LaunchedEffect(rec.sens.path) {
         loading = true; error = null; result = null
         try {
-            result = withContext(Dispatchers.Default) {
-                val gps = rec.gps ?: throw ImuAnalysis.AnalysisException("No paired GpsPhone file for ${rec.sens.name}.")
-                ImuAnalysis.fromPhoneLogger(rec.sens, gps)
-            }
+            result = withContext(Dispatchers.IO) { ImuAnalysisCache.load(ctx, rec.sens, rec.gps) }
+                ?: withContext(Dispatchers.Default) {
+                    val gps = rec.gps ?: throw ImuAnalysis.AnalysisException("No paired GpsPhone file for ${rec.sens.name}.")
+                    ImuAnalysis.fromPhoneLogger(rec.sens, gps)
+                        .also { ImuAnalysisCache.store(ctx, rec.sens, rec.gps, it) }
+                }
         } catch (e: Exception) {
             error = e.message ?: "Analysis failed."
         }
