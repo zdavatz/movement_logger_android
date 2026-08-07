@@ -17,6 +17,9 @@ import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.audio.AudioProcessor
+import androidx.media3.common.audio.ChannelMixingAudioProcessor
+import androidx.media3.common.audio.ChannelMixingMatrix
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.MatrixTransformation
@@ -165,6 +168,9 @@ object VideoMerger {
         clips: List<Clip>,
         session: SensorSession?,
         displayName: String,
+        backgroundMusic: Uri? = null,
+        musicVolume: Float = 0.35f,
+        muteClipAudio: Boolean = false,
         onProgress: (Float) -> Unit,
     ): Uri {
         require(clips.isNotEmpty()) { "no clips to merge" }
@@ -207,10 +213,16 @@ object VideoMerger {
                 return f
             }
             val firstFrame = extractFirstFrame(context, clips.first())
+            // Music credit for the intro card (only when music actually plays).
+            val credit = if (backgroundMusic != null && musicVolume.coerceIn(0f, 1f) > 0f) {
+                musicCreditString(context, backgroundMusic)
+            } else {
+                null
+            }
             val s = Stills(
                 intro = writePng(
                     "intro_$stamp.png",
-                    renderIntroCard(plan.outWidth, plan.outHeight, videoRegionH, firstFrame),
+                    renderIntroCard(plan.outWidth, plan.outHeight, videoRegionH, firstFrame, credit),
                 ),
                 cards = clips.mapIndexed { i, clip ->
                     writePng(
@@ -239,10 +251,44 @@ object VideoMerger {
             // duration), so each clip's overlays carry the clip's global
             // start offset to recover clip-local time.
             val items = withContext(Dispatchers.Default) {
-                buildSequenceItems(clips, stills, session, plan, pumpLogo)
+                buildSequenceItems(clips, stills, session, plan, pumpLogo, muteClipAudio)
             }
 
-            val composition = Composition.Builder(EditedMediaItemSequence(items))
+            // Optional background music: a SECOND, looping audio-only sequence
+            // that Transformer mixes UNDER the primary sequence's audio. A
+            // looping sequence is repeated to fill the primary (film) duration
+            // and truncated there, so it covers the whole film whether the
+            // track is shorter or longer. Volume is scaled by a channel-mixing
+            // processor. `muteClipAudio` drops the clips' own sound (via
+            // setRemoveAudio on each clip item) so the music carries the film
+            // alone; by DEFAULT the original video sound is KEPT and the music
+            // sits under it. (Media3 1.4.1 has no built-in fade audio
+            // processor, and a per-item processor on a looping sequence is
+            // flushed each loop — so, unlike iOS's AVMutableAudioMix, there is
+            // no start/end fade here; the visual outro fade-to-black masks the
+            // audio stop at the film's end.)
+            val vol = musicVolume.coerceIn(0f, 1f)
+            val musicSequence: EditedMediaItemSequence? =
+                if (backgroundMusic != null && vol > 0f) {
+                    val volumeProcessor = ChannelMixingAudioProcessor().apply {
+                        putChannelMixingMatrix(ChannelMixingMatrix.create(1, 1).scaleBy(vol))
+                        putChannelMixingMatrix(ChannelMixingMatrix.create(2, 2).scaleBy(vol))
+                    }
+                    val musicItem = EditedMediaItem.Builder(MediaItem.fromUri(backgroundMusic))
+                        .setEffects(
+                            Effects(listOf<AudioProcessor>(volumeProcessor), emptyList()),
+                        )
+                        .build()
+                    EditedMediaItemSequence(listOf(musicItem), /* isLooping = */ true)
+                } else {
+                    null
+                }
+
+            val sequences = buildList {
+                add(EditedMediaItemSequence(items))
+                musicSequence?.let { add(it) }
+            }
+            val composition = Composition.Builder(sequences)
                 // Tone-map HDR sources down to SDR — load-bearing, same
                 // rationale as VideoExporter (SDR overlay bitmaps trip the
                 // Ultra-HDR codepath on iPhone HDR clips otherwise).
@@ -287,6 +333,7 @@ object VideoMerger {
         session: SensorSession?,
         plan: VideoExporter.OutputPlan,
         pumpLogo: Bitmap?,
+        muteClipAudio: Boolean,
     ): List<EditedMediaItem> {
         // Shared full-frame opaque black bitmap for every fade-out.
         val black = Bitmap.createBitmap(plan.outWidth, plan.outHeight, Bitmap.Config.ARGB_8888)
@@ -345,6 +392,9 @@ object VideoMerger {
                 )
             }
             items += EditedMediaItem.Builder(MediaItem.fromUri(clip.uri))
+                // Keep the footage's own audio by default; drop it only when
+                // the user asked the background music to carry the film alone.
+                .setRemoveAudio(muteClipAudio)
                 .setEffects(Effects(/* audioProcessors = */ emptyList(), clipEffects))
                 .build()
             cursorUs += clipDurationUs
@@ -503,7 +553,36 @@ object VideoMerger {
      * with a soft shadow so the frame shows through; on a null background it
      * renders fully opaque on solid black (the legacy intro).
      */
-    private fun renderIntroCard(w: Int, h: Int, videoRegionH: Int, background: Bitmap?): Bitmap {
+    /**
+     * Title — artist for the intro credit: the track's embedded metadata,
+     * falling back to its filename (the user names tracks by song title).
+     */
+    private fun musicCreditString(context: Context, uri: Uri): String? {
+        val mmr = MediaMetadataRetriever()
+        var title: String? = null
+        var artist: String? = null
+        try {
+            mmr.setDataSource(context, uri)
+            title = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
+            artist = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
+        } catch (_: Exception) {
+            // fall through to the filename
+        } finally {
+            runCatching { mmr.release() }
+        }
+        val t = title?.trim()
+        val a = artist?.trim()
+        val base = if (!t.isNullOrEmpty()) {
+            if (!a.isNullOrEmpty()) "$t — $a" else t
+        } else {
+            uri.path?.let { File(it).nameWithoutExtension } ?: "music"
+        }
+        return if (base.isBlank()) null else "♫ $base"
+    }
+
+    private fun renderIntroCard(
+        w: Int, h: Int, videoRegionH: Int, background: Bitmap?, musicCredit: String? = null,
+    ): Bitmap {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         canvas.drawColor(Color.BLACK)
@@ -544,6 +623,24 @@ object VideoMerger {
             val s = ch.toString()
             canvas.drawText(s, x, baseline, paint)
             x += paint.measureText(s)
+        }
+        // Music credit ("♫ Title — Artist") as a smaller translucent line
+        // under the title, shrunk to fit ~90 % of the width.
+        if (musicCredit != null) {
+            val creditPaint = Paint().apply {
+                isAntiAlias = true
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                color = Color.argb(230, 255, 255, 255)
+                textAlign = Paint.Align.CENTER
+                textSize = paint.textSize * 0.30f
+                setShadowLayer(paint.textSize * 0.05f, 0f, 0f, Color.argb(180, 0, 0, 0))
+            }
+            val maxW = w * 0.90f
+            while (creditPaint.measureText(musicCredit) > maxW && creditPaint.textSize > 8f) {
+                creditPaint.textSize -= 2f
+            }
+            val creditY = baseline + paint.fontMetrics.descent + h * 0.03f + creditPaint.textSize
+            canvas.drawText(musicCredit, w / 2f, creditY, creditPaint)
         }
         return bmp
     }

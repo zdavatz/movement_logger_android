@@ -57,6 +57,15 @@ data class MergeUiState(
     val computing: Boolean = false,
     val error: String? = null,
     val exportState: ExportState = ExportState.Idle,
+    /** Optional background-music track (a LOCAL audio file the user supplied
+     *  — imported from the picker or already in the app's Music folder).
+     *  Nothing is ever downloaded in-app. */
+    val musicUri: Uri? = null,
+    val musicName: String? = null,
+    /** Background-music level, 0…1 (below the footage audio by default). */
+    val musicVolume: Float = 0.35f,
+    /** Drop the clips' original sound so the music carries the film alone. */
+    val muteClipAudio: Boolean = false,
 ) {
     /** Sensor panels composite only when both CSVs are loaded + fusion done. */
     val sensorsReady: Boolean
@@ -210,6 +219,71 @@ class MergeViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(exportState = ExportState.Idle) }
     }
 
+    // ── background music (optional) ──────────────────────────────────────
+
+    /**
+     * Canonical on-device home for background-music tracks: the app's
+     * external files `Music/` folder (created on demand). Drop audio here
+     * (`adb push … files/Music/`) and it appears in the picker; the same
+     * folder receives files imported through the system picker. Mirrors
+     * iOS's `Documents/Music/`.
+     */
+    fun musicDir(): File {
+        val base = getApplication<Application>().getExternalFilesDir("Music")
+            ?: File(getApplication<Application>().filesDir, "Music")
+        if (!base.exists()) base.mkdirs()
+        return base
+    }
+
+    /** Audio files already in the Music folder (newest-first). */
+    fun listLocalAudio(): List<File> {
+        val exts = setOf("mp3", "m4a", "aac", "wav", "ogg", "flac", "opus", "3gp")
+        return musicDir().listFiles()
+            ?.filter { it.isFile && it.extension.lowercase() in exts }
+            ?.sortedByDescending { it.lastModified() }
+            ?: emptyList()
+    }
+
+    /** Copy a picked audio content-Uri into the Music folder and select it. */
+    fun pickMusic(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val ctx = getApplication<Application>().applicationContext
+                val name = queryDisplayName(uri)
+                val dest = withContext(Dispatchers.IO) {
+                    val out = File(musicDir(), sanitizeFileName(name))
+                    ctx.contentResolver.openInputStream(uri)?.use { input ->
+                        out.outputStream().use { input.copyTo(it) }
+                    } ?: throw IllegalStateException("cannot read audio file")
+                    out
+                }
+                _state.update { it.copy(musicUri = Uri.fromFile(dest), musicName = dest.name) }
+            } catch (e: Exception) {
+                _state.update { it.copy(error = "Music: ${e.message}") }
+            }
+        }
+    }
+
+    /** Select an audio file already present in the Music folder. */
+    fun selectMusicFile(file: File) {
+        _state.update { it.copy(musicUri = Uri.fromFile(file), musicName = file.name) }
+    }
+
+    fun clearMusic() {
+        _state.update { it.copy(musicUri = null, musicName = null) }
+    }
+
+    fun setMusicVolume(v: Float) {
+        _state.update { it.copy(musicVolume = v.coerceIn(0f, 1f)) }
+    }
+
+    fun setMuteClipAudio(mute: Boolean) {
+        _state.update { it.copy(muteClipAudio = mute) }
+    }
+
+    private fun sanitizeFileName(name: String): String =
+        name.replace(Regex("[/\\\\]"), "_").ifBlank { "music_${System.currentTimeMillis()}.m4a" }
+
     /** Same fusion chain as the Replay tab — see `ReplayViewModel.maybeComputeFusion`. */
     private fun maybeComputeFusion() {
         val s = _state.value
@@ -302,6 +376,9 @@ class MergeViewModel(app: Application) : AndroidViewModel(app) {
                     clips = clips,
                     session = session,
                     displayName = displayName,
+                    backgroundMusic = s.musicUri,
+                    musicVolume = s.musicVolume,
+                    muteClipAudio = s.muteClipAudio,
                 ) { p ->
                     _state.update { it.copy(exportState = ExportState.Running(p)) }
                 }

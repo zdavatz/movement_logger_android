@@ -28,6 +28,8 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -174,6 +176,12 @@ fun MergeScreen(vm: MergeViewModel = viewModel()) {
 
             SensorDataPicker(vm = vm, state = state)
 
+            Spacer(Modifier.height(12.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(12.dp))
+
+            BackgroundMusicPicker(vm = vm, state = state)
+
             if (state.computing) {
                 Spacer(Modifier.height(12.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -236,6 +244,102 @@ private fun SensorDataPicker(vm: MergeViewModel, state: MergeUiState) {
         empty = "no Gps*.csv downloaded",
         onPick = vm::pickGpsCsv,
     )
+}
+
+/**
+ * Optional background-music picker. Pick a local audio file (system picker,
+ * copied into the app's Music folder) or select one already there; set the
+ * level and, optionally, mute the clips' own sound so the music carries the
+ * film. Nothing is downloaded in-app — the user supplies the file.
+ */
+@Composable
+private fun BackgroundMusicPicker(vm: MergeViewModel, state: MergeUiState) {
+    val audioLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? -> uri?.let { vm.pickMusic(it) } }
+    // Re-list when the selection changes (a fresh import lands in the folder).
+    val audioFiles = remember(state.musicName) { vm.listLocalAudio() }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "Background music (optional)",
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.weight(1f),
+        )
+        if (state.musicUri != null) {
+            OutlinedButton(onClick = vm::clearMusic) { Text("Clear") }
+        }
+    }
+    Text(
+        "Pick an audio file you already have; it plays under the clips " +
+            "(looped to the film length). Extract tracks on your computer and " +
+            "drop them into the app's Music folder.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Button(onClick = { audioLauncher.launch("audio/*") }) { Text("Pick audio") }
+        Spacer(Modifier.width(8.dp))
+        Text(
+            state.musicName ?: "no track selected",
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
+        )
+    }
+
+    if (audioFiles.isNotEmpty()) {
+        Spacer(Modifier.height(8.dp))
+        Text("In the Music folder", fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        LazyColumn(modifier = Modifier.fillMaxWidth().height(96.dp)) {
+            items(audioFiles, key = { it.absolutePath }) { f ->
+                val isSelected = Uri.fromFile(f) == state.musicUri
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(f.name, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
+                            Text(
+                                mergeHumanBytesShort(f.length()),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        OutlinedButton(onClick = { vm.selectMusicFile(f) }, enabled = !isSelected) {
+                            Text(if (isSelected) "Selected" else "Use")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Spacer(Modifier.height(8.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Music volume", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+        Text(
+            "${(state.musicVolume * 100).toInt()}%",
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    Slider(value = state.musicVolume, onValueChange = vm::setMusicVolume, valueRange = 0f..1f)
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Mute original video sound", modifier = Modifier.weight(1f))
+        Switch(checked = state.muteClipAudio, onCheckedChange = vm::setMuteClipAudio)
+    }
 }
 
 @Composable
