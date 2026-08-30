@@ -79,6 +79,10 @@ Once the video and both CSVs are picked, **Export combined** renders a single MP
 
 The Alignment card shows the row counts that fall inside the video window, so you can see at a glance how much of the session will be in the export (`trim → gps: 365 / 26914` etc.) before kicking it off.
 
+### Merge
+
+Stitch several phone clips of one session into a single film, in chronological order (by capture time), **never trimming a clip** ("never cut a video") — each clip plays complete, preceded by a date/time title card and followed by a 3 s fade-out. Optionally overlays the same Replay sensor panels under every clip, and optionally mixes in a **background-music track** (a local audio file you supply — imported from the picker or dropped into the app's `Music/` folder; nothing is downloaded), looped and faded under the clips' own sound. As you add clips the **estimated output size** is shown, with a warning before it would exceed **WhatsApp's 2 GB** send limit — so you catch an oversized film before the encode; there's no clip-count cap. The merged MP4 is saved to `Movies/MovementLogger/` and can be opened or shared from the result banner.
+
 ### Analyze
 
 On-device analysis of a recorded Phone-logger ride (`SensPhone_*`/`GpsPhone_*` pair) — reachable from the **More** menu. A per-second **mode strip** shows how each moment was spent — paddling / pumping (orange) vs gliding on the foil (blue) vs waiting (grey) — inferred from the IMU via an STFT cadence analysis, alongside **stroke cadence**, **board pitch / roll** (violet / magenta), and **GPS speed** on one shared timeline. Every graph carries a **real time-of-day axis** (hh:mm:ss, from the recording's phone-clock `# SYNC` anchor) and its **y-axis scale value**, so a moment on the water can be matched to the clock and a peak to a number. **Pinch to zoom** into any stretch and **drag to pan** — the zoom stays anchored to the middle of the view. Results are **cached on disk**: the first open of a long ride computes for ~half a minute, every open after that — including after an app restart — is instant. Everything is computed on the phone; nothing is uploaded.
