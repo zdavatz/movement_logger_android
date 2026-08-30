@@ -36,6 +36,9 @@ data class MergeClipInfo(
     val durationMillis: Long,
     val width: Int,
     val height: Int,
+    /** Source file size in bytes (from OpenableColumns.SIZE) — drives the
+     *  merged-output size estimate / 2 GB WhatsApp guard. */
+    val sizeBytes: Long = 0L,
 )
 
 data class MergeUiState(
@@ -66,6 +69,12 @@ data class MergeUiState(
     val musicVolume: Float = 0.35f,
     /** Drop the clips' original sound so the music carries the film alone. */
     val muteClipAudio: Boolean = false,
+    /** Estimated size of the merged film (bytes), refreshed whenever the clip
+     *  set or panel selection changes — so the user is warned BEFORE the
+     *  (many-minute) encode. null = unknown. */
+    val estimatedExportBytes: Long? = null,
+    /** True when the estimate is at/over WhatsApp's 2 GB share ceiling. */
+    val exceedsShareLimit: Boolean = false,
 ) {
     /** Sensor panels composite only when both CSVs are loaded + fusion done. */
     val sensorsReady: Boolean
@@ -112,10 +121,12 @@ class MergeViewModel(app: Application) : AndroidViewModel(app) {
                             durationMillis = if (size.durationMs > 0) size.durationMs else meta.durationMillis,
                             width = size.width,
                             height = size.height,
+                            sizeBytes = querySize(uri),
                         )
                     }.sortedBy { it.creationTimeMillis ?: Long.MAX_VALUE }
                 }
                 _state.update { it.copy(clips = infos, loading = false) }
+                refreshEstimate()
                 // hhmmss.ss GPS rows without `# SYNC` anchors were anchored
                 // to "today" if they loaded before the videos — re-anchor to
                 // the session date now that clip creation times are known.
@@ -145,6 +156,7 @@ class MergeViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearClips() {
         _state.update { it.copy(clips = emptyList()) }
+        refreshEstimate()
     }
 
     fun pickSensorCsv(file: File) {
@@ -209,6 +221,7 @@ class MergeViewModel(app: Application) : AndroidViewModel(app) {
                 fusedHeightM = DoubleArray(0), sensorAbsTimesMs = LongArray(0),
             )
         }
+        refreshEstimate()
     }
 
     fun clearError() {
@@ -315,6 +328,7 @@ class MergeViewModel(app: Application) : AndroidViewModel(app) {
                         computing = false,
                     )
                 }
+                refreshEstimate()   // panels now composite → taller frame
             } catch (e: Exception) {
                 _state.update { it.copy(computing = false, error = "fusion: ${e.message}") }
             }
@@ -440,5 +454,54 @@ class MergeViewModel(app: Application) : AndroidViewModel(app) {
                 }
         } catch (_: Exception) { /* fall through */ }
         return uri.lastPathSegment ?: "video"
+    }
+
+    /** Source file size in bytes for the output-size estimate; 0 if unknown. */
+    private fun querySize(uri: Uri): Long {
+        val ctx = getApplication<Application>().applicationContext
+        try {
+            ctx.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+                ?.use { c ->
+                    val idx = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (idx >= 0 && c.moveToFirst() && !c.isNull(idx)) return c.getLong(idx)
+                }
+        } catch (_: Exception) { /* fall through */ }
+        return 0L
+    }
+
+    /**
+     * Recompute the merged-output size estimate + the 2 GB WhatsApp guard from
+     * the current clips + panel availability. No native "estimate output size"
+     * exists for Media3 Transformer, so this scales the summed source bytes by
+     * the film-length factor (intro/title/freeze/outro seconds charged at the
+     * average clip bitrate — a safe over-estimate) and the panel-stack factor
+     * (panels roughly double the frame height: `planOutput` sets the panel band
+     * to the full source height). iOS uses AVFoundation's own estimator, so the
+     * two won't match to the byte, but both flag a film that lands over 2 GB.
+     */
+    private fun refreshEstimate() {
+        val s = _state.value
+        val clips = s.clips
+        val totalBytes = clips.sumOf { it.sizeBytes }
+        val clipMs = clips.sumOf { maxOf(it.durationMillis, 0L) }
+        if (clips.isEmpty() || totalBytes <= 0L || clipMs <= 0L) {
+            _state.update { it.copy(estimatedExportBytes = null, exceedsShareLimit = false) }
+            return
+        }
+        val filmMs = clipMs + clips.size * (2500L + 3000L) + 3000L + 5000L
+        val filmFactor = filmMs.toDouble() / clipMs.toDouble()
+        val panelFactor = if (s.sensorsReady) 2.0 else 1.0
+        val est = (totalBytes.toDouble() * filmFactor * panelFactor).toLong()
+        _state.update {
+            it.copy(
+                estimatedExportBytes = est,
+                exceedsShareLimit = est >= SHARE_SIZE_LIMIT_BYTES,
+            )
+        }
+    }
+
+    companion object {
+        /** WhatsApp refuses to send a video larger than 2 GB. */
+        const val SHARE_SIZE_LIMIT_BYTES = 2L * 1024 * 1024 * 1024
     }
 }

@@ -89,7 +89,9 @@ fun MergeScreen(vm: MergeViewModel = viewModel()) {
             Text(
                 "Pick several videos — they are ordered by recording time. " +
                     "Each clip plays complete (never trimmed) with a title card " +
-                    "before it and a 3 s fade-out at its end.",
+                    "before it and a 3 s fade-out at its end. Add as many as you " +
+                    "like: the estimated output size shows below, so you can keep " +
+                    "adding while it stays under WhatsApp's 2 GB send limit.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -108,6 +110,13 @@ fun MergeScreen(vm: MergeViewModel = viewModel()) {
                         onClick = { vm.mergeVideos() },
                         enabled = state.exportState !is ExportState.Running,
                     ) { Text("Merge videos") }
+                }
+            }
+
+            state.estimatedExportBytes?.let { est ->
+                if (state.clips.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    SizeEstimateNotice(bytes = est, exceeds = state.exceedsShareLimit)
                 }
             }
 
@@ -382,6 +391,40 @@ private fun MergeFileChooserList(
             }
         }
     }
+}
+
+/** Estimated merged-output size, with an over-2-GB WhatsApp warning. */
+@Composable
+private fun SizeEstimateNotice(bytes: Long, exceeds: Boolean) {
+    if (exceeds) {
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+            ),
+        ) {
+            Text(
+                "Estimated ${formatBytesShort(bytes)} — larger than WhatsApp's 2 GB " +
+                    "send limit. Remove or shorten clips to share it on WhatsApp. " +
+                    "(The film still exports and saves to Movies.)",
+                modifier = Modifier.padding(12.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+        }
+    } else {
+        Text(
+            "Estimated size ~${formatBytesShort(bytes)} — under WhatsApp's 2 GB limit",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+private fun formatBytesShort(n: Long): String {
+    val gb = n.toDouble() / 1_073_741_824.0
+    if (gb >= 1.0) return String.format("%.1f GB", gb)
+    val mb = n.toDouble() / 1_048_576.0
+    return String.format("%.0f MB", mb)
 }
 
 @Composable
