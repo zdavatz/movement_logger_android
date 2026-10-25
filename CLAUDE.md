@@ -23,7 +23,7 @@ Pure Kotlin + Jetpack Compose, no NDK. Phase-2 numerics (Madgwick fusion, baro h
 ./gradlew assembleRelease            # signed APK for sideload
 ```
 
-APK lands at `app/build/outputs/apk/debug/app-debug.apk` (debug) or `…/release/app-release.apk` (release, signed only when `signing.properties` is present at repo root). AAB at `app/build/outputs/bundle/release/app-release.aab`. SDK path comes from `local.properties` (not committed). The wrapper pins Gradle 8.9; AGP is 8.7.3 in `gradle/libs.versions.toml`.
+APK lands at `app/build/outputs/apk/debug/app-debug.apk` (debug) or `…/release/app-release.apk` (release, signed only when `signing.properties` is present at repo root). AAB at `app/build/outputs/bundle/release/app-release.aab`. SDK path comes from `local.properties` (not committed). The wrapper pins Gradle 8.11.1; AGP is 8.10.1 (compile + target SDK 36 — Play rejects updates targeting < 36 since 2026, "Target SDK of artifact is too low") in `gradle/libs.versions.toml`.
 
 Targets: `minSdk 26 / compileSdk 35 / targetSdk 35`, `buildToolsVersion 34.0.0`.
 

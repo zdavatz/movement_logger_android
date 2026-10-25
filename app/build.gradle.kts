@@ -22,15 +22,15 @@ val cliVersionCode: Int?    = (project.findProperty("appVersionCode") as String?
 
 android {
     namespace = "ch.ywesee.movementlogger"
-    compileSdk = 35
+    compileSdk = 36
     buildToolsVersion = "34.0.0"
 
     defaultConfig {
         applicationId = "ch.ywesee.movementlogger"
         minSdk = 26
-        targetSdk = 35
-        versionCode = cliVersionCode ?: 76
-        versionName = cliVersionName ?: "0.0.76"
+        targetSdk = 36
+        versionCode = cliVersionCode ?: 77
+        versionName = cliVersionName ?: "0.0.77"
     }
 
     if (signingProps != null) {
