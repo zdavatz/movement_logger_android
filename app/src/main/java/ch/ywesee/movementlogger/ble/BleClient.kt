@@ -1032,7 +1032,14 @@ class BleClient(private val context: Context) {
         }
         // FileData path — drive the in-flight op's state machine.
         when (val current = op) {
-            CurrentOp.Idle -> Unit  // stray notify between ops — harmless
+            // Stray notify between ops — harmless, except the v0.0.70
+            // SD-refusal byte for a fire-and-forget START_LOG: "eject the
+            // USB drive" / "battery lock" must reach the user.
+            CurrentOp.Idle -> if (value.size == 1 &&
+                (value[0] == FileSyncProtocol.STATUS_SD_USB ||
+                 value[0] == FileSyncProtocol.STATUS_SD_LOWBAT)) {
+                emitErr(FileSyncProtocol.statusMessage(value[0]))
+            }
             is CurrentOp.Listing -> handleListNotify(current, value)
             is CurrentOp.Reading -> handleReadNotify(current, value)
             is CurrentOp.Deleting -> handleDeleteNotify(current, value)

@@ -149,6 +149,12 @@ object FileSyncProtocol {
     const val STATUS_NOT_FOUND: Byte = 0xE1.toByte()
     const val STATUS_IO_ERROR: Byte = 0xE2.toByte()
     const val STATUS_BAD_REQUEST: Byte = 0xE3.toByte()
+    /** Firmware v0.0.70+: an SD-writing op (DELETE / START_LOG / SET_MODE /
+     *  CAL_SET) was refused because a USB host has the card mounted.
+     *  Only replies to writes — deliberately not in [isStatusByte]. */
+    const val STATUS_SD_USB: Byte = 0xE8.toByte()
+    /** Firmware v0.0.70+: same, refused by the low-battery SD lock. */
+    const val STATUS_SD_LOWBAT: Byte = 0xE9.toByte()
 
     // Firmware-update status bytes (in single-byte FW_* notifies).
     /** FW_COMMIT success: image verified, box is swapping banks + resetting. */
@@ -172,6 +178,8 @@ object FileSyncProtocol {
         STATUS_NOT_FOUND -> "NOT_FOUND"
         STATUS_IO_ERROR -> "IO_ERROR"
         STATUS_BAD_REQUEST -> "BAD_REQUEST"
+        STATUS_SD_USB -> "SD card is mounted over USB — eject it on the computer (or unplug USB-C), then retry"
+        STATUS_SD_LOWBAT -> "battery too low — SD writes are locked, charge the box via USB-C"
         else -> "unknown error"
     }
 
