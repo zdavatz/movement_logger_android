@@ -394,7 +394,7 @@ def main() -> None:
         default="completed",
         choices=["completed", "draft", "inProgress", "halted"],
         help="Roll-out status for the release. 'completed' = roll out to "
-             "100% of the track's audience (default). 'draft' = stage in "
+             "100%% of the track's audience (default). 'draft' = stage in "
              "Play Console without rolling out (required when the app is "
              "still in draft state on Play, i.e. has never had a production "
              "release approved). Use 'draft' for first production push.",
