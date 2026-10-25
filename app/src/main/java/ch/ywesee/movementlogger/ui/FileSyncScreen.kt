@@ -1197,10 +1197,7 @@ private fun DownloadedFileViewer(
                         off += n
                     }
                 }
-                val hasNul = buf.any { it == 0.toByte() }
-                val text = if (hasNul) null else runCatching {
-                    buf.toString(Charsets.UTF_8)
-                }.getOrNull()
+                val text = textPreview(buf, truncated = size > cap)
                 Quad(size, text != null, size > cap, text ?: "")
             }.getOrElse { Quad(0L, false, false, "") }
         }
@@ -1291,6 +1288,41 @@ private data class Quad<A, B, C, D>(val a: A, val b: B, val c: C, val d: D)
  *  would stutter for seconds. The Share button handles "I want the
  *  whole thing" cleanly. */
 private const val PREVIEW_CAP_BYTES: Int = 48 * 1024
+
+/** Decode a preview chunk as text, or null if it is genuinely binary.
+ *
+ *  The old check called a file binary for a single NUL byte — which hid
+ *  an ERRLOG.LOG whose card had a cross-linked cluster (a corrupted card
+ *  stitched 72 KB of FAT directory entries into the log). Now: drop a
+ *  partial UTF-8 character at the 48 KB cut, call it binary only when
+ *  >10 % of the bytes are non-whitespace control bytes or invalid UTF-8
+ *  (a damaged log scores ~3 %, PCM/WAV ~75 %), and show damaged spots
+ *  instead of hiding the file — invalid bytes as "�", NUL as "␀".
+ *  Same rule as the iOS viewer. */
+private fun textPreview(raw: ByteArray, truncated: Boolean): String? {
+    var end = raw.size
+    if (truncated) {
+        var lead = end - 1
+        while (lead >= 0 && (raw[lead].toInt() and 0xC0) == 0x80) lead--
+        if (lead >= 0) {
+            val b = raw[lead].toInt() and 0xFF
+            if (b >= 0xC0) {
+                val need = if (b >= 0xF0) 4 else if (b >= 0xE0) 3 else 2
+                if (end - lead < need) end = lead
+            }
+        }
+    }
+    if (end == 0) return ""
+    var control = 0
+    for (i in 0 until end) {
+        val b = raw[i].toInt() and 0xFF
+        if (b < 0x20 && b != 0x09 && b != 0x0A && b != 0x0D) control++
+    }
+    val text = String(raw, 0, end, Charsets.UTF_8)
+    val invalid = text.count { it == '�' }
+    if ((control + invalid) * 10 > end) return null
+    return text.replace('\u0000', '␀')
+}
 
 private fun shareDownloadedFile(
     context: android.content.Context,
