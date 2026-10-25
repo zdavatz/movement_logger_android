@@ -822,10 +822,13 @@ private fun FileRow(
     val queued = f.name in state.queuedDownloads
     val savedPath = state.savedPaths[f.name]
     val deleteReason = deleteUnsupported(f.name)
-    // Fully downloaded = local mirror has at least the box's reported
+    // Fully downloaded = local mirror is exactly the box's reported
     // size. Then the Download button is replaced by a "View" button
     // that opens the file in an inline preview (iOS parity, a86fd6d).
-    val downloaded = f.size > 0L && (state.localBytes[f.name] ?: 0L) >= f.size
+    // A LARGER local copy is a stale mirror of an older file with the
+    // same name (ERRLOG.LOG deleted on the box and recreated) — offer
+    // Download, which mirrorOffset turns into drop + refetch.
+    val downloaded = f.size > 0L && (state.localBytes[f.name] ?: 0L) == f.size
     var viewing by remember { mutableStateOf(false) }
     var mapping by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
