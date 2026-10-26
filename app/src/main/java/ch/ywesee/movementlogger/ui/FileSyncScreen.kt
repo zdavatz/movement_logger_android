@@ -4,6 +4,7 @@ import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import ch.ywesee.movementlogger.BuildConfig
+import ch.ywesee.movementlogger.ble.BatterySample
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -214,6 +215,10 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                                     onDismiss = vm::dismissFirmwareUpdate,
                                 )
                             }
+                        }
+
+                        if (state.connection == Connection.Connected) {
+                            BatteryLockBanner(state.live.latestBattery, Modifier.padding(top = 8.dp))
                         }
 
                         if (state.transferInterrupted && state.connection != Connection.Connected) {
@@ -1033,6 +1038,32 @@ private fun FirmwareUpdateBanner(
             Spacer(Modifier.width(4.dp))
             TextButton(onClick = onDismiss) { Text("✕") }
         }
+    }
+}
+
+/**
+ * Persistent red banner while the box's low-battery SD lock is engaged
+ * (BatteryStatus flags bit 2, firmware v0.0.72+). Driven by the bit only —
+ * never inferred from the voltage. Not dismissible: it clears when the box
+ * notifies the bit back to 0, or on disconnect (LiveState is reset). Shared
+ * by the Sync and Live tabs.
+ */
+@Composable
+internal fun BatteryLockBanner(b: BatterySample?, modifier: Modifier = Modifier) {
+    if (b == null || !b.sdLowbatLock) return
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5)),
+        border = BorderStroke(1.dp, Color(0xFFC75050)),
+    ) {
+        Text(
+            "🔋 Battery lock (%.2f V): recording and GPS paused, SD writes refused. ".format(b.volts()) +
+                "Charge the box (until about 3.7 V) — live data and file download keep working.",
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = Color(0xFFAA1E1E),
+        )
     }
 }
 

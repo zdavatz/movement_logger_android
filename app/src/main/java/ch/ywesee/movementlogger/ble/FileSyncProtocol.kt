@@ -179,7 +179,7 @@ object FileSyncProtocol {
         STATUS_IO_ERROR -> "IO_ERROR"
         STATUS_BAD_REQUEST -> "BAD_REQUEST"
         STATUS_SD_USB -> "SD card is mounted over USB — eject it on the computer (or unplug USB-C), then retry"
-        STATUS_SD_LOWBAT -> "battery too low — SD writes are locked, charge the box via USB-C"
+        STATUS_SD_LOWBAT -> "Battery lock: the box refuses SD writes while the battery is low. Charge the box (until about 3.7 V), then retry"
         else -> "unknown error"
     }
 

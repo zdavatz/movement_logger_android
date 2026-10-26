@@ -206,6 +206,7 @@ data class LiveSample(
  * One decoded BatteryStatus snapshot — the box's dedicated …0200…
  * characteristic (STC3115 fuel gauge). 8-byte LE packed layout. Its flags
  * byte is NOT LiveSample's: bit0 = low_batt (SoC < 10 %), bit1 = logging,
+ * bit2 = sd_lowbat_lock (firmware v0.0.72+; older firmware always sends 0),
  * byte 7 reserved. Byte-identical to desktop `ble.rs` BatterySample.
  */
 data class BatterySample(
@@ -214,6 +215,11 @@ data class BatterySample(
     val currentX100uA: Int,   // signed 100 µA steps (+ charging / − draining)
     val lowBatt: Boolean,     // firmware low-battery warning (SoC < 10 %)
     val logging: Boolean,     // box actively logging to SD
+    /** Low-battery SD lock (flags bit 2, firmware v0.0.72+): session closed,
+     *  GPS in backup, every SD write refused (0xE9) until the cell recovers
+     *  (~3.7 V, i.e. charging). Read the bit — never derive it from
+     *  voltageMv (hysteresis; the release rule may change). */
+    val sdLowbatLock: Boolean = false,
 ) {
     /** SoC as a 0..1 fraction for a progress bar. */
     fun socFrac(): Float = (socX10 / 10f / 100f).coerceIn(0f, 1f)
@@ -237,6 +243,7 @@ data class BatterySample(
                 currentX100uA = bb.getShort(4).toInt(),          // signed i16 — no mask
                 lowBatt = flags and 0x01 != 0,
                 logging = flags and 0x02 != 0,
+                sdLowbatLock = flags and 0x04 != 0,
             )
         }
     }

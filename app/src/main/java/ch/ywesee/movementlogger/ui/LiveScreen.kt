@@ -138,6 +138,8 @@ private fun LiveContent(
             return@Column
         }
 
+        BatteryLockBanner(state.live.latestBattery, Modifier.padding(top = 12.dp))
+
         Spacer(Modifier.height(12.dp))
         FreshnessStrip(state.live)
         HorizontalDivider(Modifier.padding(vertical = 12.dp))
