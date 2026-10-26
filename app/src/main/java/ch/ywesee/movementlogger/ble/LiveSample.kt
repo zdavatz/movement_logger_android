@@ -206,7 +206,8 @@ data class LiveSample(
  * One decoded BatteryStatus snapshot — the box's dedicated …0200…
  * characteristic (STC3115 fuel gauge). 8-byte LE packed layout. Its flags
  * byte is NOT LiveSample's: bit0 = low_batt (SoC < 10 %), bit1 = logging,
- * bit2 = sd_lowbat_lock (firmware v0.0.72+; older firmware always sends 0),
+ * bit2 = sd_lowbat_lock (firmware v0.0.72+), bit3 = sd_usb_host (firmware
+ * v0.0.73+); older firmware always sends 0 for both,
  * byte 7 reserved. Byte-identical to desktop `ble.rs` BatterySample.
  */
 data class BatterySample(
@@ -220,6 +221,11 @@ data class BatterySample(
      *  (~3.7 V, i.e. charging). Read the bit — never derive it from
      *  voltageMv (hysteresis; the release rule may change). */
     val sdLowbatLock: Boolean = false,
+    /** USB host owns the SD card (flags bit 3, firmware v0.0.73+): a computer
+     *  has the card mounted over USB-C, so every SD write is refused (0xE8)
+     *  until it is ejected / unplugged. Notified within ~1 s of every change
+     *  and on subscribe. */
+    val sdUsbHost: Boolean = false,
 ) {
     /** SoC as a 0..1 fraction for a progress bar. */
     fun socFrac(): Float = (socX10 / 10f / 100f).coerceIn(0f, 1f)
@@ -244,6 +250,7 @@ data class BatterySample(
                 lowBatt = flags and 0x01 != 0,
                 logging = flags and 0x02 != 0,
                 sdLowbatLock = flags and 0x04 != 0,
+                sdUsbHost = flags and 0x08 != 0,
             )
         }
     }

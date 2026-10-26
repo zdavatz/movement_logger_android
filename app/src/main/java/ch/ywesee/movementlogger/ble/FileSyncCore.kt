@@ -109,6 +109,8 @@ object FileSyncCore {
      * any Error (every op-termination path emits one), and on Disconnect.
      */
     private var briefOpInFlight = false
+    /** Toggle value before the last optimistic GPS_POWER, restored on failure. */
+    private var gpsPowerBeforeSet: Boolean? = null
 
     /** True while a GPS Debug survey ([BleGpsSurvey]) owns the FileData channel
      *  — the manual/sync loops back off so they don't collide with the UBX
@@ -439,15 +441,30 @@ object FileSyncCore {
         startRead(next)
     }
 
+    /**
+     * BatteryStatus bit 3 (sd_usb_host, firmware v0.0.73+): a computer has the
+     * box's SD card mounted, so the box refuses every SD write with 0xE8.
+     * Short-circuit SD-writing ops (DELETE / START_LOG / SET_MODE / CAL_SET)
+     * here instead of sending and waiting — on iOS the 0xE8 reply was seen
+     * not to arrive, leaving a bare 20 s timeout. Returns true when blocked.
+     */
+    private fun refuseWhileUsbHost(what: String): Boolean {
+        if (_state.value.live.latestBattery?.sdUsbHost != true) return false
+        log("$what not sent: ${FileSyncProtocol.SD_USB_UNPLUG_MSG}")
+        _state.update { it.copy(opError = FileSyncProtocol.SD_USB_UNPLUG_MSG) }
+        return true
+    }
+
     fun delete(file: RemoteFile) {
-        _state.update { it.copy(deleteError = null) }  // clear stale rejection
+        _state.update { it.copy(opError = null) }  // clear stale rejection
+        if (refuseWhileUsbHost("DELETE ${file.name}")) return
         briefOpInFlight = true
         log("DELETE ${file.name}")
         ble?.send(BleCmd.Delete(file.name))
     }
 
-    fun dismissDeleteError() {
-        _state.update { it.copy(deleteError = null) }
+    fun dismissOpError() {
+        _state.update { it.copy(opError = null) }
     }
 
     fun stopLog() {
@@ -462,6 +479,8 @@ object FileSyncCore {
 
     fun startSession() {
         val dur = _state.value.sessionDurationSeconds
+        _state.update { it.copy(opError = null) }
+        if (refuseWhileUsbHost("START_LOG")) return
         // Current firmware does not reboot on START_LOG — it opens a
         // session and auto-stops after `dur` s, the link stays up. Only
         // meaningful in manual mode (in auto the box is already logging).
@@ -479,6 +498,8 @@ object FileSyncCore {
 
     /** Persist the box log-mode and remember it locally. */
     fun setLogMode(manual: Boolean) {
+        _state.update { it.copy(opError = null) }
+        if (refuseWhileUsbHost("SET_MODE")) return
         briefOpInFlight = true
         log("SET_MODE ${if (manual) "manual" else "auto"}")
         ble?.send(BleCmd.SetLogMode(manual))
@@ -493,8 +514,11 @@ object FileSyncCore {
      * wrong guess). The box persists the setting; we don't.
      */
     fun setGpsPower(on: Boolean) {
+        // GPS_POWER is deliberately NOT SD-gated (the box records the choice
+        // and applies it after the lock) — no sdUsbHost short-circuit here.
         briefOpInFlight = true
-        _state.update { it.copy(gpsPowerOn = on) }
+        gpsPowerBeforeSet = _state.value.gpsPowerOn
+        _state.update { it.copy(gpsPowerOn = on, opError = null) }
         log("GPS_POWER ${if (on) "on" else "off"}")
         ble?.send(BleCmd.SetGpsPower(on))
     }
@@ -567,6 +591,7 @@ object FileSyncCore {
      */
     fun pushCalibration(input: Calibration.EncodeInput) {
         val b = ble ?: return
+        if (refuseWhileUsbHost("CAL_SET")) return
         val blob = Calibration.encode(input)
         log("CAL_SET mask=0x%02X".format(blob[1].toInt() and 0xFF))
         b.send(BleCmd.SetCalibration(blob))
@@ -845,8 +870,30 @@ object FileSyncCore {
                 // some Debug rows (8.3-name miss -> NOT_FOUND, >15 chars
                 // -> BAD_REQUEST, logging active -> BUSY). Without this it
                 // only hits the log and looks like the tap did nothing (#7).
-                if (e.msg.startsWith("DELETE ")) {
-                    _state.update { it.copy(deleteError = e.msg) }
+                //
+                // Same for the other user-initiated box-setting ops: a
+                // SET_MODE / GPS_POWER / CAL_SET non-OK status or timeout,
+                // and the fire-and-forget START_LOG's SD refusal, used to
+                // reach only the log — the Auto/Manual switch just silently
+                // didn't move. All of them now land in the op-error banner.
+                val userOp = USER_OP_ERROR_PREFIXES.any { e.msg.startsWith(it) }
+                if (userOp) {
+                    // A timeout while the box reports the card USB-mounted is
+                    // almost certainly an eaten 0xE8 — say what to do instead.
+                    val usbHost = _state.value.live.latestBattery?.sdUsbHost == true
+                    val shown = if (usbHost && e.msg.contains("timed out")) {
+                        FileSyncProtocol.SD_USB_UNPLUG_MSG
+                    } else e.msg
+                    _state.update { it.copy(opError = shown) }
+                    // GPS_POWER was applied optimistically — roll the toggle
+                    // back so it doesn't claim a state the box refused.
+                    if (e.msg.startsWith("GPS_POWER")) {
+                        _state.update { it.copy(gpsPowerOn = gpsPowerBeforeSet) }
+                    }
+                    // A refused START_LOG never opened a session.
+                    if (e.msg.startsWith("START_LOG")) {
+                        _state.update { it.copy(sessionRunning = null) }
+                    }
                 }
                 // "another op is in flight" means the BLE worker rejected
                 // the command BEFORE dispatching — the in-flight op (a
@@ -1010,7 +1057,7 @@ object FileSyncCore {
                         downloads = emptyMap(),
                         queuedDownloads = emptyList(),
                         live = LiveState(),
-                        deleteError = null,
+                        opError = null,
                         firmwareUpdateAvailable = null,
                         // A hard Disconnected during a BT-off test means the
                         // auto-reconnect gave up (or the user disconnected) —
@@ -1115,7 +1162,7 @@ object FileSyncCore {
                 briefOpInFlight = false
                 _state.update { s ->
                     s.copy(files = s.files.filterNot { it.name == e.name },
-                           deleteError = null)
+                           opError = null)
                 }
                 log("deleted ${e.name}")
                 pumpManualQueue()
@@ -1585,6 +1632,10 @@ object FileSyncCore {
      *  sync keeps the worker busy past this, the check resolves the box side as
      *  "unknown" (→ offer update against the latest release). */
     private const val FW_VERSION_QUERY_WINDOW_MS = 20_000L
+    /** BleEvent.Error prefixes of user-initiated ops whose failure must be
+     *  shown in the op-error banner, not just the log. */
+    private val USER_OP_ERROR_PREFIXES =
+        listOf("DELETE ", "SET_MODE", "GPS_POWER", "CAL_SET", "START_LOG")
     private const val MAX_LOG_LINES = 200
     /** Rotate the on-disk log past this size (1 MiB ≈ tens of sessions). */
     private const val MAX_LOG_FILE_BYTES = 1L * 1024 * 1024

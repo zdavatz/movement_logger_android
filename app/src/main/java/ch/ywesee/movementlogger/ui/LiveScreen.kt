@@ -139,6 +139,7 @@ private fun LiveContent(
         }
 
         BatteryLockBanner(state.live.latestBattery, Modifier.padding(top = 12.dp))
+        UsbHostBanner(state.live.latestBattery, Modifier.padding(top = 12.dp))
 
         Spacer(Modifier.height(12.dp))
         FreshnessStrip(state.live)

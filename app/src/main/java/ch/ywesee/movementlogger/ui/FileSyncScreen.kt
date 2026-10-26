@@ -219,6 +219,7 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
 
                         if (state.connection == Connection.Connected) {
                             BatteryLockBanner(state.live.latestBattery, Modifier.padding(top = 8.dp))
+                            UsbHostBanner(state.live.latestBattery, Modifier.padding(top = 8.dp))
                         }
 
                         if (state.transferInterrupted && state.connection != Connection.Connected) {
@@ -236,10 +237,10 @@ fun FileSyncScreen(vm: FileSyncViewModel = viewModel()) {
                         CenteredSpinner(label = "connecting…")
                     }
                     Connection.Connected -> {
-                        state.deleteError?.let { err ->
+                        state.opError?.let { err ->
                             item(key = "delete-error") {
                                 Column {
-                                    DeleteErrorBanner(err) { vm.dismissDeleteError() }
+                                    OpErrorBanner(err) { vm.dismissOpError() }
                                     Spacer(Modifier.height(8.dp))
                                 }
                             }
@@ -1067,8 +1068,39 @@ internal fun BatteryLockBanner(b: BatterySample?, modifier: Modifier = Modifier)
     }
 }
 
+/**
+ * Persistent banner while a computer has the box's SD card mounted over
+ * USB-C (BatteryStatus flags bit 3, firmware v0.0.73+). Same rules as
+ * [BatteryLockBanner]: driven by the bit only, not dismissible, clears when
+ * the box notifies 0 or on disconnect. Both banners stack if both bits are set.
+ */
 @Composable
-private fun DeleteErrorBanner(message: String, onDismiss: () -> Unit) {
+internal fun UsbHostBanner(b: BatterySample?, modifier: Modifier = Modifier) {
+    if (b == null || !b.sdUsbHost) return
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5)),
+        border = BorderStroke(1.dp, Color(0xFFC75050)),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(10.dp)) {
+            Text(
+                "🔌 SD card in use by a computer",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFFAA1E1E),
+            )
+            Text(
+                "Unplug USB-C to delete files or change the log mode. " +
+                    "Live data and download keep working.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(0xFFAA1E1E),
+            )
+        }
+    }
+}
+
+@Composable
+private fun OpErrorBanner(message: String, onDismiss: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = Color(0xFFFFE5E5)),

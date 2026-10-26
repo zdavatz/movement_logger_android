@@ -111,4 +111,16 @@ class LiveSampleTest {
         val s = LiveSample.parse(build())!!
         assertEquals(1.0247, s.accMagnitudeG(), 1e-4)
     }
+
+    @Test
+    fun batteryFlagsDecodeLockAndUsbHostBits() {
+        fun bat(flags: Int) = BatterySample.parse(byteArrayOf(0x10, 0x0E, 0x20, 0x03, 0, 0, flags.toByte(), 0))!!
+        val none = bat(0x00)
+        assertFalse(none.sdLowbatLock); assertFalse(none.sdUsbHost)
+        val usb = bat(0x08)
+        assertTrue(usb.sdUsbHost); assertFalse(usb.sdLowbatLock)
+        val both = bat(0x0C)
+        assertTrue(both.sdUsbHost); assertTrue(both.sdLowbatLock)
+        assertFalse(both.lowBatt); assertFalse(both.logging)
+    }
 }

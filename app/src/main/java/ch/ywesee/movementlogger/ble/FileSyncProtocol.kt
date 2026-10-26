@@ -155,6 +155,9 @@ object FileSyncProtocol {
     const val STATUS_SD_USB: Byte = 0xE8.toByte()
     /** Firmware v0.0.70+: same, refused by the low-battery SD lock. */
     const val STATUS_SD_LOWBAT: Byte = 0xE9.toByte()
+    /** Shown instead of sending an SD-writing op while BatteryStatus bit 3
+     *  (sd_usb_host) is set, and instead of a bare timeout in that state. */
+    const val SD_USB_UNPLUG_MSG = "Unplug USB-C — the box's SD card is in use by a computer"
 
     // Firmware-update status bytes (in single-byte FW_* notifies).
     /** FW_COMMIT success: image verified, box is swapping banks + resetting. */
@@ -178,7 +181,7 @@ object FileSyncProtocol {
         STATUS_NOT_FOUND -> "NOT_FOUND"
         STATUS_IO_ERROR -> "IO_ERROR"
         STATUS_BAD_REQUEST -> "BAD_REQUEST"
-        STATUS_SD_USB -> "SD card is mounted over USB — eject it on the computer (or unplug USB-C), then retry"
+        STATUS_SD_USB -> "Unplug USB-C — the box's SD card is in use by a computer (or eject it on the computer), then retry"
         STATUS_SD_LOWBAT -> "Battery lock: the box refuses SD writes while the battery is low. Charge the box (until about 3.7 V), then retry"
         else -> "unknown error"
     }

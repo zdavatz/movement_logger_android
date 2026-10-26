@@ -168,10 +168,13 @@ data class FileSyncUiState(
      *  on the next Connected (desktop v0.0.9). Persists across the
      *  disconnect on purpose. */
     val transferInterrupted: Boolean = false,
-    /** A DELETE the box rejected (BUSY / NOT_FOUND / IO_ERROR /
-     *  BAD_REQUEST). Surfaced as a dismissable banner; cleared on a
-     *  successful delete, a fresh attempt, or disconnect (desktop #7). */
-    val deleteError: String? = null,
+    /** A user-initiated op the box rejected or that timed out: DELETE
+     *  (BUSY / NOT_FOUND / IO_ERROR / BAD_REQUEST, desktop #7), SET_MODE,
+     *  GPS_POWER, CAL_SET, START_LOG (incl. 0xE8/0xE9 SD refusals), or an
+     *  SD-writing op short-circuited while the card is USB-mounted.
+     *  Surfaced as a dismissable banner; cleared on a successful delete,
+     *  a fresh attempt, or disconnect. */
+    val opError: String? = null,
     val log: List<String> = emptyList(),
     val sessionDurationSeconds: Int = 1800,  // 30-min default, matches desktop
     val sessionRunning: SessionRunning? = null,
@@ -240,7 +243,7 @@ class FileSyncViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun download(file: RemoteFile) = FileSyncCore.download(file)
     fun delete(file: RemoteFile) = FileSyncCore.delete(file)
-    fun dismissDeleteError() = FileSyncCore.dismissDeleteError()
+    fun dismissOpError() = FileSyncCore.dismissOpError()
     fun setKeepSynced(on: Boolean) = FileSyncCore.setKeepSynced(on)
     fun stopLog() = FileSyncCore.stopLog()
     fun setSessionDuration(seconds: Int) = FileSyncCore.setSessionDuration(seconds)

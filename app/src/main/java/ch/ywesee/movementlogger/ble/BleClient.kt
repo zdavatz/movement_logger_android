@@ -1038,7 +1038,7 @@ class BleClient(private val context: Context) {
             CurrentOp.Idle -> if (value.size == 1 &&
                 (value[0] == FileSyncProtocol.STATUS_SD_USB ||
                  value[0] == FileSyncProtocol.STATUS_SD_LOWBAT)) {
-                emitErr(FileSyncProtocol.statusMessage(value[0]))
+                emitErr("START_LOG: ${FileSyncProtocol.statusMessage(value[0])}")
             }
             is CurrentOp.Listing -> handleListNotify(current, value)
             is CurrentOp.Reading -> handleReadNotify(current, value)
