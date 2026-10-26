@@ -388,21 +388,29 @@ class BleClient(private val context: Context) {
         if (emitEvent) emit(BleEvent.Disconnected)
     }
 
-    private fun writeCmdBytes(payload: ByteArray): Boolean {
+    /**
+     * `confirmed`: ATT write-with-response when the characteristic allows it
+     * (v0.0.82, desktop v0.0.83/84, iOS v1.0.71/72). An unconfirmed write the
+     * stack loses costs a READ a 20 s stall + reconnect and a FW_DATA chunk a
+     * resend timeout; a confirmed one is acknowledged at the link layer.
+     */
+    private fun writeCmdBytes(payload: ByteArray, confirmed: Boolean = false): Boolean {
         val g = gatt ?: run { emitErr("not connected"); return false }
         val c = cmdChar ?: run { emitErr("FileCmd characteristic missing"); return false }
         if (DEBUG_WIRE) {
             Log.i(tag, "TX FileCmd len=${payload.size} hex=${payload.toHex()}")
         }
+        val type = if (confirmed &&
+            (c.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
+        ) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val rc = g.writeCharacteristic(
-                    c, payload, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                )
+                val rc = g.writeCharacteristic(c, payload, type)
                 rc == BluetoothGatt.GATT_SUCCESS
             } else {
                 @Suppress("DEPRECATION")
-                c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                c.writeType = type
                 @Suppress("DEPRECATION")
                 c.value = payload
                 @Suppress("DEPRECATION")
@@ -458,24 +466,8 @@ class BleClient(private val context: Context) {
         if (op !is CurrentOp.Idle) {
             emitErr("another op is in flight — wait or Disconnect"); return
         }
-        // Opcode payload: 0x02 + name + NUL + 4-byte LE start offset.
-        // The firmware seeks to `offset` before streaming, so a resumed
-        // or grown file continues mid-file. offset is u32 on the wire —
-        // SD files are well under 4 GiB.
-        val nameBytes = name.toByteArray(Charsets.UTF_8)
-        val payload = ByteArray(1 + nameBytes.size + 1 + 4)
-        payload[0] = FileSyncProtocol.OP_READ
-        System.arraycopy(nameBytes, 0, payload, 1, nameBytes.size)
-        payload[1 + nameBytes.size] = 0x00
-        val off = offset.toInt()
-        val p = 1 + nameBytes.size + 1
-        payload[p]     = (off and 0xFF).toByte()
-        payload[p + 1] = ((off ushr 8) and 0xFF).toByte()
-        payload[p + 2] = ((off ushr 16) and 0xFF).toByte()
-        payload[p + 3] = ((off ushr 24) and 0xFF).toByte()
-        if (!writeCmdBytes(payload)) return
         val remaining = (size - offset).coerceAtLeast(0)
-        op = CurrentOp.Reading(
+        val st = CurrentOp.Reading(
             name = name,
             expected = size,
             base = offset,
@@ -484,7 +476,41 @@ class BleClient(private val context: Context) {
             lastProgress = now(),
             firstPacket = true,
         )
+        if (!requestReadSegment(st, offset)) return
+        op = st
         emit(BleEvent.ReadStarted(name, size))
+    }
+
+    /**
+     * One READ segment of at most [READ_SEGMENT_BYTES] (v0.0.82, desktop
+     * v0.0.83). Opcode payload: 0x02 + name + NUL + 4-byte LE start offset +
+     * 4-byte LE length cap (box v0.0.24+). The box seeks to `from` and
+     * streams exactly `cap` bytes, so a dropped link costs at most one
+     * segment and a lost request is noticed within [READ_RESEND_AFTER_MS].
+     */
+    private fun requestReadSegment(st: CurrentOp.Reading, from: Long): Boolean {
+        val cap = (st.expected - from).coerceIn(0, READ_SEGMENT_BYTES)
+        val nameBytes = st.name.toByteArray(Charsets.UTF_8)
+        val payload = ByteArray(1 + nameBytes.size + 1 + 4 + 4)
+        payload[0] = FileSyncProtocol.OP_READ
+        System.arraycopy(nameBytes, 0, payload, 1, nameBytes.size)
+        payload[1 + nameBytes.size] = 0x00
+        val p = 1 + nameBytes.size + 1
+        putLe32(payload, p, from.toInt())
+        putLe32(payload, p + 4, cap.toInt())
+        // Armed before the write: if the stack refuses it (GATT busy), the
+        // watchdog's 3 s re-send still picks the segment up.
+        st.segEnd = from + cap
+        st.segRequestedAt = now()
+        st.segGotData = false
+        return writeCmdBytes(payload, confirmed = true)
+    }
+
+    private fun putLe32(b: ByteArray, at: Int, v: Int) {
+        b[at]     = (v and 0xFF).toByte()
+        b[at + 1] = ((v ushr 8) and 0xFF).toByte()
+        b[at + 2] = ((v ushr 16) and 0xFF).toByte()
+        b[at + 3] = ((v ushr 24) and 0xFF).toByte()
     }
 
     private fun sendDelete(name: String) {
@@ -1212,12 +1238,18 @@ class BleClient(private val context: Context) {
         // byte must be a recognised error code. Avoids false positives on tiny
         // CSV/log files (which start with ASCII text, well below 0x80).
         if (state.firstPacket && value.size == 1 && FileSyncProtocol.isStatusByte(value[0])) {
+            // A later segment refused: hand back what the earlier ones
+            // delivered so the mirror keeps it and resumes from there.
+            if (state.content.isNotEmpty()) {
+                emit(BleEvent.ReadAborted(state.name, state.content.toByteArray(), state.base))
+            }
             emitErr("READ ${state.name}: ${FileSyncProtocol.statusMessage(value[0])} " +
                 "(0x${"%02X".format(value[0].toInt() and 0xFF)})")
             op = CurrentOp.Idle
             return
         }
         state.firstPacket = false
+        state.segGotData = true
 
         for (b in value) state.content.add(b)
         // `done` is the absolute byte position in the file: the resume
@@ -1238,6 +1270,11 @@ class BleClient(private val context: Context) {
             for (i in 0 until take) bytes[i] = state.content[i]
             emit(BleEvent.ReadDone(state.name, bytes, state.base))
             op = CurrentOp.Idle
+        } else if (done >= state.segEnd) {
+            // Segment complete → ask for the next one. Its first notify may
+            // again be a status byte (e.g. the file was deleted meanwhile).
+            state.segResends = 0
+            state.firstPacket = requestReadSegment(state, done)
         }
     }
 
@@ -1397,7 +1434,7 @@ class BleClient(private val context: Context) {
         begin[3] = ((len ushr 16) and 0xFF).toByte()
         begin[4] = ((len ushr 24) and 0xFF).toByte()
         System.arraycopy(sha256, 0, begin, 5, 32)
-        if (!writeCmdBytes(begin)) {
+        if (!writeCmdBytes(begin, confirmed = true)) {
             emit(BleEvent.FwUploadDone(false, "not connected — couldn't send FW_BEGIN"))
             return
         }
@@ -1439,7 +1476,7 @@ class BleClient(private val context: Context) {
             // Whole image staged — verify + swap + reset.
             state.phase = CurrentOp.Uploading.Phase.COMMITTING
             state.lastProgress = now()
-            if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_FW_COMMIT))) {
+            if (!writeCmdBytes(byteArrayOf(FileSyncProtocol.OP_FW_COMMIT), confirmed = true)) {
                 finishUpload(false, "not connected — couldn't send FW_COMMIT")
                 return
             }
@@ -1455,7 +1492,10 @@ class BleClient(private val context: Context) {
         payload[3] = ((off ushr 16) and 0xFF).toByte()
         payload[4] = ((off ushr 24) and 0xFF).toByte()
         System.arraycopy(state.image, off, payload, 5, n)
-        if (!writeCmdBytes(payload)) {
+        // Confirmed (v0.0.82, desktop v0.0.84 / iOS v1.0.72): stop-and-wait
+        // on the box's ACK as before, but a lost chunk no longer costs a
+        // FW_CHUNK_TIMEOUT_MS resend.
+        if (!writeCmdBytes(payload, confirmed = true)) {
             finishUpload(false, "not connected — couldn't send FW_DATA @$off")
         }
     }
@@ -1638,6 +1678,22 @@ class BleClient(private val context: Context) {
         (op as? CurrentOp.Uploading)?.let { st ->
             tickUploadWatchdog(st, now)
             return
+        }
+        // READ segment request lost (no byte of it after READ_RESEND_AFTER_MS):
+        // re-send from where the data stopped. Only while nothing of the
+        // segment has arrived, so a slow-but-flowing stream is never doubled.
+        (op as? CurrentOp.Reading)?.let { st ->
+            if (!st.segGotData && now - st.segRequestedAt > READ_RESEND_AFTER_MS &&
+                st.segResends < READ_RESEND_MAX
+            ) {
+                st.segResends += 1
+                val from = st.base + st.content.size
+                emit(BleEvent.Status(
+                    "READ ${st.name} — no data, re-sending request @$from (${st.segResends}/$READ_RESEND_MAX)"))
+                requestReadSegment(st, from)
+                st.lastProgress = now
+                return
+            }
         }
         val stale = when (val o = op) {
             is CurrentOp.Listing -> now - o.lastProgress > OP_IDLE_TIMEOUT_MS
@@ -1857,6 +1913,12 @@ class BleClient(private val context: Context) {
             var lastEmit: Long,
             var lastProgress: Long,
             var firstPacket: Boolean,
+            /** Absolute offset where the current READ segment ends, when it
+             *  was requested, whether any byte of it arrived, re-sends. */
+            var segEnd: Long = 0,
+            var segRequestedAt: Long = 0,
+            var segGotData: Boolean = false,
+            var segResends: Int = 0,
         ) : CurrentOp()
         data class Deleting(val name: String, var lastProgress: Long) : CurrentOp()
         /** SET_MODE / GET_MODE: both get one FileData reply byte.
@@ -2001,6 +2063,13 @@ class BleClient(private val context: Context) {
         private const val RECONNECT_WAIT_MS = 2_000L
         private const val RECONNECT_CONNECT_MS = 60_000L
         private const val PROGRESS_CHUNK_BYTES = 4L * 1024
+        /** READ segment length (desktop v0.0.83: 64 KB ≈ 3.5 s on air). */
+        private const val READ_SEGMENT_BYTES = 64L * 1024
+        /** Re-send a READ segment request when none of its bytes arrived
+         *  after this long (the box answers within one connection interval)… */
+        private const val READ_RESEND_AFTER_MS = 3_000L
+        /** …at most this often per segment; then the 20 s stall path. */
+        private const val READ_RESEND_MAX = 3
         private const val MAX_BUFFER_HINT = 16 * 1024 * 1024
         /**
          * ATT MTU we ask for on connect. Max in the spec is 517; 247 is the
