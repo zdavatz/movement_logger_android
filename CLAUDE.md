@@ -9,6 +9,7 @@ Android port of the Movement Logger desktop app at `~/software/movement_logger_d
 - **Live** — when connected to a PumpLogger-firmware box, renders the 0.5 Hz SensorStream snapshot (accel / gyro / mag / baro / GPS) as a typed readout plus two acc-magnitude + pressure sparklines. Empty for legacy PumpTsueri firmware (no SensorStream characteristic).
 - **Sync** — connects to the PumpTsueri/STBoxFs SensorTile.box over BLE, downloads its CSV recordings, saves them to app-private external storage.
 - **Replay** — picks a saved sensor / GPS CSV pair and a video, plays them time-synced with overlaid panels (speed, pitch / Nasenwinkel, height above water, GPS track).
+- **Session** (More menu) — one `SENSnnn.CSV` + `GPSnnn.CSV` pair with no video: speed-coloured track map + stacked charts + playback cursor. Port of the desktop Session tab — see *Session screen* below.
 
 Pure Kotlin + Jetpack Compose, no NDK. Phase-2 numerics (Madgwick fusion, baro height, butterworth, etc.) are ported from `stbox-viz/*.rs` to Kotlin under `data/`; the desktop's plotly-HTML / GIF / board-3D output side is replaced by direct Compose Canvas rendering. The desktop's ffmpeg-overlay GIF export is replaced on Android by an in-app **Export combined** that uses Media3 Transformer to bake the same v-stack (rider on top, four sensor panels below) into a single MP4 saved to `Movies/MovementLogger/`.
 
@@ -151,6 +152,65 @@ The Done banner exposes an **Open video** button that fires `Intent.ACTION_VIEW`
 
 - **HDR sources trip `OverlayShaderProgram` checkArgument.** HEVC HLG / Ultra-HDR clips (iPhone, Pixel main camera) route through Media3's HDR overlay codepath, which asserts `bitmap.hasGainmap()` on the overlay — our SDR panel bitmap fails. Fix: set `Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL` on the composition. Without it, the Ayano_Pump session crashes with `java.lang.IllegalArgumentException at OverlayShaderProgram.drawFrame:131` on Pixel 8a.
 - **Rotation:** the encoded stream keeps the source's rotation flag (1080×3840 raw bytes for a portrait source) but plays back rotated (3840×1080 displayed → 1080×3840 visible). Don't try to compensate in pixel space; trust the rotation metadata.
+
+## Session screen — video-less session view (v0.0.83, desktop `session_view.rs` port)
+
+`data/SessionData.kt` (pure, JVM-tested in `SessionDataTest`) +
+`ui/SessionViewModel.kt` + `ui/SessionScreen.kt`; `MainNav` `Dest.Session`
+(first entry in the More sheet) and a "No video?" link in Replay. Ports
+desktop commit 39f81b9 — keep the two in step.
+
+- **One clock.** Both CSVs carry the box's ms counter, so t = 0 is the first
+  sample of either file and every array is seconds from there — no
+  alignment step. Wall clock (`SessionClock`) from the sensor file's
+  `# SYNC` anchors via `SyncTimeAlign` (preferred), else the median of
+  (GPS-UTC seconds-of-day − box seconds) over ≤ 200 fixed rows, else
+  elapsed time. Labels are local time.
+- **Memory: never a `List<SensorRow>`.** `SessionLoader.parseSensor` is ONE
+  streaming field-walk pass (both header schemas via
+  `CsvParsers.SensorColumns`, `# SYNC` lines collected on the way via
+  `CsvParsers.parseSyncLine`) into primitive arrays, with
+  `parseFieldOrNan` parsing numbers in place (no per-field substring).
+  The real 2 h 50 min test session (956 k rows, 57 MB) loads in ~0.6 s on
+  the JVM; a row list would be ~100 MB of heap (the 11.7.2026 OOM lesson).
+  Each file is read once; progress comes from a counting stream.
+- **Derived series** (desktop formulas verbatim): |acc| g, |gyro| °/s;
+  pitch = atan2(ay, √(ax²+az²)), roll = atan2(ax, az) from the
+  accelerometer only after a 0.5 s centred moving average — box frame nose
+  = +Y, up = +Z (phone-style formulas swap pitch/roll on this box); height
+  = 44330·(1−(p/p0)^(1/5.255)), p0 = median of the first 100 rows,
+  smoothed the same. Track = fixed, non-zero rows with hops ≤ 60 km/h
+  (`MAX_JUMP_KMH`) — distance sums those hops; colour scale = 95th-pct
+  track speed (`RideMapRenderer.robustMaxSpeed`), ≥ 5 km/h. Deliberately
+  NOT the ride-map's blackout/outlier gates or Replay's Madgwick pipeline —
+  this view shows what the box recorded, like the desktop.
+- **Charts never draw raw rows.** `SessionLoader.decimate` → min/max pairs
+  over ≤ 1200 buckets of the visible range. Decimation + paths live in a
+  `drawWithCache` block that only re-runs when the shared view range
+  (`viewLo`/`viewHi` in the VM) or size changes; the cursor line is read in
+  the draw block only, so playback never re-decimates. Sample-free
+  stretches (> max(2 s, 3 buckets)) are drawn as gaps, not bridged.
+  Gestures: tap = cursor, horizontal drag = pan, two-finger pinch = zoom
+  (custom `awaitEachGesture`, so the charts' vertical scroll still works).
+- **Map = one custom osmdroid `Overlay`** (`SpeedTrackOverlay`): ≤ 4000
+  points, 16 colour bands, one `drawLines` per band. A `Polyline` per
+  colour run was ~1500 Polylines on the 10 Hz test file and took seconds
+  per frame — don't go back. Satellite = Esri World Imagery through an
+  `OnlineTileSourceBase` subclass (Esri URLs are z/y/x). Camera fit reuses
+  `RideMapRenderer.boundingBox` + `fitZoom` after layout (same
+  pre-layout `zoomToBoundingBox` trap as the ride map). Map taps go to a
+  `MapEventsOverlay` added LAST (on top) → nearest track point within 24 dp.
+- Cursor / view range / toggles live in the VM as Compose state so they
+  survive tab switches; playback is a `withFrameNanos` loop that also
+  scrolls a zoomed view to keep the cursor visible.
+- **File pairing**: `SessionLoader.matchingGpsName` — `SENS003.CSV` →
+  `GPS003.CSV`, case-insensitive (also `Sens003.csv`, `SensPhone_x` →
+  `GpsPhone_x`). Files come from the same app-private dir as Replay.
+- **Compact sensor schema in `parseSensorStream` (fixed here).** The strict
+  row parser (Replay, Merge) only knew the spaced header, so every box file
+  since firmware 22.4.2026 (`ms,ax_mg,…,p_hPa,t_C`) failed with "missing
+  column". `CsvParsers.SensorColumns` now resolves both (compact `ms` ÷ 10
+  → 10 ms ticks); `accBinsFromSensorStream` too.
 
 ## Analyze tab — on-device IMU ride analysis (v0.0.70+)
 

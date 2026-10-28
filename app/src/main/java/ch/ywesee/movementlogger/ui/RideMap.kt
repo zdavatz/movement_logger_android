@@ -408,7 +408,7 @@ private fun TrackMapView(segments: List<List<GpsRow>>, modes: List<RideMode>?, p
 }
 
 /** A round start/end dot (green/red, white ring) as a centre-anchored marker. */
-private fun dotMarker(map: MapView, at: GeoPoint, fill: Int): Marker {
+internal fun dotMarker(map: MapView, at: GeoPoint, fill: Int): Marker {
     val d = (map.context.resources.displayMetrics.density * 18).toInt()
     val bmp = Bitmap.createBitmap(d, d, Bitmap.Config.ARGB_8888)
     val c = Canvas(bmp)

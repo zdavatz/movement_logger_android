@@ -33,6 +33,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -71,7 +72,7 @@ import kotlinx.coroutines.delay
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ReplayScreen(vm: ReplayViewModel = viewModel()) {
+fun ReplayScreen(vm: ReplayViewModel = viewModel(), onOpenSession: () -> Unit = {}) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
 
@@ -138,6 +139,9 @@ fun ReplayScreen(vm: ReplayViewModel = viewModel()) {
                 }
             }
             ExportBanner(state = state.exportState, onDismiss = vm::clearExportState)
+            // No video of the session? The Session screen shows the same
+            // CSVs (map + charts + playback) without one.
+            TextButton(onClick = onOpenSession) { Text("No video? Show the session without one →") }
 
             Spacer(Modifier.height(12.dp))
             HorizontalDivider()
@@ -619,11 +623,13 @@ private fun RecordingPicker(vm: ReplayViewModel, state: ReplayUiState) {
 }
 
 @Composable
-private fun FileChooserList(
+internal fun FileChooserList(
     files: List<File>,
     selected: File?,
     empty: String,
     onPick: (File) -> Unit,
+    pickLabel: String = "Load",
+    pickedLabel: String = "Reload",
 ) {
     if (files.isEmpty()) {
         Text(empty, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
@@ -655,7 +661,7 @@ private fun FileChooserList(
                         )
                     }
                     OutlinedButton(onClick = { onPick(f) }) {
-                        Text(if (isSelected) "Reload" else "Load")
+                        Text(if (isSelected) pickedLabel else pickLabel)
                     }
                 }
             }
@@ -731,19 +737,19 @@ private fun countInWindow(times: LongArray, lo: Long, hi: Long): Int {
     return n
 }
 
-private fun isSensCsv(name: String): Boolean {
+internal fun isSensCsv(name: String): Boolean {
     val n = name.lowercase()
     if (n.startsWith("._")) return false
     return n.startsWith("sens") && n.endsWith(".csv")
 }
 
-private fun isGpsCsv(name: String): Boolean {
+internal fun isGpsCsv(name: String): Boolean {
     val n = name.lowercase()
     if (n.startsWith("._")) return false
     return n.startsWith("gps") && n.endsWith(".csv")
 }
 
-private fun humanBytesShort(b: Long): String = when {
+internal fun humanBytesShort(b: Long): String = when {
     b < 1024 -> "$b B"
     b < 1024L * 1024 -> "%.1f KB".format(b / 1024.0)
     else -> "%.2f MB".format(b / (1024.0 * 1024.0))

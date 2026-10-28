@@ -514,18 +514,6 @@ private fun formatClipDuration(ms: Long): String {
     return "%d:%02d".format(min, sec)
 }
 
-private fun isSensCsv(name: String): Boolean {
-    val n = name.lowercase()
-    if (n.startsWith("._")) return false
-    return n.startsWith("sens") && n.endsWith(".csv")
-}
-
-private fun isGpsCsv(name: String): Boolean {
-    val n = name.lowercase()
-    if (n.startsWith("._")) return false
-    return n.startsWith("gps") && n.endsWith(".csv")
-}
-
 private fun mergeHumanBytesShort(b: Long): String = when {
     b < 1024 -> "$b B"
     b < 1024L * 1024 -> "%.1f KB".format(b / 1024.0)

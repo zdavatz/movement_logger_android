@@ -17,6 +17,7 @@ import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.ShowChart
+import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -52,12 +53,13 @@ private sealed class Dest(val route: String, val label: String, val icon: ImageV
     data object Race : Dest("race", "Race", Icons.Filled.Map)
     data object Analyze : Dest("analyze", "Analyze", Icons.Filled.ShowChart)
     data object GpsDebug : Dest("gpsdebug", "GPS Debug", Icons.Filled.Settings)
+    data object Session : Dest("session", "Session", Icons.Filled.Timeline)
 }
 
 // Cap the bottom bar at four icons + a "More" overflow (mirrors iOS's tab bar):
 // the four realtime/primary tabs stay one tap away; the rest live in the sheet.
 private val primary = listOf(Dest.Live, Dest.Gps, Dest.Sync, Dest.Replay)
-private val overflow = listOf(Dest.Merge, Dest.Race, Dest.Analyze, Dest.GpsDebug)
+private val overflow = listOf(Dest.Session, Dest.Merge, Dest.Race, Dest.Analyze, Dest.GpsDebug)
 
 private fun NavController.go(route: String) {
     if (currentDestination?.route == route) return
@@ -107,7 +109,8 @@ fun MainNav() {
             }
             composable(Dest.Gps.route) { UsbGpsScreen() }
             composable(Dest.Sync.route) { FileSyncScreen() }
-            composable(Dest.Replay.route) { ReplayScreen() }
+            composable(Dest.Replay.route) { ReplayScreen(onOpenSession = { nav.go(Dest.Session.route) }) }
+            composable(Dest.Session.route) { SessionScreen() }
             composable(Dest.Merge.route) { MergeScreen() }
             composable(Dest.Race.route) { RaceMapScreen() }
             composable(Dest.Analyze.route) { ImuAnalysisScreen() }

@@ -108,7 +108,7 @@ private fun axisBaseSec(startEpochMs: Long?): Double =
         (startEpochMs + java.util.TimeZone.getDefault().getOffset(startEpochMs)) / 1000.0
     } else 0.0
 
-private fun niceStepSec(spanSec: Double, widthPx: Float, minGapPx: Float): Double {
+internal fun niceStepSec(spanSec: Double, widthPx: Float, minGapPx: Float): Double {
     for (s in doubleArrayOf(1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0)) {
         if (widthPx * (s / spanSec) >= minGapPx) return s
     }

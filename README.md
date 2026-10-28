@@ -24,7 +24,7 @@ Requires Android 8.0 (API 26) or newer. Targets API 35.
 
 ## What it does
 
-Five tabs via the bottom navigation bar: Live, GPS, Sync, Replay, GPS Debug.
+Bottom navigation: Live, GPS, Sync, Replay, plus a **More** menu with Session, Merge, Race, Analyze and GPS Debug.
 
 ### Live
 
@@ -78,6 +78,17 @@ The downloaded CSVs from the Sync tab are picked up directly, so the typical loo
 Once the video and both CSVs are picked, **Export combined** renders a single MP4 with the rider on top and the four data panels stacked below — exactly what the live Replay shows, baked into a video the phone's Photos app understands. The export is automatically trimmed to the video's time window, so panels only show sensor + GPS data that overlaps the ride, not the whole session. HDR clips (HEVC HLG, iPhone-style) are tone-mapped to SDR before encoding so the panel overlays composite correctly. When the encode finishes, an **Open video** button on the banner launches the system video viewer on the freshly saved file under `Movies/MovementLogger/`.
 
 The Alignment card shows the row counts that fall inside the video window, so you can see at a glance how much of the session will be in the export (`trim → gps: 365 / 26914` etc.) before kicking it off.
+
+### Session
+
+One recorded session from the box — **no video needed** — reachable from the **More** menu (and from a "No video?" link in Replay). Pick a `SENSnnn.CSV`; the matching `GPSnnn.CSV` is picked automatically. The screen shows:
+
+- **Map** — the GPS track on OpenStreetMap (or **Satellite** imagery), coloured by speed from blue (slow) through green to red (fast; the scale tops out at the session's 95th-percentile speed so one spike doesn't wash out the colours), green start / red end dot, and a yellow dot at the cursor. **Fit track** re-centres; **Follow** keeps the map on the cursor. Tap near the track to jump there.
+- **Charts** on one shared wall-clock time axis: GPS speed (km/h), acceleration |acc| (g), board pitch + roll (°), barometric height relative to the start (m), and optionally rotation rate |gyro| (°/s). Pinch to zoom, drag sideways to pan, tap to move the cursor.
+- **Playback** — a time slider with play/pause at 1× / 5× / 20× / 60× / 300×, and a readout line with time, speed, position, satellites, |acc|, pitch, roll and height at the cursor.
+- A summary line: files, start–end time, duration, distance, top speed, GPS rate.
+
+A 3-hour session (~1 million sensor rows) loads in a few seconds with a progress bar and stays smooth to zoom and play. Same view as the desktop app's Session tab.
 
 ### Merge
 

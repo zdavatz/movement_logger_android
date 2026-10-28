@@ -136,45 +136,74 @@ object CsvParsers {
                 if (line.lowercase().contains("time [")) tickDiv = 1.0
                 continue
             }
-            if (!line.startsWith("#") || !line.contains("SYNC")) continue
-            var epochMs: Long? = null
-            var tickMs: Double? = null
-            for (tok in line.split(' ', '\t').filter { it.isNotEmpty() }) {
-                when {
-                    tok.startsWith("epoch_ms=") -> epochMs = tok.removePrefix("epoch_ms=").toLongOrNull()
-                    tok.startsWith("tick_ms=") -> tickMs = tok.removePrefix("tick_ms=").toDoubleOrNull()
-                }
-            }
-            val e = epochMs
-            val t = tickMs
-            if (e != null && t != null && e > 0L) out.add(SyncAnchor(t / tickDiv, e))
+            parseSyncLine(line, tickDiv)?.let(out::add)
         }
-        // Sort + dedupe by tick so the abs-time interpolation gets a clean,
-        // monotone anchor curve even if connects produced out-of-order or
-        // duplicate markers.
-        out.sortBy { it.ticks }
-        val deduped = ArrayList<SyncAnchor>(out.size)
-        for (a in out) if (deduped.lastOrNull()?.ticks != a.ticks) deduped.add(a)
+        return sortDedupeAnchors(out)
+    }
+
+    /**
+     * One `# SYNC epoch_ms=… tick_ms=…` comment line → anchor in row-tick
+     * units (`tick_ms ÷ tickDiv`), or null for any other line. Shared with
+     * the Session loader, which meets these lines inside its single
+     * streaming pass over the sensor file.
+     */
+    internal fun parseSyncLine(line: String, tickDiv: Double): SyncAnchor? {
+        if (!line.startsWith("#") || !line.contains("SYNC")) return null
+        var epochMs: Long? = null
+        var tickMs: Double? = null
+        for (tok in line.split(' ', '\t').filter { it.isNotEmpty() }) {
+            when {
+                tok.startsWith("epoch_ms=") -> epochMs = tok.removePrefix("epoch_ms=").toLongOrNull()
+                tok.startsWith("tick_ms=") -> tickMs = tok.removePrefix("tick_ms=").toDoubleOrNull()
+            }
+        }
+        val e = epochMs ?: return null
+        val t = tickMs ?: return null
+        return if (e > 0L) SyncAnchor(t / tickDiv, e) else null
+    }
+
+    /**
+     * Sort + dedupe by tick so the abs-time interpolation gets a clean,
+     * monotone anchor curve even if connects produced out-of-order or
+     * duplicate markers.
+     */
+    internal fun sortDedupeAnchors(anchors: List<SyncAnchor>): List<SyncAnchor> {
+        val sorted = anchors.sortedBy { it.ticks }
+        val deduped = ArrayList<SyncAnchor>(sorted.size)
+        for (a in sorted) if (deduped.lastOrNull()?.ticks != a.ticks) deduped.add(a)
         return deduped
+    }
+
+    /**
+     * Column indices of a `Sens*` header, both schemas: the spaced one
+     * (`Time [10ms]`, `AccX [mg]`, `P [mB]` …, already in 10 ms ticks)
+     * and the compact one the firmware writes since 22.4.2026
+     * (`ms,ax_mg,…,p_hPa,t_C` — raw ms, so `tickDiv` = 10). Legacy
+     * `Time [mS]` keeps tickDiv 1 as before.
+     */
+    internal class SensorColumns(header: String) {
+        private val cols = HeaderMap(header)
+        private val iMs = cols.idxOrNull("ms")
+        val t = iMs ?: cols.idxAny("Time [10ms]", "Time [mS]")
+        val tickDiv = if (iMs != null) 10.0 else 1.0
+        val ax = cols.idxAny("AccX [mg]", "ax_mg")
+        val ay = cols.idxAny("AccY [mg]", "ay_mg")
+        val az = cols.idxAny("AccZ [mg]", "az_mg")
+        val gx = cols.idxAny("GyroX [mdps]", "gx_mdps")
+        val gy = cols.idxAny("GyroY [mdps]", "gy_mdps")
+        val gz = cols.idxAny("GyroZ [mdps]", "gz_mdps")
+        val mx = cols.idxAny("MagX [mgauss]", "mx_mg")
+        val my = cols.idxAny("MagY [mgauss]", "my_mg")
+        val mz = cols.idxAny("MagZ [mgauss]", "mz_mg")
+        val p = cols.idxAny("P [mB]", "p_hPa")
+        val tc = cols.idxAny("T ['C]", "t_C")
     }
 
     @Throws(IOException::class)
     fun parseSensorStream(input: InputStream): List<SensorRow> {
         val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
         val header = reader.readLine() ?: throw IOException("sensor csv: empty file")
-        val cols = HeaderMap(header)
-        val iT = cols.idxAny("Time [10ms]", "Time [mS]")
-        val iAx = cols.idxAny("AccX [mg]")
-        val iAy = cols.idxAny("AccY [mg]")
-        val iAz = cols.idxAny("AccZ [mg]")
-        val iGx = cols.idxAny("GyroX [mdps]")
-        val iGy = cols.idxAny("GyroY [mdps]")
-        val iGz = cols.idxAny("GyroZ [mdps]")
-        val iMx = cols.idxAny("MagX [mgauss]")
-        val iMy = cols.idxAny("MagY [mgauss]")
-        val iMz = cols.idxAny("MagZ [mgauss]")
-        val iP = cols.idxAny("P [mB]")
-        val iTc = cols.idxAny("T ['C]")
+        val c = SensorColumns(header)
 
         val out = ArrayList<SensorRow>(8192)
         var lineNo = 1
@@ -189,18 +218,18 @@ object CsvParsers {
             try {
                 out.add(
                     SensorRow(
-                        ticks = parseDouble(r, iT),
-                        accX = parseDouble(r, iAx),
-                        accY = parseDouble(r, iAy),
-                        accZ = parseDouble(r, iAz),
-                        gyroX = parseDouble(r, iGx),
-                        gyroY = parseDouble(r, iGy),
-                        gyroZ = parseDouble(r, iGz),
-                        magX = parseDouble(r, iMx),
-                        magY = parseDouble(r, iMy),
-                        magZ = parseDouble(r, iMz),
-                        pressureMb = parseDouble(r, iP),
-                        temperatureC = parseDouble(r, iTc),
+                        ticks = parseDouble(r, c.t) / c.tickDiv,
+                        accX = parseDouble(r, c.ax),
+                        accY = parseDouble(r, c.ay),
+                        accZ = parseDouble(r, c.az),
+                        gyroX = parseDouble(r, c.gx),
+                        gyroY = parseDouble(r, c.gy),
+                        gyroZ = parseDouble(r, c.gz),
+                        magX = parseDouble(r, c.mx),
+                        magY = parseDouble(r, c.my),
+                        magZ = parseDouble(r, c.mz),
+                        pressureMb = parseDouble(r, c.p),
+                        temperatureC = parseDouble(r, c.tc),
                     )
                 )
             } catch (e: Exception) {
@@ -225,12 +254,14 @@ object CsvParsers {
         val reader = BufferedReader(InputStreamReader(input, Charsets.UTF_8))
         val header = reader.readLine() ?: throw IOException("sensor csv: empty file")
         val cols = HeaderMap(header)
-        val iMsLegacy = cols.idxOrNull("Time [mS]")
+        // Raw-millisecond time columns (legacy `Time [mS]`, compact `ms`)
+        // are normalised to 10 ms ticks.
+        val iMsLegacy = cols.idxOrNull("Time [mS]") ?: cols.idxOrNull("ms")
         val iT = iMsLegacy ?: cols.idxAny("Time [10ms]")
         val tickDiv = if (iMsLegacy != null) 10.0 else 1.0
-        val iAx = cols.idxAny("AccX [mg]")
-        val iAy = cols.idxAny("AccY [mg]")
-        val iAz = cols.idxAny("AccZ [mg]")
+        val iAx = cols.idxAny("AccX [mg]", "ax_mg")
+        val iAy = cols.idxAny("AccY [mg]", "ay_mg")
+        val iAz = cols.idxAny("AccZ [mg]", "az_mg")
         val maxIdx = maxOf(iT, iAx, iAy, iAz)
         val acc = HashMap<Int, DoubleArray>()
         // Field walk instead of split(): at 1.1 M rows × 12 columns a full
@@ -358,7 +389,7 @@ object CsvParsers {
     }
 }
 
-private class HeaderMap(headerLine: String) {
+internal class HeaderMap(headerLine: String) {
     private val map: Map<String, Int> =
         splitTrim(headerLine).withIndex().associate { (i, name) -> name to i }
 
@@ -389,6 +420,49 @@ internal fun fastDoubleOrNull(s: String): Double? {
     } catch (_: NumberFormatException) {
         null
     }
+}
+
+private val POW10 = DoubleArray(16) { Math.pow(10.0, it.toDouble()) }
+
+/**
+ * Allocation-free decimal parse of `line[start, end)` — the Session
+ * loader's hot loop runs this ~10 M times on a 3 h sensor file, where a
+ * `substring` + [fastDoubleOrNull] per field would churn ~10 M short-lived
+ * strings. Plain `[-+]digits[.digits]` is parsed inline (an exact long
+ * divided by an exact power of ten, so the result equals
+ * `Double.parseDouble`); anything else (exponent, > 15 digits — past exact double range) falls back
+ * to [fastDoubleOrNull]. NaN for an empty or malformed field.
+ */
+internal fun parseFieldOrNan(line: String, start: Int, end: Int): Double {
+    var s = start
+    var e = end
+    while (s < e && line[s] == ' ') s++
+    while (e > s && line[e - 1] == ' ') e--
+    if (s >= e) return Double.NaN
+    var i = s
+    var neg = false
+    if (line[i] == '-') { neg = true; i++ } else if (line[i] == '+') i++
+    var v = 0L
+    var digits = 0
+    var frac = 0
+    var dot = false
+    while (i < e) {
+        val c = line[i]
+        if (c in '0'..'9') {
+            if (digits == 15) return fastDoubleOrNull(line.substring(s, e)) ?: Double.NaN
+            v = v * 10 + (c - '0')
+            digits++
+            if (dot) frac++
+        } else if (c == '.' && !dot) {
+            dot = true
+        } else {
+            return fastDoubleOrNull(line.substring(s, e)) ?: Double.NaN
+        }
+        i++
+    }
+    if (digits == 0) return Double.NaN
+    val d = v.toDouble() / POW10[frac]
+    return if (neg) -d else d
 }
 
 private fun parseDouble(row: List<String>, idx: Int): Double {
